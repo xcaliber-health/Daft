@@ -67,7 +67,7 @@ dev = [
   "pre-commit==4.5.1",
   "docker==7.1.0",
   # Pinned aiohttp due to Ray connection issue in aiohttp==3.12.6
-  "aiohttp==3.13.3",
+  "aiohttp==3.14.0",
   # Pinned httpx due to unitycatalog-python issue: https://github.com/unitycatalog/unitycatalog-python/issues/9
   "httpx==0.28.1",
   # Tracing

@@ -32,6 +32,18 @@ const PATH_SEGMENT_DELIMITER: &str = "/";
 
 use crate::{local_path_to_file_uri, strip_file_uri_to_path};
 
+/// Convert a filesystem modification time to epoch milliseconds (UTC).
+///
+/// Returns `None` when the platform does not expose a modification time or it
+/// predates the Unix epoch.
+fn mtime_to_epoch_ms(meta: &std::fs::Metadata) -> Option<i64> {
+    let modified = meta.modified().ok()?;
+    let dur = modified
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .ok()?;
+    i64::try_from(dur.as_millis()).ok()
+}
+
 pub struct LocalSource {}
 
 #[derive(Debug, Snafu)]
@@ -325,6 +337,7 @@ impl ObjectSource for LocalSource {
                 filepath: local_path_to_file_uri(&uri),
                 size: Some(meta.len()),
                 filetype: object_io::FileType::File,
+                last_modified: mtime_to_epoch_ms(&meta),
             })])
             .boxed());
         }
@@ -371,6 +384,7 @@ impl ObjectSource for LocalSource {
                             path: entry.path().to_string_lossy().to_string(),
                         }
                     })?,
+                    last_modified: mtime_to_epoch_ms(&meta),
                 })
             }
         });
@@ -424,6 +438,7 @@ pub async fn collect_file(local_file: LocalFile) -> Result<Bytes> {
 mod tests {
     use std::{default, io::Write};
 
+    use super::mtime_to_epoch_ms;
     use crate::{
         HttpSource, LocalSource, Result,
         integrations::test_full_get,
@@ -491,16 +506,19 @@ mod tests {
                 filepath: expected_filepath(&file1),
                 size: Some(file1.as_file().metadata().unwrap().len()),
                 filetype: FileType::File,
+                last_modified: mtime_to_epoch_ms(&file1.as_file().metadata().unwrap()),
             },
             FileMetadata {
                 filepath: expected_filepath(&file2),
                 size: Some(file2.as_file().metadata().unwrap().len()),
                 filetype: FileType::File,
+                last_modified: mtime_to_epoch_ms(&file2.as_file().metadata().unwrap()),
             },
             FileMetadata {
                 filepath: expected_filepath(&file3),
                 size: Some(file3.as_file().metadata().unwrap().len()),
                 filetype: FileType::File,
+                last_modified: mtime_to_epoch_ms(&file3.as_file().metadata().unwrap()),
             },
         ];
         expected.sort_by(|a, b| a.filepath.cmp(&b.filepath));

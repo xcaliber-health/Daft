@@ -88,6 +88,7 @@ fn generate_metadata_from_manifest(
             filepath: path.clone(),
             size: None,
             filetype: FileType::File,
+            last_modified: None,
         })
     })
 }

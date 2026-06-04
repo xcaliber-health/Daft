@@ -325,6 +325,7 @@ impl ObjectSource for OpenDALSource {
                     filepath,
                     size,
                     filetype,
+                    last_modified: None,
                 })
             })
             .collect();

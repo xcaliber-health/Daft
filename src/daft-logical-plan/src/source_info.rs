@@ -101,6 +101,9 @@ impl GlobScanInfo {
             Field::new("path", DataType::Utf8),
             Field::new("size", DataType::Int64),
             Field::new("num_rows", DataType::Int64),
+            // Last-modified time in epoch milliseconds (UTC); null when the
+            // source does not report it.
+            Field::new("mtime", DataType::Int64),
         ])
         .into();
         Self {

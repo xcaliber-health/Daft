@@ -36,6 +36,78 @@ def _any_file_missing(paths) -> bool:
     return any(not os.path.exists(_strip_scheme(p)) for p in paths)
 
 
+def _metadata_json_files(table) -> list[str]:
+    import glob
+
+    meta_dir = os.path.join(_strip_scheme(table.location()), "metadata")
+    return sorted(glob.glob(os.path.join(meta_dir, "*.metadata.json")))
+
+
+def _capped_metadata_table(local_catalog, simple_schema, name: str, n: int):
+    from pyiceberg.partitioning import UNPARTITIONED_PARTITION_SPEC
+
+    table = local_catalog.create_table(
+        identifier=name,
+        schema=simple_schema,
+        partition_spec=UNPARTITIONED_PARTITION_SPEC,
+        properties={
+            # Keep the metadata log short so each commit drops an older entry,
+            # but leave the physical files on disk for cleanup to reclaim.
+            "write.metadata.previous-versions-max": "1",
+            "write.metadata.delete-after-commit.enabled": "false",
+        },
+    )
+    for i in range(n):
+        table.append(
+            pa.table(
+                {
+                    "id": pa.array(list(range(i * 3, i * 3 + 3)), type=pa.int64()),
+                    "label": pa.array([f"r{i}"] * 3, type=pa.string()),
+                }
+            )
+        )
+    return table
+
+
+def test_clean_expired_metadata_deletes_stale_metadata_json(
+    local_catalog, simple_schema
+):
+    table = _capped_metadata_table(
+        local_catalog, simple_schema, "default.t_exp_md", n=5
+    )
+    before = set(_metadata_json_files(table))
+    assert len(before) >= 3
+
+    dt = Table.from_iceberg(table)
+    result = dt.expire_snapshots(retain_last=1, clean_expired_metadata=True)
+
+    table.refresh()
+    after = set(_metadata_json_files(table))
+    # At least one previously-present metadata file was reclaimed.
+    assert result.deleted_metadata_files_count >= 1
+    assert before - after, "expected some pre-existing metadata files to be deleted"
+    # The live metadata pointer is never deleted.
+    assert os.path.exists(_strip_scheme(table.metadata_location))
+
+
+def test_clean_expired_metadata_default_keeps_metadata_json(
+    local_catalog, simple_schema
+):
+    table = _capped_metadata_table(
+        local_catalog, simple_schema, "default.t_exp_md_off", n=5
+    )
+    before = set(_metadata_json_files(table))
+
+    dt = Table.from_iceberg(table)
+    result = dt.expire_snapshots(retain_last=1)
+
+    table.refresh()
+    after = set(_metadata_json_files(table))
+    # No metadata cleanup: every pre-existing metadata file survives.
+    assert result.deleted_metadata_files_count == 0
+    assert before <= after
+
+
 def test_older_than_removes_old_keeps_new(make_tiny_table):
     table = make_tiny_table(name="default.t_exp_older", n_files=5, rows_per_file=3)
     snaps = list(table.metadata.snapshots)

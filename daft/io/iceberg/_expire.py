@@ -1,28 +1,48 @@
-"""Expire snapshots: resolve the kept set, commit the metadata change, delete unreachable files."""
+"""Expire snapshots: resolve the kept set, commit the metadata change, delete unreachable files.
+
+The set of files that become unreachable is computed by the execution engine.
+The files referenced before the metadata commit (across every snapshot) minus
+the files referenced after it (across the survivors) is exactly the set the
+expired snapshots alone held, and is deleted. This anti-join distributes on a
+cluster and streams on a single host, so it scales to very large tables.
+"""
 
 from __future__ import annotations
 
 import datetime as _dt
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Iterable, Iterator
+from typing import TYPE_CHECKING, Any
 
 from daft.io.iceberg._common import (
     DEFAULT_DELETE_BACKOFF_BASE_SECONDS,
     DEFAULT_DELETE_NUM_RETRIES,
     DEFAULT_MAX_CONCURRENT_DELETES,
-    DEFAULT_MAX_CONCURRENT_MANIFEST_READS,
     CommitRetryExhausted,
     commit_with_retry,
     delete_files,
     is_not_found,
     validate_gc_enabled,
 )
+from daft.io.iceberg._engine import (
+    KIND_DATA,
+    KIND_EQ_DELETE,
+    KIND_MANIFEST,
+    KIND_MANIFEST_LIST,
+    KIND_METADATA,
+    KIND_POS_DELETE,
+    KIND_STATS,
+    anti_join_paths,
+    content_frame,
+    engine_delete,
+    manifest_frame,
+    paths_frame,
+    union_paths,
+)
 
 if TYPE_CHECKING:
-    from pyiceberg.manifest import ManifestFile
+    from daft.dataframe import DataFrame
     from pyiceberg.table import Table as PyIcebergTable
 
 logger = logging.getLogger(__name__)
@@ -53,6 +73,8 @@ class ExpireResult:
         Number of manifest-list files removed.
     deleted_statistics_files_count
         Number of statistics (and partition-statistics) files removed.
+    deleted_metadata_files_count
+        Number of table-metadata files removed when metadata cleanup is enabled.
     """
 
     deleted_data_files_count: int = 0
@@ -61,6 +83,7 @@ class ExpireResult:
     deleted_manifest_files_count: int = 0
     deleted_manifest_lists_count: int = 0
     deleted_statistics_files_count: int = 0
+    deleted_metadata_files_count: int = 0
 
 
 class ExpireSnapshotsFailedException(RuntimeError):
@@ -74,17 +97,13 @@ def run(
     retain_last: int | None = None,
     snapshot_ids: list[int] | None = None,
     clean_expired_files: bool = True,
+    clean_expired_metadata: bool = False,
     stream_results: bool = False,
     options: dict[str, Any] | None = None,
 ) -> ExpireResult:
     opts = options or {}
     max_concurrent_deletes = int(
         opts.get("max-concurrent-deletes", DEFAULT_MAX_CONCURRENT_DELETES)
-    )
-    max_concurrent_manifest_reads = int(
-        opts.get(
-            "max-concurrent-manifest-reads", DEFAULT_MAX_CONCURRENT_MANIFEST_READS
-        )
     )
     delete_num_retries = int(
         opts.get("delete-num-retries", DEFAULT_DELETE_NUM_RETRIES)
@@ -104,7 +123,6 @@ def run(
     if retain_last is not None and retain_last < 1:
         raise ValueError(f"retain_last must be >= 1, got {retain_last!r}")
 
-    original_metadata = table.metadata
     protected_ids = _protected_snapshot_ids(table)
 
     if snapshot_ids:
@@ -121,71 +139,133 @@ def run(
     if not expired_ids:
         return ExpireResult()
 
+    # Capture what the table references now, while the expired snapshots still
+    # exist; the post-commit set is subtracted from this to find what only they
+    # held. Frames built from the inspected tables retain the pre-commit data.
+    # If a referenced manifest or manifest list is already gone, the candidate
+    # set cannot be enumerated; file cleanup is skipped (never deleting data —
+    # any leftover is reclaimed by a later run) while the expiry still commits.
+    pre_frame: DataFrame | None = None
+    if clean_expired_files:
+        try:
+            pre_frame = _expire_file_frame(table)
+        except Exception as exc:
+            if not is_not_found(exc):
+                raise
+            logger.warning(
+                "expire_snapshots: cannot enumerate referenced files (%r); "
+                "expiring snapshots without file cleanup",
+                exc,
+            )
+    pre_metadata: set[str] | None = None
+    if clean_expired_metadata:
+        pre_metadata = set(_metadata_file_paths(table))
+
     _commit_expire(table, expired_ids)
 
-    if not clean_expired_files:
+    if not clean_expired_files and not clean_expired_metadata:
         return ExpireResult()
 
     table.refresh()
-    updated_metadata = table.metadata
 
-    kept_snapshots = list(updated_metadata.snapshots)
-    expired_snapshots = [
-        s for s in original_metadata.snapshots if s.snapshot_id in expired_ids
-    ]
+    counts: dict[str, int] = {}
+    if clean_expired_files and pre_frame is not None:
+        post_frame = _expire_file_frame(table)
+        to_delete = anti_join_paths(pre_frame, post_frame, on="path")
+        counts, _failed, _sample, _total = engine_delete(
+            table,
+            to_delete,
+            has_kind=True,
+            dry_run=False,
+            stream=stream_results,
+            sample_limit=0,
+            max_concurrent_deletes=max_concurrent_deletes,
+            num_retries=delete_num_retries,
+            backoff_base=delete_backoff_base,
+            op_name="expire_snapshots",
+        )
 
-    kept_paths, _ = _collect_paths(
-        table=table,
-        snapshots=kept_snapshots,
-        statistics_files=updated_metadata.statistics,
-        partition_statistics_files=updated_metadata.partition_statistics,
-        max_concurrent_manifest_reads=max_concurrent_manifest_reads,
+    deleted_metadata = 0
+    if clean_expired_metadata and pre_metadata is not None:
+        deleted_metadata = _clean_metadata(
+            table=table,
+            pre_metadata=pre_metadata,
+            max_concurrent_deletes=max_concurrent_deletes,
+            delete_num_retries=delete_num_retries,
+            delete_backoff_base=delete_backoff_base,
+        )
+
+    return ExpireResult(
+        deleted_data_files_count=counts.get(KIND_DATA, 0),
+        deleted_position_delete_files_count=counts.get(KIND_POS_DELETE, 0),
+        deleted_equality_delete_files_count=counts.get(KIND_EQ_DELETE, 0),
+        deleted_manifest_files_count=counts.get(KIND_MANIFEST, 0),
+        deleted_manifest_lists_count=counts.get(KIND_MANIFEST_LIST, 0),
+        deleted_statistics_files_count=counts.get(KIND_STATS, 0),
+        deleted_metadata_files_count=deleted_metadata,
     )
 
-    if stream_results:
-        candidates: Iterable[tuple[str, str]] = _stream_candidate_paths(
-            table=table,
-            snapshots=expired_snapshots,
-            statistics_files=original_metadata.statistics,
-            partition_statistics_files=original_metadata.partition_statistics,
-            expired_ids=expired_ids,
-            max_concurrent_manifest_reads=max_concurrent_manifest_reads,
-        )
-        to_delete: Iterable[tuple[str, str]] = (
-            (path, kind) for path, kind in candidates if path not in kept_paths
-        )
-    else:
-        candidate_paths, _ = _collect_paths(
-            table=table,
-            snapshots=expired_snapshots,
-            statistics_files=[
-                s for s in original_metadata.statistics if s.snapshot_id in expired_ids
-            ],
-            partition_statistics_files=[
-                s
-                for s in original_metadata.partition_statistics
-                if s.snapshot_id in expired_ids
-            ],
-            max_concurrent_manifest_reads=max_concurrent_manifest_reads,
-        )
-        to_delete = [(p, k) for p, k in candidate_paths.items() if p not in kept_paths]
 
-    counts, _failed = delete_files(
+def _expire_file_frame(table: PyIcebergTable) -> DataFrame:
+    """Build a ``(path, kind)`` frame of every file the table currently references.
+
+    Spans the data and delete files, manifests, manifest lists, and statistics
+    files reachable from all snapshots. Table-metadata files are excluded; they
+    are handled separately so that retiring an old metadata pointer is not
+    mistaken for a data-file deletion.
+    """
+    content = content_frame(
+        table.inspect.all_files(), path_col="file_path", content_col="content"
+    )
+    manifests = manifest_frame(table.inspect.all_manifests(), path_col="path")
+    extra: list[tuple[str, str]] = []
+    md = table.metadata
+    for snap in md.snapshots:
+        ml = getattr(snap, "manifest_list", None)
+        if ml:
+            extra.append((ml, KIND_MANIFEST_LIST))
+    for s in getattr(md, "statistics", []) or []:
+        extra.append((s.statistics_path, KIND_STATS))
+    for s in getattr(md, "partition_statistics", []) or []:
+        extra.append((s.statistics_path, KIND_STATS))
+    return union_paths([content, manifests, paths_frame(extra)])
+
+
+def _metadata_file_paths(table: PyIcebergTable) -> list[str]:
+    """Return the table-metadata files recorded by the table, plus the current one."""
+    md = table.metadata
+    out: list[str] = []
+    for entry in getattr(md, "metadata_log", []) or []:
+        if entry.metadata_file:
+            out.append(entry.metadata_file)
+    current = getattr(table, "metadata_location", None)
+    if current:
+        out.append(current)
+    return out
+
+
+def _clean_metadata(
+    *,
+    table: PyIcebergTable,
+    pre_metadata: set[str],
+    max_concurrent_deletes: int,
+    delete_num_retries: int,
+    delete_backoff_base: float,
+) -> int:
+    """Delete metadata files no longer referenced after expiry; keep the current one."""
+    survivors = set(_metadata_file_paths(table))
+    stale = [p for p in pre_metadata if p not in survivors]
+    if not stale:
+        return 0
+    md_counts, _failed = delete_files(
         table=table,
-        to_delete=to_delete,
+        to_delete=((p, KIND_METADATA) for p in stale),
         max_concurrent_deletes=max_concurrent_deletes,
         num_retries=delete_num_retries,
         backoff_base=delete_backoff_base,
-        op_name="expire_snapshots",
+        op_name="expire_snapshots_metadata",
     )
-    return ExpireResult(
-        deleted_data_files_count=counts.get(_KIND_DATA, 0),
-        deleted_position_delete_files_count=counts.get(_KIND_POS_DELETE, 0),
-        deleted_equality_delete_files_count=counts.get(_KIND_EQ_DELETE, 0),
-        deleted_manifest_files_count=counts.get(_KIND_MANIFEST, 0),
-        deleted_manifest_lists_count=counts.get(_KIND_MANIFEST_LIST, 0),
-        deleted_statistics_files_count=counts.get(_KIND_STATS, 0),
-    )
+    return md_counts.get(KIND_METADATA, 0)
 
 
 def _protected_snapshot_ids(table: PyIcebergTable) -> set[int]:
@@ -313,142 +393,3 @@ def _commit_expire(table: PyIcebergTable, expired_ids: set[int]) -> None:
             "expire_snapshots: metadata commit could not land within the retry budget"
         ) from exc
 
-
-_KIND_DATA = "data"
-_KIND_POS_DELETE = "pos_delete"
-_KIND_EQ_DELETE = "eq_delete"
-_KIND_MANIFEST = "manifest"
-_KIND_MANIFEST_LIST = "manifest_list"
-_KIND_STATS = "stats"
-
-
-def _collect_paths(
-    *,
-    table: PyIcebergTable,
-    snapshots: Iterable[Any],
-    statistics_files: Iterable[Any],
-    partition_statistics_files: Iterable[Any],
-    max_concurrent_manifest_reads: int,
-) -> tuple[dict[str, str], int]:
-    """Return ``{path: kind}`` for every file reachable from ``snapshots`` and statistics."""
-    paths: dict[str, str] = {}
-    manifest_files: list[Any] = []
-
-    for snap in snapshots:
-        ml = getattr(snap, "manifest_list", None)
-        if ml:
-            paths.setdefault(ml, _KIND_MANIFEST_LIST)
-        try:
-            for m in snap.manifests(table.io):
-                manifest_files.append(m)
-                paths.setdefault(m.manifest_path, _KIND_MANIFEST)
-        except Exception as exc:
-            if not is_not_found(exc):
-                raise
-            logger.warning(
-                "expire_snapshots: manifest list missing for snapshot %s (%s); skipping",
-                getattr(snap, "snapshot_id", "?"),
-                ml,
-            )
-
-    for entry_path, kind in _read_manifest_entries(
-        table=table,
-        manifests=manifest_files,
-        max_workers=max_concurrent_manifest_reads,
-    ):
-        paths.setdefault(entry_path, kind)
-
-    for s in statistics_files:
-        paths.setdefault(s.statistics_path, _KIND_STATS)
-    for s in partition_statistics_files:
-        paths.setdefault(s.statistics_path, _KIND_STATS)
-
-    return paths, len(manifest_files)
-
-
-def _read_manifest_entries(
-    *,
-    table: PyIcebergTable,
-    manifests: list[ManifestFile],
-    max_workers: int,
-) -> Iterator[tuple[str, str]]:
-    """Yield ``(path, kind)`` for every live data/delete file across ``manifests``."""
-    from pyiceberg.manifest import DataFileContent
-
-    def _read_one(m: ManifestFile) -> list[tuple[str, str]]:
-        # discard_deleted=True so DELETED entries in a kept snapshot's manifest
-        # do not pin retired data files into kept_paths.
-        try:
-            entries = m.fetch_manifest_entry(table.io, discard_deleted=True)
-        except Exception as exc:
-            if not is_not_found(exc):
-                raise
-            logger.warning(
-                "expire_snapshots: manifest missing on object store: %s; skipping",
-                m.manifest_path,
-            )
-            return []
-        out: list[tuple[str, str]] = []
-        for e in entries:
-            f = e.data_file
-            content = getattr(f, "content", DataFileContent.DATA)
-            if content == DataFileContent.POSITION_DELETES:
-                kind = _KIND_POS_DELETE
-            elif content == DataFileContent.EQUALITY_DELETES:
-                kind = _KIND_EQ_DELETE
-            else:
-                kind = _KIND_DATA
-            out.append((f.file_path, kind))
-        return out
-
-    if not manifests:
-        return iter(())
-
-    workers = max(1, min(max_workers, len(manifests)))
-    if workers == 1:
-        for m in manifests:
-            yield from _read_one(m)
-        return
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for batch in pool.map(_read_one, manifests):
-            yield from batch
-
-
-def _stream_candidate_paths(
-    *,
-    table: PyIcebergTable,
-    snapshots: Iterable[Any],
-    statistics_files: Iterable[Any],
-    partition_statistics_files: Iterable[Any],
-    expired_ids: set[int],
-    max_concurrent_manifest_reads: int,
-) -> Iterator[tuple[str, str]]:
-    """Yield candidate paths snapshot-by-snapshot for memory-bounded expiration."""
-    for snap in snapshots:
-        ml = getattr(snap, "manifest_list", None)
-        if ml:
-            yield ml, _KIND_MANIFEST_LIST
-        try:
-            ms = list(snap.manifests(table.io))
-        except Exception as exc:
-            if not is_not_found(exc):
-                raise
-            logger.warning(
-                "expire_snapshots: manifest list missing for snapshot %s (%s); skipping",
-                getattr(snap, "snapshot_id", "?"),
-                ml,
-            )
-            continue
-        for m in ms:
-            yield m.manifest_path, _KIND_MANIFEST
-        yield from _read_manifest_entries(
-            table=table, manifests=ms, max_workers=max_concurrent_manifest_reads
-        )
-
-    for s in statistics_files:
-        if s.snapshot_id in expired_ids:
-            yield s.statistics_path, _KIND_STATS
-    for s in partition_statistics_files:
-        if s.snapshot_id in expired_ids:
-            yield s.statistics_path, _KIND_STATS

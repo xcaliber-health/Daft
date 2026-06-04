@@ -68,6 +68,10 @@ pub struct RewriteOptions {
     pub compression_factor: f64,
     pub zorder_max_output_size: u64,
     pub zorder_var_length_contribution: u32,
+    /// Number of sorted output partitions per target file for the sort and
+    /// z-order strategies. Higher values produce more, smaller, contiguously
+    /// ordered files; `1` produces one file per target size.
+    pub shuffle_partitions_per_file: u32,
 }
 
 impl Default for RewriteOptions {
@@ -92,6 +96,7 @@ impl Default for RewriteOptions {
             compression_factor: 1.0,
             zorder_max_output_size: DEFAULT_ZORDER_MAX_OUTPUT_SIZE,
             zorder_var_length_contribution: DEFAULT_ZORDER_VAR_LEN_CONTRIBUTION,
+            shuffle_partitions_per_file: 1,
         }
     }
 }
@@ -159,6 +164,12 @@ impl RewriteOptions {
         if self.max_concurrent_file_group_rewrites == 0 {
             return Err(invalid(
                 "max-concurrent-file-group-rewrites",
+                "must be >= 1".into(),
+            ));
+        }
+        if self.shuffle_partitions_per_file == 0 {
+            return Err(invalid(
+                "shuffle-partitions-per-file",
                 "must be >= 1".into(),
             ));
         }

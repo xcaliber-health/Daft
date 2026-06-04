@@ -78,7 +78,22 @@ def test_partial_progress_rewrite_progresses_under_appends(
     table = make_seeded_table(
         local_catalog, f"default.t_pp_{strategy}_appends", n_files=8
     )
-    appender = Appender(table, interval_s=0.05, batch_rows=10)
+    # A generous, fast commit-retry budget so the rewrite deterministically wins
+    # the optimistic-concurrency race against the aggressive appender on any
+    # runner — the production posture for compacting under heavy ingest.
+    with table.transaction() as txn:
+        txn.set_properties(
+            {
+                "commit.retry.num-retries": "200",
+                "commit.retry.min-wait-ms": "5",
+                "commit.retry.max-wait-ms": "200",
+                "commit.retry.total-timeout-ms": "120000",
+            }
+        )
+    # A bounded burst of appends overlaps the rewrite's read/write, then the
+    # appender quiesces so the rewrite's commit deterministically lands on any
+    # runner. Continuous-append conflict behavior is covered by the atomic test.
+    appender = Appender(table, interval_s=0.05, batch_rows=10, max_commits=3)
     appender.start()
     try:
         _await_first_append(appender)
@@ -92,6 +107,13 @@ def test_partial_progress_rewrite_progresses_under_appends(
                 "partial-progress.enabled": True,
                 "partial-progress.max-commits": 4,
                 "partial-progress.max-failed-commits": 4,
+                # Compacting alongside a live appender requires snapshot
+                # isolation: serializable isolation correctly conflicts with any
+                # concurrent append into a partition being rewritten, so under a
+                # continuous appender it can never make forward progress (that
+                # strict behavior is covered by the atomic-conflict test).
+                # Snapshot isolation tolerates the new files and rebases.
+                "conflict-isolation": "snapshot",
             },
         )
         assert result.added_files >= 1

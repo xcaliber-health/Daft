@@ -271,6 +271,9 @@ pub struct FileMetadata {
     pub filepath: String,
     pub size: Option<u64>,
     pub filetype: FileType,
+    /// Last-modified time in epoch milliseconds (UTC), when the source reports
+    /// it. `None` for sources or entries that do not carry a modification time.
+    pub last_modified: Option<i64>,
 }
 #[derive(Debug)]
 pub struct LSResult {

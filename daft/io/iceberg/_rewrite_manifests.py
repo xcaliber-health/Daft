@@ -1,11 +1,14 @@
 """Repack live manifest entries into target-sized manifests.
 
-Reads the current snapshot's manifests, retains only live entries, and writes
-a fresh manifest set sized to ``manifest-target-size-bytes``. Output entries
-are clustered by ``(spec_id, partition_key_tuple)`` so a partition-scoped
-query reads at most one manifest per partition. Commits a single REPLACE
-snapshot whose existing-manifests set is the new manifests plus any
-untouched manifests; data and delete files are unchanged.
+Reads the target branch's current snapshot manifests, retains only live
+entries, and writes a fresh manifest set sized to ``manifest-target-size-bytes``.
+Output entries are clustered by partition (optionally restricted to a subset of
+partition fields) so a partition-scoped query reads fewer manifests. Commits a
+single REPLACE snapshot whose existing-manifests set is the new manifests plus
+any untouched manifests; data and delete files are unchanged.
+
+Only data manifests for the chosen spec are repacked. Delete manifests and
+manifests for other specs are carried through unchanged.
 """
 
 from __future__ import annotations
@@ -122,15 +125,26 @@ def run(
             f"manifest-target-size-bytes must be > 0, got {target_size_bytes!r}"
         )
 
-    # Accepted for interface compatibility. Entries are read exactly once per
-    # input manifest as they stream into the rollers, so there is no shared
-    # intermediate to cache; the flag has no effect here.
+    read_concurrency = int(opts.get("manifest-read-concurrency", 1))
+    if read_concurrency < 1:
+        raise ValueError(
+            f"manifest-read-concurrency must be >= 1, got {read_concurrency!r}"
+        )
+
+    sort_by = opts.get("sort-by")
+    if sort_by is not None:
+        sort_by = [str(c) for c in sort_by]
+
+    # Accepted for interface compatibility. Entries stream into the rollers as
+    # each input manifest is read, so there is no shared intermediate to cache;
+    # the flag has no effect on the result.
     del use_caching
 
     validate_gc_enabled(table)
 
     resolved_spec_id = _resolve_spec_id(table, spec_id)
     target_branch = _resolve_branch(table, branch)
+    _validate_sort_by(table, resolved_spec_id, sort_by)
 
     plan = _plan(
         table=table,
@@ -164,6 +178,8 @@ def run(
             target_branch=target_branch,
             operation=Operation.REPLACE,
             target_size_bytes=target_size_bytes,
+            sort_by=sort_by,
+            read_concurrency=read_concurrency,
         )
 
     def _on_conflict(t: PyIcebergTable) -> RewriteManifestsResult | None:
@@ -290,6 +306,8 @@ def _commit_attempt(
     target_branch: str,
     operation: Any,
     target_size_bytes: int,
+    sort_by: list[str] | None,
+    read_concurrency: int,
 ) -> RewriteManifestsResult:
     snapshot_props = {
         SNAPSHOT_PROP_MAINTENANCE_OP: SNAPSHOT_PROP_MAINTENANCE_OP_VALUE,
@@ -311,6 +329,8 @@ def _commit_attempt(
             commit_uuid=_uuid.uuid4(),
             plan=plan,
             target_size_bytes=target_size_bytes,
+            sort_by=sort_by,
+            read_concurrency=read_concurrency,
         )
         producer.build_new_manifests()
         producer.snapshot_properties[SNAPSHOT_PROP_OUTPUT_MANIFESTS] = str(
@@ -344,9 +364,10 @@ _PRODUCER_CLASS: type | None = None
 def _producer_class() -> type:
     """Lazily build and cache the snapshot producer used for manifest rewrite.
 
-    The producer overrides ``_existing_manifests`` to return our untouched +
-    newly-written manifests and ``_deleted_entries`` to no-op, which is what a
-    manifest reshuffle requires.
+    The producer keeps the data and delete files unchanged: the new snapshot's
+    existing-manifest set is the untouched manifests plus the freshly written
+    ones, and no entries are marked deleted, which is what repacking manifests
+    requires.
     """
     global _PRODUCER_CLASS
     if _PRODUCER_CLASS is not None:
@@ -366,6 +387,8 @@ def _producer_class() -> type:
             commit_uuid: _uuid.UUID,
             plan: _Plan,
             target_size_bytes: int,
+            sort_by: list[str] | None = None,
+            read_concurrency: int = 1,
         ) -> None:
             super().__init__(
                 operation=operation,
@@ -377,6 +400,8 @@ def _producer_class() -> type:
             )
             self._plan = plan
             self._target_size_bytes = target_size_bytes
+            self._sort_by = sort_by
+            self._read_concurrency = max(1, int(read_concurrency))
             self._untouched_manifests: list[Any] = list(plan.untouched_manifests)
             self._new_manifests: list[Any] = []
             self._bytes_added = 0
@@ -459,16 +484,14 @@ def _producer_class() -> type:
             fallback_roll_at_entries = max(1, int(roll_at_bytes / avg_bytes))
 
             rollers: dict[tuple[int, tuple[Any, ...]], _RollingManifestWriter] = {}
+            specs = self._transaction.table_metadata.specs()
 
-            for manifest in self._plan.matching_manifests:
+            for manifest, entries in self._read_entries():
                 spec_id = manifest.partition_spec_id
-                spec = self._transaction.table_metadata.specs()[spec_id]
-
-                for entry in manifest.fetch_manifest_entry(
-                    self._io, discard_deleted=True
-                ):
-                    partition_key = _partition_key_tuple(entry.data_file)
-                    key = (spec_id, partition_key)
+                spec = specs[spec_id]
+                for entry in entries:
+                    cluster_key = _cluster_key(entry.data_file, spec, self._sort_by)
+                    key = (spec_id, cluster_key)
                     roller = rollers.get(key)
                     if roller is None:
                         roller = _RollingManifestWriter(
@@ -492,6 +515,29 @@ def _producer_class() -> type:
                 for mf in roller.finish():
                     self._new_manifests.append(mf)
                     self._bytes_added += int(mf.manifest_length)
+
+        def _read_entries(self) -> list[tuple[Any, list[Any]]]:
+            """Read live entries from each matching manifest, preserving input order.
+
+            With a read concurrency above one, manifests are fetched in parallel
+            and returned in their original order so the written output — and the
+            replay identity that depends on it — stays deterministic.
+            """
+            manifests = self._plan.matching_manifests
+            if self._read_concurrency == 1 or len(manifests) <= 1:
+                return [
+                    (m, list(m.fetch_manifest_entry(self._io, discard_deleted=True)))
+                    for m in manifests
+                ]
+            from concurrent.futures import ThreadPoolExecutor
+
+            def _read(m: Any) -> list[Any]:
+                return list(m.fetch_manifest_entry(self._io, discard_deleted=True))
+
+            workers = min(self._read_concurrency, len(manifests))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                entry_lists = list(pool.map(_read, manifests))
+            return list(zip(manifests, entry_lists))
 
     _PRODUCER_CLASS = _RewriteManifestsProducer
     return _PRODUCER_CLASS
@@ -565,21 +611,54 @@ def _manifest_writer_bytes(writer: ManifestWriter | None) -> int | None:
         return None
 
 
-def _partition_key_tuple(data_file: Any) -> tuple[Any, ...]:
-    """Stable hashable representation of a data file's partition tuple."""
+def _partition_values_in_order(partition: Any, n: int) -> list[Any]:
+    """Return a partition record's values aligned to its spec's field order."""
+    try:
+        return [partition[i] for i in range(n)]
+    except (TypeError, IndexError, KeyError):
+        pass
+    try:
+        return list(partition)[:n]
+    except TypeError:
+        return list((getattr(partition, "__dict__", None) or {}).values())[:n]
+
+
+def _cluster_key(
+    data_file: Any, spec: PartitionSpec, sort_by: list[str] | None
+) -> tuple[Any, ...]:
+    """Stable clustering key for a data file's partition.
+
+    Output entries that share this key are grouped into the same manifest, so a
+    query filtered on the corresponding partition fields reads fewer manifests.
+    By default the full partition tuple is used; ``sort_by`` restricts the key
+    to the named partition fields.
+    """
     partition = getattr(data_file, "partition", None)
     if partition is None:
         return ()
-    items = getattr(partition, "__dict__", None) or {}
-    if items:
-        return tuple(sorted(items.items()))
-    fields = getattr(partition, "_fields", None)
-    if fields:
-        return tuple(getattr(partition, f) for f in fields)
-    try:
-        return tuple(partition)
-    except TypeError:
-        return (partition,)
+    names = [f.name for f in spec.fields]
+    values = _partition_values_in_order(partition, len(names))
+    pairs = list(zip(names, values))
+    if sort_by:
+        wanted = set(sort_by)
+        pairs = [(n, v) for n, v in pairs if n in wanted]
+    return tuple(pairs)
+
+
+def _validate_sort_by(
+    table: PyIcebergTable, spec_id: int, sort_by: list[str] | None
+) -> None:
+    """Reject ``sort_by`` columns that are not partition fields of the spec."""
+    if not sort_by:
+        return
+    spec = table.specs()[spec_id]
+    names = {f.name for f in spec.fields}
+    bad = [c for c in sort_by if c not in names]
+    if bad:
+        raise ValueError(
+            f"sort-by columns {bad!r} are not partition fields of spec {spec_id} "
+            f"(available: {sorted(names)})"
+        )
 
 
 def _resolve_spec_id(table: PyIcebergTable, spec_id: int | None) -> int:

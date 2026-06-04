@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -162,13 +163,6 @@ def run(
             raw_options["target-file-size-bytes"] = int(prop)
     normalized = _rust_iceberg.validate_options_py(raw_options)
 
-    if "use-starting-sequence-number" in raw_options:
-        raise ValueError(
-            "rewrite_data_files: option `use-starting-sequence-number` is not "
-            "supported. Output files are assigned sequence numbers at commit "
-            "time; remove the option to proceed."
-        )
-
     row_filter = where if where is not None else AlwaysTrue()
     scan_kwargs: dict[str, Any] = {"row_filter": row_filter}
     if branch is not None:
@@ -301,15 +295,27 @@ def _rewrite_groups(
     sort_order: list[tuple[str, bool, bool]] | None,
     zorder_by: list[str] | None,
 ) -> list[_GroupOutput]:
-    """Rewrite each file group in turn through the streaming engine.
+    """Rewrite the file groups through the streaming engine, bounded in flight.
 
-    Groups are processed sequentially: within a group the read, optional
-    re-clustering, and write all stream through the execution engine, which
-    bounds peak memory to the engine's budget rather than the group's full
-    decompressed size. Running groups one at a time keeps that bound flat.
+    Within a group the read, optional re-clustering, and write all stream through
+    the execution engine, which bounds peak memory to the engine's budget rather
+    than the group's full decompressed size.
+
+    On a distributed runner, up to ``max-concurrent-file-group-rewrites`` groups
+    are dispatched at once so they spread across the cluster; the bound caps how
+    many group working sets are in flight. On a single-node runner the groups
+    run one at a time because the engine already parallelizes each group across
+    all cores and does not accept concurrent plan submissions; the bound is still
+    honored as an upper limit. Outputs are returned in input order regardless of
+    completion order.
     """
-    return [
-        _rewrite_group(
+    from daft import runners
+
+    max_concurrent = max(1, int(normalized_options["max-concurrent-file-group-rewrites"]))
+    distributed = runners.get_or_create_runner().name == "ray"
+
+    def _run_one(g: dict[str, Any]) -> _GroupOutput:
+        return _rewrite_group(
             table=table,
             group=g,
             plan_by_path=plan_by_path,
@@ -320,8 +326,17 @@ def _rewrite_groups(
             sort_order=sort_order,
             zorder_by=zorder_by,
         )
-        for g in groups
-    ]
+
+    if not distributed or max_concurrent == 1 or len(groups) <= 1:
+        return [_run_one(g) for g in groups]
+
+    outputs: list[_GroupOutput | None] = [None] * len(groups)
+    workers = min(max_concurrent, len(groups))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_run_one, g): i for i, g in enumerate(groups)}
+        for fut in as_completed(futures):
+            outputs[futures[fut]] = fut.result()
+    return [o for o in outputs if o is not None]
 
 
 def _augment_result_with_dangling(
@@ -460,6 +475,7 @@ def _rewrite_group(
         io_config=io_config,
     )
 
+    write_target = target_size
     if strategy == "sort":
         assert sort_order is not None
         df = df.sort(
@@ -467,15 +483,24 @@ def _rewrite_group(
             desc=[descending for (_, descending, _) in sort_order],
             nulls_first=[nulls_first for (_, _, nulls_first) in sort_order],
         )
+        write_target = _shuffled_target_size(target_size, normalized_options)
     elif strategy == "zorder":
         assert zorder_by is not None
         df = _apply_zorder(df, zorder_by, normalized_options)
+        write_target = _shuffled_target_size(target_size, normalized_options)
+    else:  # binpack: no re-clustering, so coalesce to target-sized partitions
+        df = _coalesce_binpack(
+            df,
+            n_inputs=len(input_paths),
+            bytes_rewritten=bytes_rewritten,
+            target_size=target_size,
+        )
 
     data_files = _collect_data_files(
         df=df,
         table=table,
         io_config=io_config,
-        target_size=target_size,
+        target_size=write_target,
         output_spec_id=output_spec_id,
     )
     bytes_added = sum(int(getattr(d, "file_size_in_bytes", 0)) for d in data_files)
@@ -542,6 +567,44 @@ def _apply_zorder(
         .sort(_ZORDER_KEY_COL, desc=False, nulls_first=True)
         .exclude(_ZORDER_KEY_COL)
     )
+
+
+_MIN_SHUFFLED_TARGET_BYTES = 1024 * 1024
+
+
+def _coalesce_binpack(
+    df: DataFrame, *, n_inputs: int, bytes_rewritten: int, target_size: int
+) -> DataFrame:
+    """Coalesce a binpack group to roughly target-sized partitions on a cluster.
+
+    A distributed write emits one output file per input partition, so packing
+    many small files would not reduce the file count without first reducing the
+    partition count. The size-based writer still rolls an oversized partition
+    into multiple files, so only coalescing (never splitting) is required here.
+    A single-node run streams and rolls by size already, leaving this a no-op.
+    """
+    from daft import runners
+
+    if runners.get_or_create_runner().name != "ray":
+        return df
+    target_partitions = max(1, (bytes_rewritten + target_size - 1) // target_size)
+    if target_partitions < n_inputs:
+        return df.into_partitions(target_partitions)
+    return df
+
+
+def _shuffled_target_size(target_size: int, normalized_options: dict[str, Any]) -> int:
+    """Scale the write target by the shuffle-partitions-per-file factor.
+
+    A factor greater than one yields proportionally more, smaller, contiguously
+    ordered output files for the sort and z-order strategies, mirroring the
+    effect of subdividing each output file across ordered partitions. The result
+    is floored so a large factor cannot drive the target below a usable size.
+    """
+    factor = int(normalized_options.get("shuffle-partitions-per-file", 1))
+    if factor <= 1:
+        return target_size
+    return max(_MIN_SHUFFLED_TARGET_BYTES, target_size // factor)
 
 
 def _collect_data_files(

@@ -92,6 +92,7 @@ impl GlobScanSource {
                             .map(move |files_chunk| {
                                 let mut paths = Vec::with_capacity(files_chunk.len());
                                 let mut sizes = Vec::with_capacity(files_chunk.len());
+                                let mut mtimes = Vec::with_capacity(files_chunk.len());
 
                                 for file_result in files_chunk {
                                     match file_result {
@@ -100,6 +101,7 @@ impl GlobScanSource {
                                             if seen_paths.insert(filepath.clone()) {
                                                 paths.push(filepath);
                                                 sizes.push(file_metadata.size.map(|s| s as i64));
+                                                mtimes.push(file_metadata.last_modified);
                                             }
                                         }
                                         Err(daft_io::Error::NotFound { path, .. }) => {
@@ -120,10 +122,15 @@ impl GlobScanSource {
                                 let rows_array =
                                     Int64Array::full_null("num_rows", &DataType::Int64, num_rows)
                                         .into_series();
+                                let mtime_array = Int64Array::from_iter(
+                                    Field::new("mtime", DataType::Int64),
+                                    mtimes.into_iter(),
+                                )
+                                .into_series();
 
                                 let record_batch = RecordBatch::new_unchecked(
                                     schema.clone(),
-                                    vec![path_array, size_array, rows_array],
+                                    vec![path_array, size_array, rows_array, mtime_array],
                                     num_rows,
                                 );
                                 Ok(MicroPartition::new_loaded(

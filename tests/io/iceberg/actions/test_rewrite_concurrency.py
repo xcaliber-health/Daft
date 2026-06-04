@@ -1,15 +1,15 @@
-"""File groups are rewritten one at a time.
+"""File groups are rewritten concurrently up to a configurable bound.
 
-Each group's read, re-cluster, and write stream through the execution engine,
-which bounds memory to a single group. Processing groups sequentially keeps
-that bound flat, so the rewrite never runs two groups at once regardless of the
-``max-concurrent-file-group-rewrites`` value, which is retained for interface
-compatibility.
+Each group's read, re-cluster, and write stream through the execution engine.
+Up to ``max-concurrent-file-group-rewrites`` groups run at once; the bound caps
+how many group working sets share the engine budget. The number of concurrent
+groups never exceeds the bound, and the result is independent of it.
 """
 
 from __future__ import annotations
 
 import threading
+import time
 
 import pyarrow as pa
 import pytest
@@ -61,6 +61,9 @@ def _instrument_peak_concurrency(monkeypatch):
             active["current"] += 1
             active["peak"] = max(active["peak"], active["current"])
         try:
+            # Hold the slot briefly so genuinely-concurrent groups overlap and
+            # the observed peak reflects the configured bound deterministically.
+            time.sleep(0.05)
             return real_rewrite(*args, **kwargs)
         finally:
             with lock:
@@ -71,7 +74,7 @@ def _instrument_peak_concurrency(monkeypatch):
 
 
 @pytest.mark.parametrize("max_concurrent", [1, 4])
-def test_groups_rewrite_sequentially(local_catalog, monkeypatch, max_concurrent):
+def test_concurrency_bounded_by_option(local_catalog, monkeypatch, max_concurrent):
     table = _make_partitioned(local_catalog, f"default.t_conc_{max_concurrent}")
     active = _instrument_peak_concurrency(monkeypatch)
 
@@ -84,9 +87,18 @@ def test_groups_rewrite_sequentially(local_catalog, monkeypatch, max_concurrent)
         }
     )
 
-    assert active["peak"] == 1, (
-        f"groups must rewrite one at a time, observed peak={active['peak']}"
+    from daft import runners
+
+    # The number of groups running at once never exceeds the configured bound,
+    # on any runner.
+    assert 1 <= active["peak"] <= max_concurrent, (
+        f"observed peak={active['peak']} outside [1, {max_concurrent}]"
     )
+    if max_concurrent == 1:
+        assert active["peak"] == 1, "groups must not overlap when the bound is 1"
+    elif runners.get_or_create_runner().name == "ray":
+        # Three partitions form three groups; a distributed runner overlaps them.
+        assert active["peak"] >= 2, "distributed groups should run concurrently"
 
 
 def test_concurrency_option_does_not_change_result(local_catalog):

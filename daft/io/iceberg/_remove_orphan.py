@@ -1,44 +1,59 @@
 """Delete files under the table location that no snapshot still references.
 
-Lists physical files under the table root, subtracts the union of files
-reachable from every snapshot, and deletes the remainder. The set-difference
-between listed and reachable paths is delegated to a Rust helper; metadata
-traversal, path normalization, and deletion run in Python.
+Lists the files physically present under the table root and subtracts the files
+reachable from any snapshot; the remainder is deleted. Listing, canonicalization,
+and the set-difference run through the execution engine, so the work distributes
+on a cluster and streams on a single host, scaling to very large tables. The
+match is performed on canonicalized paths so that equivalent spellings of one
+location (an aliased scheme or host) never flag a live file as an orphan.
 """
 
 from __future__ import annotations
 
 import datetime as _dt
 import logging
-import re
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Iterable, Iterator
+from typing import TYPE_CHECKING, Any
 
 from daft.io.iceberg._common import (
     DEFAULT_DELETE_BACKOFF_BASE_SECONDS,
     DEFAULT_DELETE_NUM_RETRIES,
     DEFAULT_MAX_CONCURRENT_DELETES,
-    delete_files,
     validate_gc_enabled,
+)
+from daft.io.iceberg._engine import (
+    KIND_MANIFEST_LIST,
+    KIND_METADATA,
+    KIND_STATS,
+    CanonSpec,
+    build_canon_spec,
+    content_frame,
+    engine_delete,
+    file_list_view_frame,
+    find_orphans,
+    io_config_for_table,
+    listed_files_frame,
+    manifest_frame,
+    paths_frame,
+    union_paths,
+    with_uri_parts,
 )
 
 if TYPE_CHECKING:
     from pyiceberg.table import Table as PyIcebergTable
+
+    from daft.dataframe import DataFrame
 
 logger = logging.getLogger(__name__)
 
 
 DEFAULT_OLDER_THAN_MS = 3 * 24 * 60 * 60 * 1000
 MIN_AGE_MS = 24 * 60 * 60 * 1000
-DEFAULT_MAX_CONCURRENT_LIST = 4
 DEFAULT_SAMPLE_LIMIT = 1000
 
 _VALID_PREFIX_MODES = frozenset({"error", "delete", "ignore"})
-_SCHEME_ALIASES = {"s3a": "s3", "s3n": "s3"}
-_SCHEME_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+\-.]*)://")
-_ORPHAN_KIND = "file"
+_DEFAULT_SPEC = build_canon_spec(None, None)
 
 
 @dataclass(frozen=True)
@@ -48,18 +63,19 @@ class RemoveOrphanResult:
     Parameters
     ----------
     orphan_files_count
-        Number of files identified as orphans (present in listing, absent
+        Number of files identified as orphans (present in the listing, absent
         from the table's reachable set).
     deleted_files_count
         Number of orphans successfully deleted. Equals ``orphan_files_count``
         unless ``dry_run=True`` or some deletes failed.
     sample_paths
-        Up to ``sample-limit`` orphan paths in listing order. Useful for
-        operator review when running with ``dry_run=True``.
+        Up to ``sample-limit`` orphan paths. Useful for operator review when
+        running with ``dry_run=True``.
     skipped_prefix_mismatch_count
         Number of listed files dropped from the candidate set because their
         scheme/authority did not match any reachable path and
-        ``prefix_mismatch_mode`` was ``"ignore"``.
+        ``prefix_mismatch_mode`` was ``"ignore"`` (or rejected under
+        ``"error"``).
     failed_deletes
         Orphans whose delete exhausted the per-file retry budget.
     """
@@ -82,6 +98,8 @@ def run(
     location: str | None = None,
     dry_run: bool = False,
     prefix_mismatch_mode: str = "error",
+    file_list_view: DataFrame | None = None,
+    prefix_listing: bool = False,
     stream_results: bool = False,
     options: dict[str, Any] | None = None,
 ) -> RemoveOrphanResult:
@@ -92,15 +110,10 @@ def run(
         )
 
     opts = options or {}
-    max_concurrent_list = int(
-        opts.get("max-concurrent-list", DEFAULT_MAX_CONCURRENT_LIST)
-    )
     max_concurrent_deletes = int(
         opts.get("max-concurrent-deletes", DEFAULT_MAX_CONCURRENT_DELETES)
     )
-    delete_num_retries = int(
-        opts.get("delete-num-retries", DEFAULT_DELETE_NUM_RETRIES)
-    )
+    delete_num_retries = int(opts.get("delete-num-retries", DEFAULT_DELETE_NUM_RETRIES))
     delete_backoff_base = float(
         opts.get("delete-backoff-base-seconds", DEFAULT_DELETE_BACKOFF_BASE_SECONDS)
     )
@@ -110,52 +123,38 @@ def run(
     validate_gc_enabled(table)
 
     older_than_ms = _resolve_older_than_ms(older_than, allow_recent=allow_recent)
-
     base_location = _resolve_location(table, location)
+    spec = _build_canonicalizer(opts)
 
-    canon = _build_canonicalizer(opts)
-    reachable = _reachable_paths(table, canon)
+    reachable = with_uri_parts(_reachable_frame(table), spec)
+    listed = with_uri_parts(
+        _listed_frame(
+            table,
+            location=base_location,
+            older_than_ms=older_than_ms,
+            file_list_view=file_list_view,
+            prefix_listing=prefix_listing,
+        ),
+        spec,
+    ).distinct("canon_path")
 
-    listed_iter = _list_files(
-        base_location,
-        older_than_ms=older_than_ms,
-        max_workers=max_concurrent_list,
-        canon=canon,
-    )
+    orphans, mismatched = find_orphans(listed, reachable, mode=prefix_mismatch_mode)
 
-    candidates, mismatched = _apply_prefix_mode(
-        listed_iter,
-        reachable=reachable,
-        mode=prefix_mismatch_mode,
-        canon=canon,
-    )
-
-    if not stream_results:
-        candidates = list(candidates)
-
-    orphans = _compute_orphans(candidates, reachable)
-
-    sample = orphans[:sample_limit]
-    if dry_run:
-        return RemoveOrphanResult(
-            orphan_files_count=len(orphans),
-            deleted_files_count=0,
-            sample_paths=sample,
-            skipped_prefix_mismatch_count=mismatched,
-            failed_deletes=0,
-        )
-
-    counts, failed = delete_files(
-        table=table,
-        to_delete=((p, _ORPHAN_KIND) for p in orphans),
+    counts, failed, sample, total = engine_delete(
+        table,
+        orphans,
+        has_kind=False,
+        dry_run=dry_run,
+        stream=stream_results,
+        sample_limit=sample_limit,
         max_concurrent_deletes=max_concurrent_deletes,
         num_retries=delete_num_retries,
         backoff_base=delete_backoff_base,
         op_name="remove_orphan_files",
     )
-    deleted = counts.get(_ORPHAN_KIND, 0)
+    deleted = 0 if dry_run else sum(counts.values())
     return RemoveOrphanResult(
-        orphan_files_count=len(orphans),
+        orphan_files_count=total,
         deleted_files_count=deleted,
         sample_paths=sample,
         skipped_prefix_mismatch_count=mismatched,
@@ -191,260 +190,70 @@ def _resolve_location(table: PyIcebergTable, location: str | None) -> str:
     if location is None:
         return table_loc
     loc = location.rstrip("/")
-    if _canonical(loc) != _canonical(table_loc) and not _canonical(loc).startswith(
-        _canonical(table_loc) + "/"
-    ):
+    table_canon = _DEFAULT_SPEC.canonical(table_loc)
+    loc_canon = _DEFAULT_SPEC.canonical(loc)
+    if loc_canon != table_canon and not loc_canon.startswith(table_canon + "/"):
         raise ValueError(
             f"location={location!r} is not a subpath of table.location()={table.location()!r}"
         )
     return loc
 
 
-def _reachable_paths(table: PyIcebergTable, canon: _PathCanonicalizer) -> set[str]:
-    """Return canonical paths of every file the table metadata still references.
+def _reachable_frame(table: PyIcebergTable) -> DataFrame:
+    """Build a frame of every file path the table references across all snapshots.
 
-    Includes data and delete files (across all snapshots), manifest files,
-    manifest lists, statistics and partition-statistics files, every recorded
-    metadata.json (current + log), and the table's own metadata pointer file.
+    Spans data and delete files, manifests, manifest lists, statistics files,
+    every recorded table-metadata file, and the current metadata pointer.
     """
-    paths: set[str] = set()
-
-    try:
-        data_files_tbl = table.inspect.all_files()
-        for p in data_files_tbl.column("file_path").to_pylist():
-            if p:
-                paths.add(canon.canonical(p))
-    except Exception as exc:
-        logger.warning("remove_orphan_files: inspect.all_files failed: %r", exc)
-
-    try:
-        manifests_tbl = table.inspect.all_manifests()
-        for p in manifests_tbl.column("path").to_pylist():
-            if p:
-                paths.add(canon.canonical(p))
-    except Exception as exc:
-        logger.warning("remove_orphan_files: inspect.all_manifests failed: %r", exc)
-
-    for snap in table.metadata.snapshots:
+    content = content_frame(
+        table.inspect.all_files(), path_col="file_path", content_col="content"
+    )
+    manifests = manifest_frame(table.inspect.all_manifests(), path_col="path")
+    extra: list[tuple[str, str]] = []
+    md = table.metadata
+    for snap in md.snapshots:
         ml = getattr(snap, "manifest_list", None)
         if ml:
-            paths.add(canon.canonical(ml))
-
-    for s in getattr(table.metadata, "statistics", []) or []:
-        paths.add(canon.canonical(s.statistics_path))
-    for s in getattr(table.metadata, "partition_statistics", []) or []:
-        paths.add(canon.canonical(s.statistics_path))
-
-    for entry in getattr(table.metadata, "metadata_log", []) or []:
-        paths.add(canon.canonical(entry.metadata_file))
+            extra.append((ml, KIND_MANIFEST_LIST))
+    for s in getattr(md, "statistics", []) or []:
+        extra.append((s.statistics_path, KIND_STATS))
+    for s in getattr(md, "partition_statistics", []) or []:
+        extra.append((s.statistics_path, KIND_STATS))
+    for entry in getattr(md, "metadata_log", []) or []:
+        if entry.metadata_file:
+            extra.append((entry.metadata_file, KIND_METADATA))
     current_md = getattr(table, "metadata_location", None)
     if current_md:
-        paths.add(canon.canonical(current_md))
+        extra.append((current_md, KIND_METADATA))
+    return union_paths([content, manifests, paths_frame(extra)])
 
-    return paths
 
+def _listed_frame(
+    table: PyIcebergTable,
+    *,
+    location: str,
+    older_than_ms: int,
+    file_list_view: DataFrame | None,
+    prefix_listing: bool,
+) -> DataFrame:
+    """Build the frame of physically-present files to compare against the table.
 
-def _list_files(
-    location: str, *, older_than_ms: int, max_workers: int, canon: _PathCanonicalizer
-) -> Iterator[str]:
-    """Yield canonical paths under ``location`` modified before ``older_than_ms``.
-
-    Walks the underlying filesystem (PyArrow) starting from the immediate child
-    directories of ``location`` in parallel. Files at the top level are walked
-    inline. Mtime-newer-than-cutoff files are skipped to avoid racing live writers.
-    Each path is canonicalized so it compares equal to a reachable path that
-    names the same location through an equivalent scheme or authority.
+    Uses a caller-supplied inventory when given, otherwise lists the object
+    store through the engine. The ``prefix_listing`` flag is accepted for flat
+    object-store listing semantics; engine listing is already prefix-based on
+    object stores.
     """
-    import pyarrow.fs as pafs
-
-    fs, base = pafs.FileSystem.from_uri(location)
-    scheme = canon.scheme_of(canon.canonical(location))
-
-    try:
-        children = fs.get_file_info(pafs.FileSelector(base, recursive=False))
-    except Exception as exc:
-        logger.warning("remove_orphan_files: top-level listing failed at %s: %r", base, exc)
-        return
-
-    top_files = [c for c in children if c.type == pafs.FileType.File]
-    top_dirs = [c.path for c in children if c.type == pafs.FileType.Directory]
-
-    for info in top_files:
-        if int(info.mtime_ns / 1_000_000) < older_than_ms:
-            yield canon.canonical(_scheme_join(scheme, info.path))
-
-    if not top_dirs:
-        return
-
-    workers = max(1, min(max_workers, len(top_dirs)))
-
-    def _walk(dir_path: str) -> list[str]:
-        out: list[str] = []
-        try:
-            entries = fs.get_file_info(pafs.FileSelector(dir_path, recursive=True))
-        except Exception as exc:
-            logger.warning(
-                "remove_orphan_files: subtree listing failed at %s: %r", dir_path, exc
-            )
-            return out
-        for info in entries:
-            if info.type != pafs.FileType.File:
-                continue
-            if int(info.mtime_ns / 1_000_000) >= older_than_ms:
-                continue
-            out.append(canon.canonical(_scheme_join(scheme, info.path)))
-        return out
-
-    if workers == 1:
-        for dir_path in top_dirs:
-            yield from _walk(dir_path)
-        return
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for batch in pool.map(_walk, top_dirs):
-            yield from batch
-
-
-def _apply_prefix_mode(
-    listed: Iterator[str], *, reachable: set[str], mode: str, canon: _PathCanonicalizer
-) -> tuple[Iterable[str], int]:
-    """Filter listed paths by scheme/authority match against the reachable set.
-
-    Parameters
-    ----------
-    listed
-        Iterator over canonical paths returned by the file lister.
-    reachable
-        Canonical paths the table metadata still references.
-    mode
-        ``"error"`` raises if any listed path's scheme/authority is absent
-        from the reachable set's prefixes; ``"delete"`` passes mismatches
-        through as candidates; ``"ignore"`` drops mismatches.
-    canon
-        Canonicalizer used to derive the scheme/authority prefix of each path.
-
-    Returns
-    -------
-    tuple of (candidates, skipped_count)
-        ``candidates`` is the filtered iterable; ``skipped_count`` is the
-        number of mismatches dropped under ``"ignore"``.
-    """
-    reachable_prefixes = {canon.prefix(p) for p in reachable}
-    skipped = 0
-    mismatches: list[str] = []
-    out: list[str] = []
-    for path in listed:
-        if canon.prefix(path) in reachable_prefixes:
-            out.append(path)
-            continue
-        if mode == "delete":
-            out.append(path)
-        elif mode == "ignore":
-            skipped += 1
-        else:
-            mismatches.append(path)
-    if mode == "error" and mismatches:
-        sample = mismatches[:5]
-        raise PrefixMismatchError(
-            f"remove_orphan_files: {len(mismatches)} listed file(s) use a "
-            f"scheme/authority not present in the table's reachable set. "
-            f"Sample: {sample!r}. Pass prefix_mismatch_mode='delete' or "
-            f"'ignore' to override."
+    if file_list_view is not None:
+        return file_list_view_frame(
+            file_list_view, location=location, older_than_ms=older_than_ms
         )
-    return out, skipped
+    del prefix_listing  # informational; engine listing already prefix-based
+    io_config = io_config_for_table(table)
+    return listed_files_frame(
+        location, io_config=io_config, older_than_ms=older_than_ms
+    )
 
 
-def _compute_orphans(candidates: Iterable[str], reachable: set[str]) -> list[str]:
-    """Return ``candidates - reachable`` using the Rust helper when available."""
-    listed = list(candidates)
-    if not listed:
-        return []
-    try:
-        from daft.daft import _iceberg as _iceberg_native
-    except ImportError:
-        _iceberg_native = None
-    if _iceberg_native is not None and hasattr(_iceberg_native, "orphan_diff_py"):
-        return _iceberg_native.orphan_diff_py(listed, list(reachable))
-    return [p for p in listed if p not in reachable]
-
-
-@dataclass(frozen=True)
-class _PathCanonicalizer:
-    """Map equivalent schemes and authorities to one canonical spelling.
-
-    Two paths that name the same physical location through different but
-    declared-equivalent schemes (such as ``s3a`` and ``s3``) or authorities
-    (such as a direct host and an endpoint alias) canonicalize to the same
-    string, so comparing reachable and listed paths does not flag a live file as
-    an orphan merely because the two sides spell its location differently.
-    """
-
-    scheme_aliases: dict[str, str]
-    authority_aliases: dict[str, str]
-
-    def canonical(self, path: str) -> str:
-        m = _SCHEME_RE.match(path)
-        if not m:
-            return path
-        scheme = m.group(1).lower()
-        scheme = self.scheme_aliases.get(scheme, scheme)
-        rest = path[m.end() :]
-        slash = rest.find("/")
-        if slash < 0:
-            authority, body = rest, ""
-        else:
-            authority, body = rest[:slash], rest[slash:]
-        authority = self.authority_aliases.get(authority, authority)
-        return f"{scheme}://{authority}{body}"
-
-    def scheme_of(self, canon: str) -> str:
-        idx = canon.find("://")
-        return canon[:idx] if idx >= 0 else ""
-
-    def prefix(self, canon: str) -> str:
-        idx = canon.find("://")
-        if idx < 0:
-            return ""
-        rest = canon[idx + 3 :]
-        slash = rest.find("/")
-        authority = rest if slash < 0 else rest[:slash]
-        return f"{canon[:idx]}://{authority}"
-
-
-_DEFAULT_CANONICALIZER = _PathCanonicalizer(scheme_aliases=_SCHEME_ALIASES, authority_aliases={})
-
-
-def _build_canonicalizer(opts: dict[str, Any]) -> _PathCanonicalizer:
-    """Build a path canonicalizer from the equivalence options.
-
-    The default scheme equivalences are always applied; caller-supplied
-    equivalences extend them.
-    """
-    scheme_aliases = dict(_SCHEME_ALIASES)
-    for key, value in (opts.get("equal-schemes") or {}).items():
-        scheme_aliases[str(key).lower()] = str(value).lower()
-    authority_aliases = {
-        str(key): str(value) for key, value in (opts.get("equal-authorities") or {}).items()
-    }
-    return _PathCanonicalizer(scheme_aliases=scheme_aliases, authority_aliases=authority_aliases)
-
-
-def _canonical(path: str) -> str:
-    return _DEFAULT_CANONICALIZER.canonical(path)
-
-
-def _scheme_of(canon: str) -> str:
-    return _DEFAULT_CANONICALIZER.scheme_of(canon)
-
-
-def _scheme_join(scheme: str, body: str) -> str:
-    body = body.lstrip("/") if scheme not in {"", "file"} else body
-    if not scheme:
-        return body
-    if scheme == "file":
-        return f"file://{body}" if body.startswith("/") else f"file:///{body}"
-    return f"{scheme}://{body}"
-
-
-def _prefix(canon_path: str) -> str:
-    return _DEFAULT_CANONICALIZER.prefix(canon_path)
+def _build_canonicalizer(opts: dict[str, Any]) -> CanonSpec:
+    """Build a path canonicalizer from the scheme/authority equivalence options."""
+    return build_canon_spec(opts.get("equal-schemes"), opts.get("equal-authorities"))

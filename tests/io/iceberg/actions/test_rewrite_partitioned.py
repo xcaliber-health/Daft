@@ -116,6 +116,9 @@ def test_identity_partition_each_output_has_correct_region(catalog):
 
 
 def test_bucket_partition_each_output_tagged_with_bucket(catalog):
+    # Seeding a bucket-partitioned table computes partition values through an
+    # optional native transform package; skip cleanly where it is not installed.
+    pytest.importorskip("pyiceberg_core")
     schema = Schema(
         NestedField(1, "id", LongType(), required=False),
         NestedField(2, "label", StringType(), required=False),
@@ -166,6 +169,7 @@ def test_bucket_partition_each_output_tagged_with_bucket(catalog):
 
 
 def test_truncate_partition_each_output_tagged_with_truncated_prefix(catalog):
+    pytest.importorskip("pyiceberg_core")
     schema = Schema(
         NestedField(1, "id", LongType(), required=False),
         NestedField(2, "name", StringType(), required=False),
@@ -206,6 +210,7 @@ def test_truncate_partition_each_output_tagged_with_truncated_prefix(catalog):
 
 
 def test_day_partition_each_output_tagged_with_day_int(catalog):
+    pytest.importorskip("pyiceberg_core")
     schema = Schema(
         NestedField(1, "id", LongType(), required=False),
         NestedField(2, "event_ts", TimestampType(), required=False),

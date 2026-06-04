@@ -185,3 +185,81 @@ def test_snapshot_summary_carries_daft_props(make_tiny_table):
     assert props.get("daft.output-manifests") == str(result.added_manifests_count)
     # Data totals carried over from parent snapshot.
     assert int(props.get("total-data-files", 0)) == 6
+
+
+def _make_partitioned(local_catalog, name: str):
+    from pyiceberg.partitioning import PartitionField, PartitionSpec
+    from pyiceberg.schema import Schema
+    from pyiceberg.transforms import IdentityTransform
+    from pyiceberg.types import LongType, NestedField, StringType
+
+    schema = Schema(
+        NestedField(1, "id", LongType(), required=False),
+        NestedField(2, "region", StringType(), required=False),
+    )
+    spec = PartitionSpec(
+        PartitionField(
+            source_id=2, field_id=1000, transform=IdentityTransform(), name="region"
+        )
+    )
+    table = local_catalog.create_table(name, schema=schema, partition_spec=spec)
+    for region in ("us", "eu", "ap"):
+        for k in range(3):
+            ids = list(range(k * 5, k * 5 + 5))
+            table.append(
+                pa.table(
+                    {
+                        "id": pa.array(ids, type=pa.int64()),
+                        "region": pa.array([region] * 5, type=pa.string()),
+                    }
+                )
+            )
+    return table
+
+
+def test_manifest_read_concurrency_preserves_result(make_tiny_table):
+    table = make_tiny_table(name="default.t_rm_conc", n_files=8, rows_per_file=2)
+    pre_ids = _read_ids(table)
+    dt = Table.from_iceberg(table)
+    opts = dict(_small_target_opts())
+    opts["manifest-read-concurrency"] = 4
+    result = dt.rewrite_manifests(options=opts)
+    assert result.rewritten_manifests_count == 8
+    assert result.added_manifests_count == 1
+    table.refresh()
+    assert _read_ids(table) == pre_ids
+
+
+def test_manifest_read_concurrency_invalid_rejected(make_tiny_table):
+    table = make_tiny_table(name="default.t_rm_conc_bad", n_files=3, rows_per_file=2)
+    dt = Table.from_iceberg(table)
+    with pytest.raises(ValueError, match="manifest-read-concurrency"):
+        dt.rewrite_manifests(options={"manifest-read-concurrency": 0})
+
+
+def test_use_caching_smoke(make_tiny_table):
+    table = make_tiny_table(name="default.t_rm_cache", n_files=6, rows_per_file=2)
+    pre_ids = _read_ids(table)
+    dt = Table.from_iceberg(table)
+    dt.rewrite_manifests(use_caching=True, options=_small_target_opts())
+    table.refresh()
+    assert _read_ids(table) == pre_ids
+
+
+def test_sort_by_invalid_field_rejected(make_tiny_table):
+    table = make_tiny_table(name="default.t_rm_sb_bad", n_files=3, rows_per_file=2)
+    dt = Table.from_iceberg(table)
+    with pytest.raises(ValueError, match="sort-by"):
+        dt.rewrite_manifests(options={"sort-by": ["not_a_partition_field"]})
+
+
+def test_sort_by_partition_field(local_catalog):
+    table = _make_partitioned(local_catalog, "default.t_rm_sb")
+    pre_ids = sorted(_read_ids(table))
+    dt = Table.from_iceberg(table)
+    result = dt.rewrite_manifests(
+        options={**_small_target_opts(), "sort-by": ["region"]}
+    )
+    assert result.snapshot_id is not None
+    table.refresh()
+    assert sorted(_read_ids(table)) == pre_ids

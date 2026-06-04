@@ -50,11 +50,19 @@ class Appender(threading.Thread):
     append to land deterministically rather than relying on ``time.sleep``.
     """
 
-    def __init__(self, table: Any, *, interval_s: float, batch_rows: int = 10) -> None:
+    def __init__(
+        self,
+        table: Any,
+        *,
+        interval_s: float,
+        batch_rows: int = 10,
+        max_commits: int | None = None,
+    ) -> None:
         super().__init__(daemon=True)
         self._table = table
         self._interval = interval_s
         self._batch = batch_rows
+        self._max_commits = max_commits
         self._stop_event = threading.Event()
         self.first_commit_event = threading.Event()
         self.commits = 0
@@ -91,6 +99,10 @@ class Appender(threading.Thread):
                 next_id += self._batch
             except BaseException as exc:  # noqa: BLE001
                 self.errors.append(exc)
+            if self._max_commits is not None and self.commits >= self._max_commits:
+                # Quiesce after a bounded burst so a concurrent maintenance
+                # commit has a window to land; the appends already overlapped it.
+                break
             self._stop_event.wait(self._interval)
 
 

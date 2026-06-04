@@ -104,6 +104,46 @@ def test_sort_descending_per_file_monotonic(shuffled_table):
         assert _read_parquet_sorted(path, "id", descending=True)
 
 
+def test_shuffle_partitions_per_file_preserves_sorted_rows(shuffled_table):
+    # The per-file file-count multiplier only materializes above the rolling
+    # floor; at unit scale the guarantee is that the option threads through
+    # without changing the row set and the output stays sorted.
+    pre_ids = sorted(int(r["id"]) for r in shuffled_table.scan().to_arrow().to_pylist())
+
+    dt = Table.from_iceberg(shuffled_table)
+    result = dt.rewrite_data_files(
+        "sort",
+        sort_order=[("id", "asc", "nulls-last")],
+        options={
+            "min-input-files": 2,
+            "rewrite-all": True,
+            "shuffle-partitions-per-file": 8,
+        },
+    )
+    shuffled_table.refresh()
+    post_ids = sorted(int(r["id"]) for r in shuffled_table.scan().to_arrow().to_pylist())
+    assert post_ids == pre_ids
+    assert result.added_files >= 1
+    for path in _output_data_paths(shuffled_table):
+        assert _read_parquet_sorted(path, "id", descending=False)
+
+
+def test_use_starting_sequence_number_option_is_accepted(shuffled_table):
+    dt = Table.from_iceberg(shuffled_table)
+    # Previously rejected outright; both values must now be accepted.
+    for value in (True, False):
+        result = dt.rewrite_data_files(
+            "sort",
+            sort_order=[("id", "asc", "nulls-last")],
+            options={
+                "rewrite-all": True,
+                "min-input-files": 2,
+                "use-starting-sequence-number": value,
+            },
+        )
+        assert result.rewrite_id
+
+
 def test_sort_requires_non_empty_order(shuffled_table):
     dt = Table.from_iceberg(shuffled_table)
     with pytest.raises(ValueError, match="non-empty sort_order"):

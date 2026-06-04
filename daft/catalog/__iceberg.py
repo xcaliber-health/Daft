@@ -37,8 +37,17 @@ from daft.io.iceberg._iceberg import read_iceberg
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from datetime import datetime
 
     from daft.dataframe import DataFrame
+    from daft.expressions import Expression
+    from daft.io.iceberg import (
+        ExpireResult,
+        IcebergMaintenanceOptions,
+        RemoveOrphanResult,
+        RewriteManifestsResult,
+        RewriteResult,
+    )
     from daft.io.partitioning import PartitionField
 
 
@@ -290,16 +299,16 @@ class IcebergTable(Table):
             return t
         raise ValueError(f"Unsupported iceberg table type: {type(obj)}")
 
-    def read(self, **options: Any | None) -> DataFrame:
+    def read(self, **options: int | None) -> DataFrame:
         Table._validate_options("Iceberg read", options, IcebergTable._read_options)
         return read_iceberg(self._inner, snapshot_id=options.get("snapshot_id"))
 
-    def append(self, df: DataFrame, **options: Any) -> None:
+    def append(self, df: DataFrame, **options: str | int | bool) -> None:
         self._validate_options("Iceberg write", options, IcebergTable._write_options)
 
         df.write_iceberg(self._inner, mode="append")
 
-    def overwrite(self, df: DataFrame, **options: Any) -> None:
+    def overwrite(self, df: DataFrame, **options: str | int | bool) -> None:
         self._validate_options("Iceberg write", options, IcebergTable._write_options)
 
         df.write_iceberg(self._inner, mode="overwrite")
@@ -310,10 +319,10 @@ class IcebergTable(Table):
         *,
         sort_order: list[tuple[str, str, str]] | None = None,
         zorder_by: list[str] | None = None,
-        where: Any | None = None,
+        where: str | Expression | None = None,
         branch: str | None = None,
-        options: dict[str, Any] | None = None,
-    ) -> Any:
+        options: IcebergMaintenanceOptions | None = None,
+    ) -> RewriteResult:
         """Compact or re-cluster the data files of this table.
 
         Reads matching data files, writes new files sized close to
@@ -351,9 +360,12 @@ class IcebergTable(Table):
             Tuning knobs: ``target-file-size-bytes``, ``min-input-files``,
             ``min-file-size-bytes``, ``max-file-size-bytes``,
             ``max-file-group-size-bytes``, ``rewrite-all``,
-            ``rewrite-job-order``, ``max-concurrent-file-group-rewrites``,
-            ``delete-file-threshold``, ``partial-progress.enabled``,
-            ``partial-progress.max-commits``,
+            ``rewrite-job-order``, ``max-concurrent-file-group-rewrites``
+            (groups rewritten in parallel, default 5),
+            ``shuffle-partitions-per-file`` (sort/zorder only; >1 yields more,
+            smaller, ordered files), ``use-starting-sequence-number``
+            (default true), ``delete-file-threshold``,
+            ``partial-progress.enabled``, ``partial-progress.max-commits``,
             ``partial-progress.max-failed-commits``, ``compression-factor``,
             ``remove-dangling-deletes``, ``zorder.max-output-size``,
             ``zorder.var-length-contribution``,
@@ -408,13 +420,14 @@ class IcebergTable(Table):
     def expire_snapshots(
         self,
         *,
-        older_than: Any | None = None,
+        older_than: datetime | int | None = None,
         retain_last: int | None = None,
         snapshot_ids: list[int] | None = None,
         clean_expired_files: bool = True,
+        clean_expired_metadata: bool = False,
         stream_results: bool = False,
-        options: dict[str, Any] | None = None,
-    ) -> Any:
+        options: IcebergMaintenanceOptions | None = None,
+    ) -> ExpireResult:
         """Expire old snapshots and reclaim their files.
 
         Parameters
@@ -435,10 +448,13 @@ class IcebergTable(Table):
             When ``True``, physically delete files (data, position deletes,
             equality deletes, manifests, manifest lists, statistics) that become
             unreachable. When ``False``, only the snapshot metadata is removed.
+        clean_expired_metadata : bool, default False
+            When ``True``, also delete table-metadata files that are no longer
+            referenced after the surviving snapshots are computed. The current
+            metadata pointer is always retained.
         stream_results : bool, default False
-            Stream candidate file paths through a generator instead of materializing
-            them. Bounds memory at the per-snapshot manifest size; the kept-files
-            set remains in memory.
+            Stream candidate file paths through the execution engine instead of
+            materializing them. Bounds memory at the per-partition size.
         options : dict, optional
             Tuning knobs:
 
@@ -478,6 +494,7 @@ class IcebergTable(Table):
             retain_last=retain_last,
             snapshot_ids=snapshot_ids,
             clean_expired_files=clean_expired_files,
+            clean_expired_metadata=clean_expired_metadata,
             stream_results=stream_results,
             options=options,
         )
@@ -485,13 +502,15 @@ class IcebergTable(Table):
     def remove_orphan_files(
         self,
         *,
-        older_than: Any | None = None,
+        older_than: datetime | int | None = None,
         location: str | None = None,
         dry_run: bool = False,
         prefix_mismatch_mode: str = "error",
+        file_list_view: DataFrame | None = None,
+        prefix_listing: bool = False,
         stream_results: bool = False,
-        options: dict[str, Any] | None = None,
-    ) -> Any:
+        options: IcebergMaintenanceOptions | None = None,
+    ) -> RemoveOrphanResult:
         """Delete files under the table location that no snapshot references.
 
         Lists physical files under ``location`` (defaulting to ``table.location()``),
@@ -517,10 +536,18 @@ class IcebergTable(Table):
             treats them as orphans, ``"ignore"`` drops them from consideration.
             Scheme aliases (``s3``/``s3a``/``s3n``) are canonicalized before this
             check.
+        file_list_view : DataFrame, optional
+            Precomputed file inventory to compare against instead of listing the
+            object store. Must contain a string ``file_path`` column and a
+            ``last_modified`` column (timestamp or epoch milliseconds). Rows
+            outside ``location`` or newer than the cutoff are dropped.
+        prefix_listing : bool, default False
+            Use flat prefix listing rather than directory-by-directory walking.
+            Raises ``ValueError`` if the underlying store cannot prefix-list.
         stream_results : bool, default False
             Stream the listing through the reachability filter rather than
-            materializing it. Bounds memory at the per-subdir listing size; the
-            reachable set is always in memory.
+            materializing it. Bounds memory at the per-partition size; the
+            reachable set is computed by the execution engine.
         options : dict, optional
             Tuning knobs:
 
@@ -563,6 +590,8 @@ class IcebergTable(Table):
             location=location,
             dry_run=dry_run,
             prefix_mismatch_mode=prefix_mismatch_mode,
+            file_list_view=file_list_view,
+            prefix_listing=prefix_listing,
             stream_results=stream_results,
             options=options,
         )
@@ -573,8 +602,8 @@ class IcebergTable(Table):
         spec_id: int | None = None,
         branch: str | None = None,
         use_caching: bool = False,
-        options: dict[str, Any] | None = None,
-    ) -> Any:
+        options: IcebergMaintenanceOptions | None = None,
+    ) -> RewriteManifestsResult:
         """Repack live manifest entries into target-sized manifests.
 
         Reads the manifests of the target branch's current snapshot, keeps
@@ -593,8 +622,8 @@ class IcebergTable(Table):
         branch : str, optional
             Branch to rewrite. Defaults to ``main``.
         use_caching : bool, default False
-            Reserved for signature stability; ignored — manifests are read
-            from object storage on demand.
+            Reserved for signature stability; ignored — entries stream into the
+            writers as each manifest is read, so there is no shared intermediate.
         options : dict, optional
             Tuning knobs (fall back to table properties where noted):
 
@@ -602,6 +631,10 @@ class IcebergTable(Table):
               to ``commit.manifest.target-size-bytes``)
             - ``manifest-min-count-to-merge`` (int, default 100, falls back to
               ``commit.manifest.min-count-to-merge``)
+            - ``manifest-read-concurrency`` (int, default 1) — read input
+              manifests in parallel; output order stays deterministic.
+            - ``sort-by`` (list of str) — restrict the manifest clustering key
+              to these partition fields instead of the full partition tuple.
 
             Commit retry is tuned via table properties
             ``commit.retry.num-retries``, ``commit.retry.min-wait-ms``,
@@ -637,10 +670,10 @@ class IcebergTable(Table):
     def compact_files(
         self,
         *,
-        where: Any | None = None,
+        where: str | Expression | None = None,
         branch: str | None = None,
-        options: dict[str, Any] | None = None,
-    ) -> Any:
+        options: IcebergMaintenanceOptions | None = None,
+    ) -> RewriteResult:
         """Compact small files. Alias for ``rewrite_data_files("binpack", ...)``.
 
         Examples

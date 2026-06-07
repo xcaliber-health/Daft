@@ -1,4 +1,4 @@
-mod chunk_source;
+pub(crate) mod chunk_source;
 mod field_reader;
 mod rg_processor;
 mod util;
@@ -599,6 +599,24 @@ pub async fn stream_parquet(
         &plan.read_daft_schema,
         source.label(),
     )?;
+
+    // Bloom-filter pruning: drop row groups whose per-column filters prove an
+    // equality/membership predicate cannot match. Additive on top of the stats
+    // pruning above; reads filter bitsets via `cs_builder` before fetches spawn.
+    let rg_indices = match opts.predicate.as_ref() {
+        Some(predicate) => {
+            let probes = crate::bloom::extract_bloom_probes(predicate);
+            crate::bloom::prune_row_groups_by_bloom(
+                &cs_builder,
+                &prepared.parquet_metadata,
+                &probes,
+                rg_indices,
+            )
+            .await?
+        }
+        None => rg_indices,
+    };
+
     if rg_indices.is_empty() {
         // Empty stream — NOT a single empty batch. Downstream sinks
         // (e.g. iceberg writer) treat any received batch as "there's

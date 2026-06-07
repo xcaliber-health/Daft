@@ -1,6 +1,7 @@
 use common_error::DaftError;
 use snafu::Snafu;
 
+mod bloom;
 mod helpers;
 pub mod metadata;
 mod metadata_adapter;

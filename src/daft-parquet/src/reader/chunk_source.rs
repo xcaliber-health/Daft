@@ -1,6 +1,7 @@
 use std::{collections::HashMap, pin::Pin, sync::Arc};
 
 use bytes::Bytes;
+use common_error::{DaftError, DaftResult};
 use common_runtime::{RuntimeTask, get_io_runtime};
 use daft_dsl::optimization::get_required_columns;
 use parquet::{
@@ -271,6 +272,63 @@ impl ChunkSourceBuilder {
         match self {
             Self::Local(s) => &s.path,
             Self::Remote(p) => &p.path,
+        }
+    }
+
+    /// Read `len` bytes starting at absolute file `offset`.
+    ///
+    /// Used for out-of-band reads (e.g. bloom filter bitsets) before the
+    /// row-group byte fetches are spawned, reusing the already-open local file
+    /// handle or the remote client.
+    pub(crate) async fn read_range(&self, offset: u64, len: usize) -> DaftResult<Bytes> {
+        match self {
+            Self::Local(s) => {
+                let file = s.file.clone();
+                get_io_runtime(true)
+                    .spawn_blocking(move || -> DaftResult<Bytes> {
+                        let mut buf = vec![0u8; len];
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::FileExt;
+                            file.read_exact_at(&mut buf, offset)?;
+                        }
+                        #[cfg(windows)]
+                        {
+                            use std::os::windows::fs::FileExt;
+                            let mut filled = 0usize;
+                            while filled < len {
+                                let n =
+                                    file.seek_read(&mut buf[filled..], offset + filled as u64)?;
+                                if n == 0 {
+                                    return Err(DaftError::IoError(std::io::Error::new(
+                                        std::io::ErrorKind::UnexpectedEof,
+                                        "short read while loading bloom filter",
+                                    )));
+                                }
+                                filled += n;
+                            }
+                        }
+                        Ok(Bytes::from(buf))
+                    })
+                    .await?
+            }
+            Self::Remote(prep) => {
+                let end = offset
+                    .checked_add(len as u64)
+                    .ok_or_else(|| DaftError::ValueError("byte range overflow".to_string()))?;
+                let range = daft_io::range::GetRange::Bounded(
+                    usize::try_from(offset).map_err(|_| {
+                        DaftError::ValueError("byte offset exceeds usize".to_string())
+                    })?..usize::try_from(end).map_err(|_| {
+                        DaftError::ValueError("byte range end exceeds usize".to_string())
+                    })?,
+                );
+                let result = prep
+                    .io_client
+                    .single_url_get(prep.uri.clone(), Some(range), prep.io_stats.clone())
+                    .await?;
+                Ok(result.bytes().await?)
+            }
         }
     }
 

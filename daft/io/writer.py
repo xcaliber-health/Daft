@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
@@ -332,15 +333,90 @@ _ICEBERG_COMPRESSION_TO_PARQUET = {
     "zstd": "zstd",
 }
 
+# Per-column enable flag and probability hint prefixes, and the shared byte budget.
+_BLOOM_ENABLED_PREFIX = "write.parquet.bloom-filter-enabled.column."
+_BLOOM_FPP_PREFIX = "write.parquet.bloom-filter-fpp.column."
+_BLOOM_MAX_BYTES_KEY = "write.parquet.bloom-filter-max-bytes"
+
+# Defaults applied when a column requests a filter without an explicit probability,
+# and when no byte budget is configured.
+_DEFAULT_BLOOM_FPP = 0.01
+_DEFAULT_BLOOM_MAX_BYTES = 1048576
+
+
+def _distinct_values_for_byte_budget(fpp: float, max_bytes: int) -> int:
+    """Return the largest distinct-value count whose filter fits a byte budget.
+
+    Inverts the split-block sizing relation ``m = -8 * n / ln(1 - fpp**(1/8))``
+    (``n`` distinct values, ``m`` bits) so that a filter sized for the returned
+    count and ``fpp`` occupies at most ``max_bytes`` bytes. This expresses a
+    byte-budget configuration as the distinct-value count expected by writers that
+    size their filters from a distinct-value count and a probability hint, keeping
+    the on-disk filter size equivalent across writers that share the sizing relation.
+
+    Parameters
+    ----------
+    fpp : float
+        Target false-positive probability, in the open interval ``(0, 1)``.
+    max_bytes : int
+        Maximum bitset size, in bytes.
+
+    Returns:
+    -------
+    int
+        Largest distinct-value count whose filter fits the budget (at least 1).
+    """
+    ndv = math.floor(-max_bytes * math.log(1.0 - fpp ** (1.0 / 8.0)))
+    return max(1, ndv)
+
+
+def _iceberg_bloom_filter_options(
+    properties: dict[str, str],
+) -> dict[str, dict[str, float | int]] | None:
+    """Build per-column bloom-filter parameters from table properties.
+
+    Collects the columns whose per-column enable flag is set, then derives each
+    column's distinct-value count from the shared byte budget and the column's
+    probability hint (or the default probability when unset).
+
+    Parameters
+    ----------
+    properties : dict of str to str
+        Table properties, including the bloom-filter enable flags, per-column
+        probability hints, and the shared byte budget.
+
+    Returns:
+    -------
+    dict or None
+        Mapping from column path to its ``ndv`` and ``fpp`` parameters, or ``None``
+        when no column requests a filter.
+    """
+    enabled = [
+        key[len(_BLOOM_ENABLED_PREFIX) :]
+        for key, value in properties.items()
+        if key.startswith(_BLOOM_ENABLED_PREFIX) and str(value).strip().lower() == "true"
+    ]
+    enabled = [column for column in enabled if column]
+    if not enabled:
+        return None
+
+    max_bytes = int(properties.get(_BLOOM_MAX_BYTES_KEY, _DEFAULT_BLOOM_MAX_BYTES))
+    options: dict[str, dict[str, float | int]] = {}
+    for column in enabled:
+        fpp = float(properties.get(f"{_BLOOM_FPP_PREFIX}{column}", _DEFAULT_BLOOM_FPP))
+        options[column] = {
+            "ndv": _distinct_values_for_byte_budget(fpp, max_bytes),
+            "fpp": fpp,
+        }
+    return options
+
 
 def _resolve_iceberg_writer_options(properties: dict[str, str] | None) -> dict[str, Any]:
     """Translate Iceberg ``write.*`` table properties to ParquetWriter kwargs."""
     props = properties or {}
     fmt = (props.get("write.format-default") or "parquet").lower()
     if fmt != "parquet":
-        raise ValueError(
-            f"IcebergWriter only supports parquet; got write.format-default={fmt!r}"
-        )
+        raise ValueError(f"IcebergWriter only supports parquet; got write.format-default={fmt!r}")
 
     codec_raw = (props.get("write.parquet.compression-codec") or "zstd").lower()
     codec = _ICEBERG_COMPRESSION_TO_PARQUET.get(codec_raw, codec_raw)
@@ -358,6 +434,9 @@ def _resolve_iceberg_writer_options(properties: dict[str, str] | None) -> dict[s
     dict_size = props.get("write.parquet.dict-size-bytes")
     if dict_size is not None:
         out["dictionary_pagesize_limit"] = int(dict_size)
+    bloom_options = _iceberg_bloom_filter_options(props)
+    if bloom_options is not None:
+        out["bloom_filter_options"] = bloom_options
     return out
 
 
@@ -398,7 +477,7 @@ class IcebergWriter(ParquetFileWriter):
         opts: dict[str, Any] = {}
         if self.metadata_collector is not None:
             opts["metadata_collector"] = self.metadata_collector
-        for k in ("compression_level", "data_page_size", "dictionary_pagesize_limit"):
+        for k in ("compression_level", "data_page_size", "dictionary_pagesize_limit", "bloom_filter_options"):
             v = self._iceberg_writer_opts.get(k)
             if v is not None:
                 opts[k] = v

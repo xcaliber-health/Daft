@@ -7,17 +7,24 @@
 //! a parse failure) keeps the row group, so results never change, only the
 //! amount of data scanned.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use bytes::Bytes;
 use common_error::DaftResult;
 use daft_core::{lit::Literal, prelude::*};
 use daft_dsl::{
     Expr, ExprRef,
     expr::{Column, ResolvedColumn, UnresolvedColumn},
 };
+use futures::{StreamExt, TryStreamExt};
 use parquet::{basic::Type as PhysicalType, bloom_filter::Sbbf, file::metadata::ParquetMetaData};
 
 use crate::reader::chunk_source::ChunkSourceBuilder;
+
+/// Maximum number of bloom-filter bitsets fetched concurrently. Bounds the
+/// number of in-flight out-of-band range reads issued before any column data is
+/// read, so a wide predicate over many row groups cannot fan out without limit.
+const BLOOM_FETCH_CONCURRENCY: usize = 16;
 
 /// A single column probe: the row group survives only if at least one candidate
 /// value may be present in the column's bloom filter.
@@ -130,16 +137,30 @@ fn literal_value(expr: &ExprRef) -> Option<&Literal> {
     }
 }
 
-/// Encode a literal as the little-endian physical bytes that the writer hashed
-/// into the column's bloom filter, or `None` when the value cannot be mapped to
-/// the column's physical type (in which case the row group is kept).
+/// Encode a literal as the physical bytes that the writer hashed into the
+/// column's bloom filter, or `None` when the value cannot be mapped to the
+/// column's physical representation (in which case the row group is kept).
 ///
-/// The physical type — not the logical type — drives the width: narrow integers
-/// are stored as 32-bit physical values, so they must be hashed as such.
-fn physical_bytes(physical: PhysicalType, literal: &Literal) -> Option<Vec<u8>> {
+/// The physical type — not the logical type — drives the encoding: narrow
+/// integers are stored as 32-bit physical values, decimals as their unscaled
+/// integer (32/64-bit) or a fixed-width big-endian two's-complement, and
+/// fixed-length binary as its raw bytes. `type_length` is the fixed byte width
+/// for `FIXED_LEN_BYTE_ARRAY` columns (ignored otherwise); `type_scale` is the
+/// column's decimal scale (`-1` when the column is not a decimal).
+///
+/// Decimal encoding is scale-sensitive: a candidate is encoded only when its
+/// scale matches the column's, so the unscaled integer hashed here equals the
+/// one the writer hashed. A mismatch returns `None` and keeps the row group,
+/// never risking a wrong "absent" verdict.
+fn physical_bytes(
+    physical: PhysicalType,
+    type_length: i32,
+    type_scale: i32,
+    literal: &Literal,
+) -> Option<Vec<u8>> {
     match physical {
-        PhysicalType::INT32 => int32_le(literal).map(|v| v.to_le_bytes().to_vec()),
-        PhysicalType::INT64 => int64_le(literal).map(|v| v.to_le_bytes().to_vec()),
+        PhysicalType::INT32 => int32_le(type_scale, literal).map(|v| v.to_le_bytes().to_vec()),
+        PhysicalType::INT64 => int64_le(type_scale, literal).map(|v| v.to_le_bytes().to_vec()),
         PhysicalType::FLOAT => match literal {
             Literal::Float32(v) => Some(v.to_le_bytes().to_vec()),
             _ => None,
@@ -153,11 +174,12 @@ fn physical_bytes(physical: PhysicalType, literal: &Literal) -> Option<Vec<u8>> 
             Literal::Binary(b) => Some(b.clone()),
             _ => None,
         },
+        PhysicalType::FIXED_LEN_BYTE_ARRAY => fixed_len_bytes(type_length, type_scale, literal),
         _ => None,
     }
 }
 
-fn int32_le(literal: &Literal) -> Option<i32> {
+fn int32_le(type_scale: i32, literal: &Literal) -> Option<i32> {
     match literal {
         Literal::Int8(v) => Some(i32::from(*v)),
         Literal::Int16(v) => Some(i32::from(*v)),
@@ -168,19 +190,73 @@ fn int32_le(literal: &Literal) -> Option<i32> {
         // value, and the writer hashes those raw bytes.
         Literal::UInt32(v) => Some(i32::from_le_bytes(v.to_le_bytes())),
         Literal::Date(v) => Some(*v),
+        // A low-precision decimal is stored as its unscaled 32-bit integer.
+        Literal::Decimal(v, _, scale) if i32::from(*scale) == type_scale => i32::try_from(*v).ok(),
         _ => None,
     }
 }
 
-fn int64_le(literal: &Literal) -> Option<i64> {
+fn int64_le(type_scale: i32, literal: &Literal) -> Option<i64> {
     match literal {
         Literal::Int64(v) => Some(*v),
         Literal::UInt64(v) => Some(i64::from_le_bytes(v.to_le_bytes())),
         Literal::Timestamp(v, _, _) => Some(*v),
         Literal::Time(v, _) => Some(*v),
         Literal::Duration(v, _) => Some(*v),
+        // A mid-precision decimal is stored as its unscaled 64-bit integer.
+        Literal::Decimal(v, _, scale) if i32::from(*scale) == type_scale => i64::try_from(*v).ok(),
         _ => None,
     }
+}
+
+/// Encode a fixed-length-binary candidate as its raw physical bytes: a binary or
+/// UUID value passed through when its width equals the column's, or a decimal as
+/// the unscaled integer in big-endian two's-complement padded to the column
+/// width. Returns `None` (keeping the row group) on any width or scale mismatch.
+fn fixed_len_bytes(type_length: i32, type_scale: i32, literal: &Literal) -> Option<Vec<u8>> {
+    let len = usize::try_from(type_length).ok().filter(|&l| l > 0)?;
+    match literal {
+        Literal::Binary(b) if b.len() == len => Some(b.clone()),
+        Literal::Uuid(u) if len == 16 => Some(u.as_bytes().to_vec()),
+        Literal::Decimal(v, _, scale) if i32::from(*scale) == type_scale => {
+            decimal_fixed_be(*v, len)
+        }
+        _ => None,
+    }
+}
+
+/// Encode an unscaled decimal as `len` big-endian two's-complement bytes,
+/// matching the fixed-width physical layout the writer hashed. Returns `None`
+/// when the value does not fit in `len` bytes, so a too-wide candidate keeps the
+/// row group rather than hashing a truncated value.
+fn decimal_fixed_be(value: i128, len: usize) -> Option<Vec<u8>> {
+    if len == 0 || len > 16 {
+        return None;
+    }
+    let full = value.to_be_bytes();
+    let (high, low) = full.split_at(16 - len);
+    // The dropped high bytes must be pure sign extension, else the value is wider
+    // than the column and cannot be represented in `len` bytes.
+    let sign_byte = if value < 0 { 0xFF } else { 0x00 };
+    if high.iter().any(|&b| b != sign_byte) {
+        return None;
+    }
+    Some(low.to_vec())
+}
+
+/// A resolved, conclusive probe against one row group: the column has a filter,
+/// and every candidate value encodes to the column's physical bytes. The row
+/// group is dropped if none of `encoded` may be present in the fetched filter.
+struct PendingProbe {
+    /// Row group this probe constrains.
+    rg_idx: usize,
+    /// Absolute file offset of the column's bloom-filter bitset.
+    offset: u64,
+    /// Byte length of the bitset.
+    length: usize,
+    /// Candidate values in physical byte form; the row group survives this probe
+    /// if at least one may be present.
+    encoded: Vec<Vec<u8>>,
 }
 
 /// Prune row groups whose bloom filters prove that an equality or membership
@@ -188,7 +264,15 @@ fn int64_le(literal: &Literal) -> Option<i64> {
 ///
 /// `rg_indices` are the candidates that survived statistics pruning, in file
 /// order. Returns the subset to read. With no probes, the input is returned
-/// unchanged. Filter bitsets are read on demand from `source`.
+/// unchanged.
+///
+/// Filter bitsets are read out of band from `source`: every distinct bitset
+/// needed across the surviving row groups and probes is fetched concurrently
+/// before any probing, rather than one serial read per row group, so the latency
+/// of locating a value does not grow with the number of row groups. Probing then
+/// runs in memory. A probe drops a row group only when its filter is present,
+/// readable, and proves all candidate values absent; any uncertainty keeps the
+/// row group.
 pub async fn prune_row_groups_by_bloom(
     source: &ChunkSourceBuilder,
     metadata: &ParquetMetaData,
@@ -206,69 +290,92 @@ pub async fn prune_row_groups_by_bloom(
         column_index.insert(schema_descr.column(idx).path().string(), idx);
     }
 
-    let mut kept = Vec::with_capacity(rg_indices.len());
-    for rg_idx in rg_indices {
-        if !row_group_survives(source, metadata, rg_idx, probes, &column_index).await? {
-            continue;
-        }
-        kept.push(rg_idx);
-    }
-    Ok(kept)
-}
-
-/// Decide whether a single row group survives every probe. A probe drops the row
-/// group only when its filter is present, readable, and proves all candidate
-/// values absent; otherwise the probe is inconclusive and the row group is kept.
-async fn row_group_survives(
-    source: &ChunkSourceBuilder,
-    metadata: &ParquetMetaData,
-    rg_idx: usize,
-    probes: &[BloomProbe],
-    column_index: &HashMap<String, usize>,
-) -> DaftResult<bool> {
-    let row_group = metadata.row_group(rg_idx);
-    for probe in probes {
-        let Some(&col_idx) = column_index.get(&probe.column) else {
-            continue;
-        };
-        let column = row_group.column(col_idx);
-        let (Some(offset), Some(length)) =
-            (column.bloom_filter_offset(), column.bloom_filter_length())
-        else {
-            continue;
-        };
-        let (Ok(offset), Ok(length)) = (u64::try_from(offset), usize::try_from(length)) else {
-            continue;
-        };
-        if length == 0 {
-            continue;
-        }
-
-        let physical = column.column_descr().physical_type();
-        let mut encoded = Vec::with_capacity(probe.values.len());
-        let mut unsupported = false;
-        for value in &probe.values {
-            match physical_bytes(physical, value) {
-                Some(bytes) => encoded.push(bytes),
-                None => {
-                    unsupported = true;
-                    break;
-                }
+    // Resolve every conclusive (row group, probe) pair up front, collecting the
+    // distinct bitset ranges they require.
+    let mut pending: Vec<PendingProbe> = Vec::new();
+    let mut ranges: HashMap<u64, usize> = HashMap::new();
+    for &rg_idx in &rg_indices {
+        let row_group = metadata.row_group(rg_idx);
+        for probe in probes {
+            if let Some(p) = resolve_probe(row_group, rg_idx, probe, &column_index) {
+                ranges.insert(p.offset, p.length);
+                pending.push(p);
             }
         }
-        if unsupported || encoded.is_empty() {
+    }
+    if pending.is_empty() {
+        return Ok(rg_indices);
+    }
+
+    // Fetch all distinct bitsets concurrently.
+    let fetched: HashMap<u64, Bytes> = futures::stream::iter(ranges)
+        .map(|(offset, length)| async move {
+            let bytes = source.read_range(offset, length).await?;
+            DaftResult::Ok((offset, bytes))
+        })
+        .buffer_unordered(BLOOM_FETCH_CONCURRENCY)
+        .try_collect()
+        .await?;
+
+    // Probe in memory: a row group is dropped as soon as one conclusive probe
+    // proves all its candidates absent.
+    let mut dropped: HashSet<usize> = HashSet::new();
+    for p in &pending {
+        if dropped.contains(&p.rg_idx) {
             continue;
         }
-
-        let buffer = source.read_range(offset, length).await?;
-        let Ok(filter) = Sbbf::from_bytes(&buffer) else {
+        let Some(buffer) = fetched.get(&p.offset) else {
             continue;
         };
-        if !encoded.iter().any(|bytes| filter.check(bytes)) {
-            return Ok(false);
+        let Ok(filter) = Sbbf::from_bytes(buffer) else {
+            continue;
+        };
+        if !p.encoded.iter().any(|bytes| filter.check(bytes)) {
+            dropped.insert(p.rg_idx);
         }
     }
-    Ok(true)
+
+    Ok(rg_indices
+        .into_iter()
+        .filter(|idx| !dropped.contains(idx))
+        .collect())
+}
+
+/// Resolve a probe against one row group into a [`PendingProbe`], or `None` when
+/// the probe is inconclusive for this row group — the column is absent, has no
+/// filter, or a candidate cannot be encoded to the column's physical type. An
+/// inconclusive probe can never drop the row group.
+fn resolve_probe(
+    row_group: &parquet::file::metadata::RowGroupMetaData,
+    rg_idx: usize,
+    probe: &BloomProbe,
+    column_index: &HashMap<String, usize>,
+) -> Option<PendingProbe> {
+    let &col_idx = column_index.get(probe.column.as_str())?;
+    let column = row_group.column(col_idx);
+    let offset = u64::try_from(column.bloom_filter_offset()?).ok()?;
+    let length = usize::try_from(column.bloom_filter_length()?).ok()?;
+    if length == 0 {
+        return None;
+    }
+
+    let descr = column.column_descr();
+    let physical = descr.physical_type();
+    let type_length = descr.type_length();
+    let type_scale = descr.type_scale();
+    let mut encoded = Vec::with_capacity(probe.values.len());
+    for value in &probe.values {
+        encoded.push(physical_bytes(physical, type_length, type_scale, value)?);
+    }
+    if encoded.is_empty() {
+        return None;
+    }
+    Some(PendingProbe {
+        rg_idx,
+        offset,
+        length,
+        encoded,
+    })
 }
 
 #[cfg(test)]
@@ -334,30 +441,133 @@ mod tests {
     #[test]
     fn narrow_integer_uses_physical_width() {
         // Int8 is stored as a 32-bit physical value, so it encodes to four bytes.
-        let bytes = physical_bytes(PhysicalType::INT32, &Literal::Int8(5)).unwrap();
+        let bytes = physical_bytes(PhysicalType::INT32, 0, -1, &Literal::Int8(5)).unwrap();
         assert_eq!(bytes, 5i32.to_le_bytes().to_vec());
 
-        let wide = physical_bytes(PhysicalType::INT64, &Literal::Int64(5)).unwrap();
+        let wide = physical_bytes(PhysicalType::INT64, 0, -1, &Literal::Int64(5)).unwrap();
         assert_eq!(wide, 5i64.to_le_bytes().to_vec());
+
+        // Temporal values reuse the integer physical width the writer hashed.
+        let date = physical_bytes(PhysicalType::INT32, 0, -1, &Literal::Date(19_000)).unwrap();
+        assert_eq!(date, 19_000i32.to_le_bytes().to_vec());
+        let ts = physical_bytes(
+            PhysicalType::INT64,
+            0,
+            -1,
+            &Literal::Timestamp(1_700_000_000_000_000, TimeUnit::Microseconds, None),
+        )
+        .unwrap();
+        assert_eq!(ts, 1_700_000_000_000_000i64.to_le_bytes().to_vec());
     }
 
     #[test]
     fn string_and_binary_encode_to_raw_bytes() {
         assert_eq!(
-            physical_bytes(PhysicalType::BYTE_ARRAY, &Literal::Utf8("abc".to_string())).unwrap(),
+            physical_bytes(
+                PhysicalType::BYTE_ARRAY,
+                0,
+                -1,
+                &Literal::Utf8("abc".to_string())
+            )
+            .unwrap(),
             b"abc".to_vec()
         );
         assert_eq!(
-            physical_bytes(PhysicalType::BYTE_ARRAY, &Literal::Binary(vec![1, 2, 3])).unwrap(),
+            physical_bytes(
+                PhysicalType::BYTE_ARRAY,
+                0,
+                -1,
+                &Literal::Binary(vec![1, 2, 3])
+            )
+            .unwrap(),
             vec![1u8, 2, 3]
         );
     }
 
     #[test]
     fn mismatched_type_is_unsupported() {
-        assert!(physical_bytes(PhysicalType::INT64, &Literal::Utf8("x".to_string())).is_none());
-        assert!(physical_bytes(PhysicalType::DOUBLE, &Literal::Int64(1)).is_none());
-        assert!(physical_bytes(PhysicalType::BOOLEAN, &Literal::Int32(1)).is_none());
+        assert!(
+            physical_bytes(PhysicalType::INT64, 0, -1, &Literal::Utf8("x".to_string())).is_none()
+        );
+        assert!(physical_bytes(PhysicalType::DOUBLE, 0, -1, &Literal::Int64(1)).is_none());
+        assert!(physical_bytes(PhysicalType::BOOLEAN, 0, -1, &Literal::Int32(1)).is_none());
+    }
+
+    #[test]
+    fn decimal_encodes_at_matching_scale_only() {
+        // Scale 2 decimal stored in a 32-bit column encodes as the unscaled int.
+        let i32_bytes =
+            physical_bytes(PhysicalType::INT32, 0, 2, &Literal::Decimal(12345, 9, 2)).unwrap();
+        assert_eq!(i32_bytes, 12345i32.to_le_bytes().to_vec());
+
+        // Same value in a 64-bit column.
+        let i64_bytes =
+            physical_bytes(PhysicalType::INT64, 0, 2, &Literal::Decimal(12345, 18, 2)).unwrap();
+        assert_eq!(i64_bytes, 12345i64.to_le_bytes().to_vec());
+
+        // A scale mismatch is inconclusive — never hash a value the writer did not.
+        assert!(
+            physical_bytes(PhysicalType::INT32, 0, 3, &Literal::Decimal(12345, 9, 2)).is_none()
+        );
+    }
+
+    #[test]
+    fn fixed_len_encodes_binary_uuid_and_decimal() {
+        // UUID fills a 16-byte fixed column in big-endian order.
+        let uuid = uuid::Uuid::from_bytes([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        assert_eq!(
+            physical_bytes(
+                PhysicalType::FIXED_LEN_BYTE_ARRAY,
+                16,
+                -1,
+                &Literal::Uuid(uuid)
+            )
+            .unwrap(),
+            (0u8..16).collect::<Vec<u8>>()
+        );
+
+        // Fixed binary passes through only at the exact column width.
+        assert_eq!(
+            physical_bytes(
+                PhysicalType::FIXED_LEN_BYTE_ARRAY,
+                3,
+                -1,
+                &Literal::Binary(vec![9, 8, 7])
+            )
+            .unwrap(),
+            vec![9u8, 8, 7]
+        );
+        assert!(
+            physical_bytes(
+                PhysicalType::FIXED_LEN_BYTE_ARRAY,
+                4,
+                -1,
+                &Literal::Binary(vec![9, 8, 7])
+            )
+            .is_none()
+        );
+
+        // High-precision decimal: big-endian two's-complement padded to width.
+        let pos = physical_bytes(
+            PhysicalType::FIXED_LEN_BYTE_ARRAY,
+            4,
+            0,
+            &Literal::Decimal(258, 9, 0),
+        )
+        .unwrap();
+        assert_eq!(pos, vec![0x00, 0x00, 0x01, 0x02]);
+        let neg = physical_bytes(
+            PhysicalType::FIXED_LEN_BYTE_ARRAY,
+            4,
+            0,
+            &Literal::Decimal(-2, 9, 0),
+        )
+        .unwrap();
+        assert_eq!(neg, vec![0xFF, 0xFF, 0xFF, 0xFE]);
+
+        // A value too wide for the column width does not fit and is inconclusive.
+        assert!(decimal_fixed_be(0x01_0000, 2).is_none());
+        assert_eq!(decimal_fixed_be(0x0102, 2).unwrap(), vec![0x01, 0x02]);
     }
 
     /// Round-trip a filter written by the Parquet writer through the same
@@ -409,9 +619,185 @@ mod tests {
 
         let filter = Sbbf::from_bytes(&bytes[offset..offset + length]).unwrap();
 
-        let present = physical_bytes(PhysicalType::INT64, &Literal::Int64(20)).unwrap();
-        let absent = physical_bytes(PhysicalType::INT64, &Literal::Int64(999)).unwrap();
+        let present = physical_bytes(PhysicalType::INT64, 0, -1, &Literal::Int64(20)).unwrap();
+        let absent = physical_bytes(PhysicalType::INT64, 0, -1, &Literal::Int64(999)).unwrap();
         assert!(filter.check(&present), "present value must probe true");
         assert!(!filter.check(&absent), "absent value must probe false");
+    }
+
+    /// Write a single-column Parquet file with a per-row-group bloom filter to a
+    /// temporary path, returning the path. `max_rg` rows per row group lets a
+    /// caller place disjoint value ranges in distinct row groups.
+    fn write_bloom_parquet(
+        field: arrow::datatypes::Field,
+        array: arrow::array::ArrayRef,
+        max_rg: usize,
+    ) -> std::path::PathBuf {
+        use arrow::{array::RecordBatch as ArrowRecordBatch, datatypes::Schema as ArrowSchema};
+        use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
+
+        let name = field.name().clone();
+        let schema = std::sync::Arc::new(ArrowSchema::new(vec![field]));
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(max_rg)
+            .set_column_bloom_filter_enabled(name.clone().into(), true)
+            .set_column_bloom_filter_ndv(name.into(), u64::try_from(max_rg).unwrap())
+            .build();
+
+        let mut buffer = Vec::new();
+        {
+            let mut writer =
+                ArrowWriter::try_new(&mut buffer, schema.clone(), Some(props)).unwrap();
+            let batch = ArrowRecordBatch::try_new(schema, vec![array]).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "daft_bloom_{}_{}.parquet",
+            std::process::id(),
+            fastrand::u64(..)
+        ));
+        std::fs::write(&path, &buffer).unwrap();
+        path
+    }
+
+    fn prune(path: &std::path::Path, probes: Vec<BloomProbe>, rgs: Vec<usize>) -> Vec<usize> {
+        let (source, metadata) =
+            ChunkSourceBuilder::local_for_test(path.to_str().unwrap()).unwrap();
+        common_runtime::get_io_runtime(true)
+            .block_on_current_thread(async move {
+                prune_row_groups_by_bloom(&source, &metadata, &probes, rgs).await
+            })
+            .unwrap()
+    }
+
+    /// Proof that bloom probing actually drops row groups: with disjoint value
+    /// ranges per row group, an equality probe keeps only the row group that may
+    /// contain the value, and an absent value drops them all.
+    #[test]
+    fn prunes_row_groups_via_writer_filter() {
+        use arrow::{
+            array::Int64Array,
+            datatypes::{DataType, Field as ArrowField},
+        };
+
+        // 300 rows, 100 per row group => RG0=0..99, RG1=100..199, RG2=200..299.
+        let array = std::sync::Arc::new(Int64Array::from((0..300i64).collect::<Vec<_>>()));
+        let path = write_bloom_parquet(ArrowField::new("v", DataType::Int64, false), array, 100);
+
+        let present = vec![BloomProbe {
+            column: "v".to_string(),
+            values: vec![Literal::Int64(150)],
+        }];
+        assert_eq!(
+            prune(&path, present, vec![0, 1, 2]),
+            vec![1],
+            "only the row group holding 150 survives"
+        );
+
+        let absent = vec![BloomProbe {
+            column: "v".to_string(),
+            values: vec![Literal::Int64(10_000)],
+        }];
+        assert_eq!(
+            prune(&path, absent, vec![0, 1, 2]),
+            Vec::<usize>::new(),
+            "an absent value prunes every row group"
+        );
+
+        let membership = vec![BloomProbe {
+            column: "v".to_string(),
+            values: vec![Literal::Int64(50), Literal::Int64(250)],
+        }];
+        assert_eq!(
+            prune(&path, membership, vec![0, 1, 2]),
+            vec![0, 2],
+            "membership keeps every row group that may hold a candidate"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Cross-type encoding parity against a real on-disk filter: for each physical
+    /// type, a present value keeps its row group and an absent value prunes it.
+    #[test]
+    fn cross_type_filter_parity() {
+        use arrow::{
+            array::{
+                ArrayRef, BinaryArray, Date32Array, FixedSizeBinaryArray, Float64Array, Int32Array,
+                StringArray,
+            },
+            datatypes::{DataType, Field as ArrowField},
+        };
+
+        fn check(field: ArrowField, array: ArrayRef, present: Literal, absent: Literal) {
+            let name = field.name().clone();
+            let path = write_bloom_parquet(field, array, 1024);
+            let present_probe = vec![BloomProbe {
+                column: name.clone(),
+                values: vec![present],
+            }];
+            assert_eq!(
+                prune(&path, present_probe, vec![0]),
+                vec![0],
+                "present value must keep the row group ({name})"
+            );
+            let absent_probe = vec![BloomProbe {
+                column: name.clone(),
+                values: vec![absent],
+            }];
+            assert_eq!(
+                prune(&path, absent_probe, vec![0]),
+                Vec::<usize>::new(),
+                "absent value must prune the row group ({name})"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+
+        check(
+            ArrowField::new("v", DataType::Int32, false),
+            std::sync::Arc::new(Int32Array::from(vec![1i32, 2, 3])),
+            Literal::Int32(2),
+            Literal::Int32(99),
+        );
+        check(
+            ArrowField::new("v", DataType::Float64, false),
+            std::sync::Arc::new(Float64Array::from(vec![1.5f64, 2.5, 3.5])),
+            Literal::Float64(2.5),
+            Literal::Float64(9.5),
+        );
+        check(
+            ArrowField::new("v", DataType::Utf8, false),
+            std::sync::Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            Literal::Utf8("b".to_string()),
+            Literal::Utf8("zzz".to_string()),
+        );
+        check(
+            ArrowField::new("v", DataType::Binary, false),
+            std::sync::Arc::new(BinaryArray::from(vec![b"\x01".as_ref(), b"\x02", b"\x03"])),
+            Literal::Binary(vec![2]),
+            Literal::Binary(vec![9]),
+        );
+        check(
+            ArrowField::new("v", DataType::Date32, false),
+            std::sync::Arc::new(Date32Array::from(vec![10i32, 20, 30])),
+            Literal::Date(20),
+            Literal::Date(999),
+        );
+        // Fixed-length binary exercises the FIXED_LEN_BYTE_ARRAY encoder (the UUID
+        // physical layout): 16 raw bytes matched on width.
+        let present_fixed = [1u8; 16];
+        let absent_fixed = [9u8; 16];
+        let fixed = FixedSizeBinaryArray::try_from_iter(
+            vec![[0u8; 16], present_fixed, [2u8; 16]].into_iter(),
+        )
+        .unwrap();
+        check(
+            ArrowField::new("v", DataType::FixedSizeBinary(16), false),
+            std::sync::Arc::new(fixed),
+            Literal::Binary(present_fixed.to_vec()),
+            Literal::Binary(absent_fixed.to_vec()),
+        );
     }
 }

@@ -102,7 +102,6 @@ class FileWriterBase(ABC):
         Returns:
             int: The number of bytes written to the file.
         """
-        pass
 
     @abstractmethod
     def close(self) -> RecordBatch:
@@ -111,7 +110,6 @@ class FileWriterBase(ABC):
         Returns:
             RecordBatch containing metadata about the written file, including path and partition values.
         """
-        pass
 
 
 class ParquetFileWriter(FileWriterBase):
@@ -333,9 +331,29 @@ _ICEBERG_COMPRESSION_TO_PARQUET = {
     "zstd": "zstd",
 }
 
-# Per-column enable flag and probability hint prefixes, and the shared byte budget.
+# Bloom-filter table-property contract.
+#
+# A bloom filter accelerates equality and membership lookups on high-cardinality
+# columns (identifiers, UUIDs, session/trace keys) where min/max statistics cannot
+# rule a value out. It does not help range predicates, low-cardinality columns
+# (a dictionary serves those better), partition-transform columns, or columns kept
+# sorted (min/max already prunes those). Each filter adds the byte budget per
+# column per row group to the file, so enabling a few well-chosen columns is the
+# rule of thumb; size the budget to the column's distinct-value count.
+#
+# Recognized properties:
+#   - per-column enable flag prefix (value ``true`` enables the column)
+#   - per-column probability hint prefix
+#   - per-column expected distinct-value count prefix
+#   - shared byte budget key
+# Sizing: when a column's expected distinct-value count is set, the filter is
+# sized from that count and the probability, but never larger than the byte
+# budget; when it is unset, the byte budget sets the size and the probability is a
+# hint only. Filters are written only through the native streaming writer; to add
+# them to existing data, rewrite it through compaction.
 _BLOOM_ENABLED_PREFIX = "write.parquet.bloom-filter-enabled.column."
 _BLOOM_FPP_PREFIX = "write.parquet.bloom-filter-fpp.column."
+_BLOOM_NDV_PREFIX = "write.parquet.bloom-filter-ndv.column."
 _BLOOM_MAX_BYTES_KEY = "write.parquet.bloom-filter-max-bytes"
 
 # Defaults applied when a column requests a filter without an explicit probability,
@@ -372,24 +390,39 @@ def _distinct_values_for_byte_budget(fpp: float, max_bytes: int) -> int:
 
 def _iceberg_bloom_filter_options(
     properties: dict[str, str],
+    valid_columns: set[str] | None = None,
 ) -> dict[str, dict[str, float | int]] | None:
     """Build per-column bloom-filter parameters from table properties.
 
-    Collects the columns whose per-column enable flag is set, then derives each
-    column's distinct-value count from the shared byte budget and the column's
-    probability hint (or the default probability when unset).
+    Collects the columns whose per-column enable flag is set, then resolves each
+    column's distinct-value count and probability hint. When a column's expected
+    distinct-value count is given, it sizes the filter together with the
+    probability, but is capped at the count the byte budget allows so the filter
+    never exceeds the budget. When it is unset, the count is derived from the byte
+    budget, so the budget sets the size and the probability is a hint only.
 
     Parameters
     ----------
     properties : dict of str to str
         Table properties, including the bloom-filter enable flags, per-column
-        probability hints, and the shared byte budget.
+        probability hints, per-column expected distinct-value counts, and the
+        shared byte budget.
+    valid_columns : set of str, optional
+        Column paths present in the written schema. When given, enable flags for
+        any other column are ignored, so a stale or misspelled flag is a no-op
+        rather than an error.
 
     Returns:
     -------
     dict or None
         Mapping from column path to its ``ndv`` and ``fpp`` parameters, or ``None``
         when no column requests a filter.
+
+    Raises:
+    ------
+    ValueError
+        If a column's probability hint is not within the open interval ``(0, 1)``,
+        or its expected distinct-value count is not positive.
     """
     enabled = [
         key[len(_BLOOM_ENABLED_PREFIX) :]
@@ -397,6 +430,8 @@ def _iceberg_bloom_filter_options(
         if key.startswith(_BLOOM_ENABLED_PREFIX) and str(value).strip().lower() == "true"
     ]
     enabled = [column for column in enabled if column]
+    if valid_columns is not None:
+        enabled = [column for column in enabled if column in valid_columns]
     if not enabled:
         return None
 
@@ -404,14 +439,30 @@ def _iceberg_bloom_filter_options(
     options: dict[str, dict[str, float | int]] = {}
     for column in enabled:
         fpp = float(properties.get(f"{_BLOOM_FPP_PREFIX}{column}", _DEFAULT_BLOOM_FPP))
-        options[column] = {
-            "ndv": _distinct_values_for_byte_budget(fpp, max_bytes),
-            "fpp": fpp,
-        }
+        if not 0.0 < fpp < 1.0:
+            raise ValueError(
+                f"Bloom-filter probability for column {column!r} must be in the open interval (0, 1); got {fpp}."
+            )
+        budget_ndv = _distinct_values_for_byte_budget(fpp, max_bytes)
+        ndv_raw = properties.get(f"{_BLOOM_NDV_PREFIX}{column}")
+        if ndv_raw is None:
+            ndv = budget_ndv
+        else:
+            requested_ndv = int(ndv_raw)
+            if requested_ndv <= 0:
+                raise ValueError(
+                    f"Bloom-filter distinct-value count for column {column!r} must be positive; got {requested_ndv}."
+                )
+            # Honor the requested count, but never size beyond the byte budget.
+            ndv = min(requested_ndv, budget_ndv)
+        options[column] = {"ndv": ndv, "fpp": fpp}
     return options
 
 
-def _resolve_iceberg_writer_options(properties: dict[str, str] | None) -> dict[str, Any]:
+def _resolve_iceberg_writer_options(
+    properties: dict[str, str] | None,
+    valid_columns: set[str] | None = None,
+) -> dict[str, Any]:
     """Translate Iceberg ``write.*`` table properties to ParquetWriter kwargs."""
     props = properties or {}
     fmt = (props.get("write.format-default") or "parquet").lower()
@@ -434,7 +485,7 @@ def _resolve_iceberg_writer_options(properties: dict[str, str] | None) -> dict[s
     dict_size = props.get("write.parquet.dict-size-bytes")
     if dict_size is not None:
         out["dictionary_pagesize_limit"] = int(dict_size)
-    bloom_options = _iceberg_bloom_filter_options(props)
+    bloom_options = _iceberg_bloom_filter_options(props, valid_columns)
     if bloom_options is not None:
         out["bloom_filter_options"] = bloom_options
     return out
@@ -453,7 +504,11 @@ class IcebergWriter(ParquetFileWriter):
     ):
         from pyiceberg.io.pyarrow import schema_to_pyarrow
 
-        self._iceberg_writer_opts = _resolve_iceberg_writer_options(dict(properties or {}))
+        # Bloom-filter enable flags are honored only for columns that exist in the
+        # schema being written, so a stale or misspelled flag is ignored rather
+        # than rejected by the writer.
+        valid_columns = set(schema.column_names) if schema is not None else None
+        self._iceberg_writer_opts = _resolve_iceberg_writer_options(dict(properties or {}), valid_columns)
         super().__init__(
             root_dir=root_dir,
             file_idx=file_idx,

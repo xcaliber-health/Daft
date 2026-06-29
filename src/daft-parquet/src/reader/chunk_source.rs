@@ -355,6 +355,41 @@ impl ChunkSourceBuilder {
     }
 }
 
+#[cfg(test)]
+impl ChunkSourceBuilder {
+    /// Open a local Parquet file as a `Local` chunk source for tests, returning
+    /// the builder alongside the parsed metadata used for row-group pruning.
+    pub(crate) fn local_for_test(path: &str) -> crate::Result<(Self, Arc<ParquetMetaData>)> {
+        let file = std::fs::File::open(path).map_err(|e| crate::Error::LocalIO {
+            path: path.to_string(),
+            source: e,
+        })?;
+        let file_len = file
+            .metadata()
+            .map_err(|e| crate::Error::LocalIO {
+                path: path.to_string(),
+                source: e,
+            })?
+            .len();
+        let meta =
+            ArrowReaderMetadata::load(&file, ArrowReaderOptions::new()).with_context(|_| {
+                ParquetMetadataSnafu {
+                    path: path.to_string(),
+                }
+            })?;
+        let metadata = meta.metadata().clone();
+        Ok((
+            Self::Local(LocalChunkSource {
+                path: Arc::from(path),
+                file: Arc::new(file),
+                file_len,
+                metadata: metadata.clone(),
+            }),
+            metadata,
+        ))
+    }
+}
+
 impl ChunkSource {
     pub(super) async fn read_rg_chunks(
         &self,

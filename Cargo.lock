@@ -3392,6 +3392,7 @@ dependencies = [
  "tango-bench",
  "tokio",
  "tokio-stream",
+ "uuid",
 ]
 
 [[package]]

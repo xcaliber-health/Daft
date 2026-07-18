@@ -105,18 +105,13 @@ def run(
 ) -> RemoveOrphanResult:
     if prefix_mismatch_mode not in _VALID_PREFIX_MODES:
         raise ValueError(
-            f"prefix_mismatch_mode must be one of {sorted(_VALID_PREFIX_MODES)}, "
-            f"got {prefix_mismatch_mode!r}"
+            f"prefix_mismatch_mode must be one of {sorted(_VALID_PREFIX_MODES)}, got {prefix_mismatch_mode!r}"
         )
 
     opts = options or {}
-    max_concurrent_deletes = int(
-        opts.get("max-concurrent-deletes", DEFAULT_MAX_CONCURRENT_DELETES)
-    )
+    max_concurrent_deletes = int(opts.get("max-concurrent-deletes", DEFAULT_MAX_CONCURRENT_DELETES))
     delete_num_retries = int(opts.get("delete-num-retries", DEFAULT_DELETE_NUM_RETRIES))
-    delete_backoff_base = float(
-        opts.get("delete-backoff-base-seconds", DEFAULT_DELETE_BACKOFF_BASE_SECONDS)
-    )
+    delete_backoff_base = float(opts.get("delete-backoff-base-seconds", DEFAULT_DELETE_BACKOFF_BASE_SECONDS))
     sample_limit = int(opts.get("sample-limit", DEFAULT_SAMPLE_LIMIT))
     allow_recent = bool(opts.get("allow-recent", False))
 
@@ -162,9 +157,7 @@ def run(
     )
 
 
-def _resolve_older_than_ms(
-    older_than: _dt.datetime | int | None, *, allow_recent: bool
-) -> int:
+def _resolve_older_than_ms(older_than: _dt.datetime | int | None, *, allow_recent: bool) -> int:
     now_ms = int(time.time() * 1000)
     if older_than is None:
         return now_ms - DEFAULT_OLDER_THAN_MS
@@ -193,9 +186,7 @@ def _resolve_location(table: PyIcebergTable, location: str | None) -> str:
     table_canon = _DEFAULT_SPEC.canonical(table_loc)
     loc_canon = _DEFAULT_SPEC.canonical(loc)
     if loc_canon != table_canon and not loc_canon.startswith(table_canon + "/"):
-        raise ValueError(
-            f"location={location!r} is not a subpath of table.location()={table.location()!r}"
-        )
+        raise ValueError(f"location={location!r} is not a subpath of table.location()={table.location()!r}")
     return loc
 
 
@@ -205,9 +196,7 @@ def _reachable_frame(table: PyIcebergTable) -> DataFrame:
     Spans data and delete files, manifests, manifest lists, statistics files,
     every recorded table-metadata file, and the current metadata pointer.
     """
-    content = content_frame(
-        table.inspect.all_files(), path_col="file_path", content_col="content"
-    )
+    content = content_frame(table.inspect.all_files(), path_col="file_path", content_col="content")
     manifests = manifest_frame(table.inspect.all_manifests(), path_col="path")
     extra: list[tuple[str, str]] = []
     md = table.metadata
@@ -244,14 +233,10 @@ def _listed_frame(
     object stores.
     """
     if file_list_view is not None:
-        return file_list_view_frame(
-            file_list_view, location=location, older_than_ms=older_than_ms
-        )
+        return file_list_view_frame(file_list_view, location=location, older_than_ms=older_than_ms)
     del prefix_listing  # informational; engine listing already prefix-based
     io_config = io_config_for_table(table)
-    return listed_files_frame(
-        location, io_config=io_config, older_than_ms=older_than_ms
-    )
+    return listed_files_frame(location, io_config=io_config, older_than_ms=older_than_ms)
 
 
 def _build_canonicalizer(opts: dict[str, Any]) -> CanonSpec:

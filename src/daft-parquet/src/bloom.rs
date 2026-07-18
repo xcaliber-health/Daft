@@ -595,7 +595,7 @@ mod tests {
         )]));
         let props = WriterProperties::builder()
             .set_column_bloom_filter_enabled("id".into(), true)
-            .set_column_bloom_filter_ndv("id".into(), 100)
+            .set_column_bloom_filter_max_ndv("id".into(), 100)
             .build();
 
         let mut buffer = Vec::new();
@@ -639,9 +639,9 @@ mod tests {
         let name = field.name().clone();
         let schema = std::sync::Arc::new(ArrowSchema::new(vec![field]));
         let props = WriterProperties::builder()
-            .set_max_row_group_size(max_rg)
+            .set_max_row_group_row_count(Some(max_rg))
             .set_column_bloom_filter_enabled(name.clone().into(), true)
-            .set_column_bloom_filter_ndv(name.into(), u64::try_from(max_rg).unwrap())
+            .set_column_bloom_filter_max_ndv(name.into(), u64::try_from(max_rg).unwrap())
             .build();
 
         let mut buffer = Vec::new();

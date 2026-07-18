@@ -80,16 +80,12 @@ def test_sort_ascending_per_file_monotonic(shuffled_table):
         },
     )
     shuffled_table.refresh()
-    post_ids = sorted(
-        int(r["id"]) for r in shuffled_table.scan().to_arrow().to_pylist()
-    )
+    post_ids = sorted(int(r["id"]) for r in shuffled_table.scan().to_arrow().to_pylist())
     assert post_ids == pre_ids
     assert result.added_files >= 1
 
     for path in _output_data_paths(shuffled_table):
-        assert _read_parquet_sorted(
-            path, "id", descending=False
-        ), f"output file {path!r} is not ascending in id"
+        assert _read_parquet_sorted(path, "id", descending=False), f"output file {path!r} is not ascending in id"
 
 
 def test_sort_descending_per_file_monotonic(shuffled_table):
@@ -175,11 +171,9 @@ def test_sort_multi_column(shuffled_table):
         tbl = pq.read_table(path)
         buckets = tbl.column("bucket").to_pylist()
         ids = tbl.column("id").to_pylist()
-        assert all(
-            a <= b for a, b in zip(buckets, buckets[1:])
-        ), f"bucket not asc in {path}"
+        assert all(a <= b for a, b in zip(buckets, buckets[1:])), f"bucket not asc in {path}"
         for b_val in set(buckets):
             ids_in_bucket = [ids[i] for i, bv in enumerate(buckets) if bv == b_val]
-            assert all(
-                a >= b for a, b in zip(ids_in_bucket, ids_in_bucket[1:])
-            ), f"id not desc within bucket={b_val} in {path}"
+            assert all(a >= b for a, b in zip(ids_in_bucket, ids_in_bucket[1:])), (
+                f"id not desc within bucket={b_val} in {path}"
+            )

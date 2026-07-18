@@ -87,9 +87,7 @@ class Appender(threading.Thread):
                                 list(range(next_id, next_id + self._batch)),
                                 type=pa.int64(),
                             ),
-                            "label": pa.array(
-                                ["live"] * self._batch, type=pa.string()
-                            ),
+                            "label": pa.array(["live"] * self._batch, type=pa.string()),
                         }
                     )
                 )
@@ -97,7 +95,7 @@ class Appender(threading.Thread):
                 if not self.first_commit_event.is_set():
                     self.first_commit_event.set()
                 next_id += self._batch
-            except BaseException as exc:  # noqa: BLE001
+            except BaseException as exc:
                 self.errors.append(exc)
             if self._max_commits is not None and self.commits >= self._max_commits:
                 # Quiesce after a bounded burst so a concurrent maintenance
@@ -132,9 +130,7 @@ def make_seeded_table(
         table.append(
             pa.table(
                 {
-                    "id": pa.array(
-                        list(range(start, start + rows_per_file)), type=pa.int64()
-                    ),
+                    "id": pa.array(list(range(start, start + rows_per_file)), type=pa.int64()),
                     "label": pa.array(["seed"] * rows_per_file, type=pa.string()),
                 }
             )

@@ -217,26 +217,25 @@ impl RewriteOptions {
                 ),
             ));
         }
-        if let Some(cap) = self.max_files_to_rewrite {
-            if cap == 0 {
-                return Err(invalid(
-                    "max-files-to-rewrite",
-                    "must be >= 1 when set".into(),
-                ));
-            }
+        if let Some(cap) = self.max_files_to_rewrite
+            && cap == 0
+        {
+            return Err(invalid(
+                "max-files-to-rewrite",
+                "must be >= 1 when set".into(),
+            ));
         }
-        if self.partial_progress_enabled {
-            if let Some(mfc) = self.partial_progress_max_failed_commits {
-                if mfc > self.partial_progress_max_commits {
-                    return Err(invalid(
-                        "partial-progress.max-failed-commits",
-                        format!(
-                            "must be <= partial-progress.max-commits ({}), got {}",
-                            self.partial_progress_max_commits, mfc
-                        ),
-                    ));
-                }
-            }
+        if self.partial_progress_enabled
+            && let Some(mfc) = self.partial_progress_max_failed_commits
+            && mfc > self.partial_progress_max_commits
+        {
+            return Err(invalid(
+                "partial-progress.max-failed-commits",
+                format!(
+                    "must be <= partial-progress.max-commits ({}), got {}",
+                    self.partial_progress_max_commits, mfc
+                ),
+            ));
         }
         Ok(())
     }
@@ -286,15 +285,19 @@ mod tests {
 
     #[test]
     fn rejects_undersized_target() {
-        let mut o = RewriteOptions::default();
-        o.target_file_size_bytes = 1024;
+        let o = RewriteOptions {
+            target_file_size_bytes: 1024,
+            ..Default::default()
+        };
         assert!(o.validate().is_err());
     }
 
     #[test]
     fn rejects_min_input_files_below_2() {
-        let mut o = RewriteOptions::default();
-        o.min_input_files = 1;
+        let o = RewriteOptions {
+            min_input_files: 1,
+            ..Default::default()
+        };
         assert!(o.validate().is_err());
     }
 

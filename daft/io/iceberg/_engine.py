@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Iterable, Iterator
+from typing import TYPE_CHECKING
 
 from daft.io.iceberg._common import (
     DEFAULT_DELETE_BACKOFF_BASE_SECONDS,
@@ -104,9 +105,7 @@ def build_canon_spec(
     scheme_aliases = dict(_DEFAULT_SCHEME_ALIASES)
     for key, value in (equal_schemes or {}).items():
         scheme_aliases[str(key).lower()] = str(value).lower()
-    authority_aliases = {
-        str(key): str(value) for key, value in (equal_authorities or {}).items()
-    }
+    authority_aliases = {str(key): str(value) for key, value in (equal_authorities or {}).items()}
     return CanonSpec(scheme_aliases=scheme_aliases, authority_aliases=authority_aliases)
 
 
@@ -160,9 +159,11 @@ def content_frame(
     df = daft.from_arrow(arrow_table)
     if status_col is not None:
         df = df.where(col(status_col) != lit(2))
-    kind = when(col(content_col) == lit(1), lit(KIND_POS_DELETE)).when(
-        col(content_col) == lit(2), lit(KIND_EQ_DELETE)
-    ).otherwise(lit(KIND_DATA))
+    kind = (
+        when(col(content_col) == lit(1), lit(KIND_POS_DELETE))
+        .when(col(content_col) == lit(2), lit(KIND_EQ_DELETE))
+        .otherwise(lit(KIND_DATA))
+    )
     return df.select(col(path_col).alias("path"), kind.alias("kind")).distinct()
 
 
@@ -205,9 +206,7 @@ def union_paths(frames: Iterable[DataFrame | None]) -> DataFrame | None:
 
 def with_uri_parts(df: DataFrame, spec: CanonSpec) -> DataFrame:
     """Add ``canon_path`` and ``prefix`` columns derived from the ``path`` column."""
-    return df.with_column("canon_path", canon_path_expr("path", spec)).with_column(
-        "prefix", prefix_expr("canon_path")
-    )
+    return df.with_column("canon_path", canon_path_expr("path", spec)).with_column("prefix", prefix_expr("canon_path"))
 
 
 # ---------------------------------------------------------------------------
@@ -249,10 +248,7 @@ def file_list_view_frame(
 
     names = view.column_names
     if "file_path" not in names or "last_modified" not in names:
-        raise ValueError(
-            "file_list_view must contain 'file_path' and 'last_modified' columns; "
-            f"got {names!r}"
-        )
+        raise ValueError(f"file_list_view must contain 'file_path' and 'last_modified' columns; got {names!r}")
     df = view.select(
         col("file_path").alias("path"),
         col("last_modified").alias("mtime"),
@@ -287,7 +283,7 @@ def find_orphans(
         to the reachable set; ``"error"`` additionally raises when a listed path
         shares no prefix with any reachable path.
 
-    Returns
+    Returns:
     -------
     tuple of (orphans, conflicts)
         ``orphans`` carries a ``path`` column. ``conflicts`` counts listed paths
@@ -351,7 +347,7 @@ def _partition_to_pydict(part: object) -> dict[str, list[str]]:
     """Materialize a partition (local micro-partition or remote handle) to a dict."""
     obj = part
     if not hasattr(obj, "to_pydict"):
-        import ray  # noqa: PLC0415 — only reached on the distributed runner
+        import ray
 
         obj = ray.get(part)
     return obj.to_pydict()

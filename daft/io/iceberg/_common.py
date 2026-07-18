@@ -12,8 +12,9 @@ from __future__ import annotations
 import logging
 import random
 import time
+from collections.abc import Callable, Hashable, Iterable
 from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING, Callable, Hashable, Iterable, TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 if TYPE_CHECKING:
     from pyiceberg.table import Table as PyIcebergTable
@@ -45,9 +46,7 @@ COMMIT_MAX_ATTEMPTS = COMMIT_DEFAULT_NUM_RETRIES
 COMMIT_BACKOFF_BASE_SECONDS = COMMIT_DEFAULT_MIN_WAIT_MS / 1000.0
 
 
-_NOT_FOUND_EXCEPTION_NAMES = frozenset(
-    {"FileNotFoundError", "NoSuchKey", "ObjectNotFound", "BlobNotFound"}
-)
+_NOT_FOUND_EXCEPTION_NAMES = frozenset({"FileNotFoundError", "NoSuchKey", "ObjectNotFound", "BlobNotFound"})
 _NOT_FOUND_MESSAGE_SUBSTRINGS = (
     "not found",
     "no such key",
@@ -79,7 +78,7 @@ def validate_gc_enabled(table: PyIcebergTable) -> None:
     table
         Iceberg table whose properties are read.
 
-    Raises
+    Raises:
     ------
     ValueError
         If ``table.properties[gc.enabled]`` resolves to false/0/no.
@@ -87,8 +86,7 @@ def validate_gc_enabled(table: PyIcebergTable) -> None:
     raw = table.properties.get(GC_ENABLED_KEY, "true")
     if str(raw).strip().lower() in {"false", "0", "no"}:
         raise ValueError(
-            f"refusing to run: table property {GC_ENABLED_KEY}=false. "
-            "Set it to true to permit physical file deletion."
+            f"refusing to run: table property {GC_ENABLED_KEY}=false. Set it to true to permit physical file deletion."
         )
 
 
@@ -124,7 +122,7 @@ def delete_files(
     op_name
         Used only in the warning log emitted on terminal delete failures.
 
-    Returns
+    Returns:
     -------
     tuple of (counts, failed)
         ``counts`` maps each ``kind`` to the number of successful deletes for
@@ -201,8 +199,7 @@ class CommitRetryExhausted(RuntimeError):
 
     def __init__(self, op_name: str, attempts: int, elapsed_ms: int) -> None:
         super().__init__(
-            f"{op_name}: commit retry budget exhausted after {attempts} "
-            f"attempt(s), {elapsed_ms}ms elapsed"
+            f"{op_name}: commit retry budget exhausted after {attempts} attempt(s), {elapsed_ms}ms elapsed"
         )
         self.op_name = op_name
         self.attempts = attempts
@@ -212,7 +209,7 @@ class CommitRetryExhausted(RuntimeError):
 def _read_retry_policy(table: PyIcebergTable) -> tuple[int, float, float, float]:
     """Resolve commit-retry parameters from table properties.
 
-    Returns
+    Returns:
     -------
     tuple
         ``(num_retries, min_wait_s, max_wait_s, total_timeout_s)`` with bounds
@@ -278,13 +275,13 @@ def commit_with_retry(
     sleep, monotonic, rng
         Injection points to make the helper deterministic in tests.
 
-    Returns
+    Returns:
     -------
     T
         The value returned by ``attempt_fn`` on a successful attempt, or the
         value returned by ``on_conflict`` if it short-circuits.
 
-    Raises
+    Raises:
     ------
     CommitRetryExhausted
         When the retry budget is exhausted without a successful commit.

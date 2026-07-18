@@ -1020,9 +1020,10 @@ impl S3LikeSource {
                         filepath: format!("{scheme}://{bucket}/{}", f.key().unwrap_or_default()),
                         size: f.size().map(|size| size as u64),
                         filetype: FileType::File,
-                        last_modified: f.last_modified().map(|dt| {
-                            dt.secs() * 1000 + i64::from(dt.subsec_nanos() / 1_000_000)
-                        }),
+                        last_modified:
+                            f.last_modified().map(|dt| {
+                                dt.secs() * 1000 + i64::from(dt.subsec_nanos() / 1_000_000)
+                            }),
                     }))
                     .collect();
 

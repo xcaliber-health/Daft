@@ -11,7 +11,6 @@ from pyiceberg.partitioning import UNPARTITIONED_PARTITION_SPEC
 
 from daft.catalog import Table
 from daft.io.iceberg import RewriteManifestsResult
-
 from tests.io.iceberg.actions._helpers import read_ids as _read_ids
 
 
@@ -27,9 +26,7 @@ def _small_target_opts():
 
 
 def test_many_small_manifests_merge_into_one(make_tiny_table):
-    table = make_tiny_table(
-        name="default.t_rm_merge", n_files=8, rows_per_file=2
-    )
+    table = make_tiny_table(name="default.t_rm_merge", n_files=8, rows_per_file=2)
     assert _current_manifest_count(table) == 8
     pre_ids = _read_ids(table)
 
@@ -138,9 +135,7 @@ def test_branch_scoping_does_not_touch_main(local_catalog, simple_schema):
     table.refresh()
     main_snapshot_id = table.metadata.current_snapshot().snapshot_id
 
-    table.manage_snapshots().create_branch(
-        snapshot_id=main_snapshot_id, branch_name="dev"
-    ).commit()
+    table.manage_snapshots().create_branch(snapshot_id=main_snapshot_id, branch_name="dev").commit()
     table.refresh()
 
     # Add more snapshots on `dev` only so it has its own manifest chain.
@@ -156,19 +151,13 @@ def test_branch_scoping_does_not_touch_main(local_catalog, simple_schema):
         )
     table.refresh()
 
-    main_manifest_paths_before = {
-        m.manifest_path
-        for m in table.snapshot_by_name("main").manifests(table.io)
-    }
+    main_manifest_paths_before = {m.manifest_path for m in table.snapshot_by_name("main").manifests(table.io)}
 
     dt = Table.from_iceberg(table)
     dt.rewrite_manifests(branch="dev", options=_small_target_opts())
 
     table.refresh()
-    main_manifest_paths_after = {
-        m.manifest_path
-        for m in table.snapshot_by_name("main").manifests(table.io)
-    }
+    main_manifest_paths_after = {m.manifest_path for m in table.snapshot_by_name("main").manifests(table.io)}
     assert main_manifest_paths_after == main_manifest_paths_before
 
 
@@ -197,11 +186,7 @@ def _make_partitioned(local_catalog, name: str):
         NestedField(1, "id", LongType(), required=False),
         NestedField(2, "region", StringType(), required=False),
     )
-    spec = PartitionSpec(
-        PartitionField(
-            source_id=2, field_id=1000, transform=IdentityTransform(), name="region"
-        )
-    )
+    spec = PartitionSpec(PartitionField(source_id=2, field_id=1000, transform=IdentityTransform(), name="region"))
     table = local_catalog.create_table(name, schema=schema, partition_spec=spec)
     for region in ("us", "eu", "ap"):
         for k in range(3):
@@ -257,9 +242,7 @@ def test_sort_by_partition_field(local_catalog):
     table = _make_partitioned(local_catalog, "default.t_rm_sb")
     pre_ids = sorted(_read_ids(table))
     dt = Table.from_iceberg(table)
-    result = dt.rewrite_manifests(
-        options={**_small_target_opts(), "sort-by": ["region"]}
-    )
+    result = dt.rewrite_manifests(options={**_small_target_opts(), "sort-by": ["region"]})
     assert result.snapshot_id is not None
     table.refresh()
     assert sorted(_read_ids(table)) == pre_ids

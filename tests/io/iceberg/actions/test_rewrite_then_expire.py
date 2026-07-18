@@ -9,19 +9,22 @@ import pytest
 pytest.importorskip("pyiceberg")
 
 from daft.catalog import Table
-
 from tests.io.iceberg.actions._helpers import (
     read_ids as _read_ids,
+)
+from tests.io.iceberg.actions._helpers import (
     scan_file_count as _scan_file_count,
+)
+from tests.io.iceberg.actions._helpers import (
     scan_paths as _scan_paths,
+)
+from tests.io.iceberg.actions._helpers import (
     strip_scheme as _strip_scheme,
 )
 
 
 def test_rewrite_then_expire_cleans_orphan_data_files(make_tiny_table):
-    table = make_tiny_table(
-        name="default.t_rewrite_expire", n_files=8, rows_per_file=5
-    )
+    table = make_tiny_table(name="default.t_rewrite_expire", n_files=8, rows_per_file=5)
     pre_paths = _scan_paths(table)
     pre_ids = _read_ids(table)
     assert _scan_file_count(table) == 8
@@ -53,9 +56,7 @@ def test_rewrite_then_expire_cleans_orphan_data_files(make_tiny_table):
 
 
 def test_compacted_files_land_in_standard_data_layout(make_tiny_table):
-    table = make_tiny_table(
-        name="default.t_rewrite_paths", n_files=6, rows_per_file=4
-    )
+    table = make_tiny_table(name="default.t_rewrite_paths", n_files=6, rows_per_file=4)
     base = table.location().rstrip("/") + "/data"
 
     dt = Table.from_iceberg(table)

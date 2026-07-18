@@ -40,9 +40,7 @@ def _tiny_arrow_table(start: int, n: int) -> pa.Table:
     return pa.table(
         {
             "id": pa.array(list(range(start, start + n)), type=pa.int64()),
-            "label": pa.array(
-                [f"row-{i}" for i in range(start, start + n)], type=pa.string()
-            ),
+            "label": pa.array([f"row-{i}" for i in range(start, start + n)], type=pa.string()),
         }
     )
 

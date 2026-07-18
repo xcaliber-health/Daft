@@ -17,7 +17,9 @@ pub use options::{
     JobOrder, NullOrder, RewriteOptions, SortColumn, SortDirection, Strategy, ZOrderKey,
 };
 pub use planner::{CandidateFile, FileGroup, plan_file_groups};
-pub use zorder::{ZORDER_KEY_COL, build_zorder_key_array, interleave_bits, normalize_to_ordered_bytes};
+pub use zorder::{
+    ZORDER_KEY_COL, build_zorder_key_array, interleave_bits, normalize_to_ordered_bytes,
+};
 
 #[cfg(feature = "python")]
 pub fn register_modules(parent: &pyo3::Bound<pyo3::types::PyModule>) -> pyo3::PyResult<()> {

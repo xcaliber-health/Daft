@@ -28,8 +28,8 @@ bincode = {workspace = true}
 fastrand = "2.1.0"
 parquet = {workspace = true}
 path_macro = {workspace = true}
-tango-bench.workspace = true
 uuid = {workspace = true}
+tango-bench.workspace = true
 
 [features]
 python = [

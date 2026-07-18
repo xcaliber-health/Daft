@@ -30,11 +30,7 @@ def _make_partitioned(local_catalog, name: str):
         NestedField(1, "id", LongType(), required=False),
         NestedField(2, "region", StringType(), required=False),
     )
-    spec = PartitionSpec(
-        PartitionField(
-            source_id=2, field_id=1000, transform=IdentityTransform(), name="region"
-        )
-    )
+    spec = PartitionSpec(PartitionField(source_id=2, field_id=1000, transform=IdentityTransform(), name="region"))
     table = local_catalog.create_table(name, schema=schema, partition_spec=spec)
     for region in ("us", "eu", "ap"):
         for k in range(3):
@@ -91,9 +87,7 @@ def test_concurrency_bounded_by_option(local_catalog, monkeypatch, max_concurren
 
     # The number of groups running at once never exceeds the configured bound,
     # on any runner.
-    assert 1 <= active["peak"] <= max_concurrent, (
-        f"observed peak={active['peak']} outside [1, {max_concurrent}]"
-    )
+    assert 1 <= active["peak"] <= max_concurrent, f"observed peak={active['peak']} outside [1, {max_concurrent}]"
     if max_concurrent == 1:
         assert active["peak"] == 1, "groups must not overlap when the bound is 1"
     elif runners.get_or_create_runner().name == "ray":

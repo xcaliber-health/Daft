@@ -40,6 +40,7 @@ class _ManifestWriterFactory(Protocol):
 
     def new_manifest_writer(self, spec: PartitionSpec) -> ManifestWriter: ...
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -107,29 +108,21 @@ def run(
     target_size_bytes = int(
         opts.get(
             "manifest-target-size-bytes",
-            table.properties.get(
-                MANIFEST_TARGET_SIZE_KEY, _DEFAULT_MANIFEST_TARGET_SIZE_BYTES
-            ),
+            table.properties.get(MANIFEST_TARGET_SIZE_KEY, _DEFAULT_MANIFEST_TARGET_SIZE_BYTES),
         )
     )
     min_count_to_merge = int(
         opts.get(
             "manifest-min-count-to-merge",
-            table.properties.get(
-                MANIFEST_MIN_COUNT_TO_MERGE_KEY, _DEFAULT_MIN_COUNT_TO_MERGE
-            ),
+            table.properties.get(MANIFEST_MIN_COUNT_TO_MERGE_KEY, _DEFAULT_MIN_COUNT_TO_MERGE),
         )
     )
     if target_size_bytes <= 0:
-        raise ValueError(
-            f"manifest-target-size-bytes must be > 0, got {target_size_bytes!r}"
-        )
+        raise ValueError(f"manifest-target-size-bytes must be > 0, got {target_size_bytes!r}")
 
     read_concurrency = int(opts.get("manifest-read-concurrency", 1))
     if read_concurrency < 1:
-        raise ValueError(
-            f"manifest-read-concurrency must be >= 1, got {read_concurrency!r}"
-        )
+        raise ValueError(f"manifest-read-concurrency must be >= 1, got {read_concurrency!r}")
 
     sort_by = opts.get("sort-by")
     if sort_by is not None:
@@ -259,10 +252,7 @@ def _plan(
             untouched.append(m)
 
     bytes_rewritten = sum(int(m.manifest_length) for m in matching)
-    total_live_entries = sum(
-        int(m.added_files_count or 0) + int(m.existing_files_count or 0)
-        for m in matching
-    )
+    total_live_entries = sum(int(m.added_files_count or 0) + int(m.existing_files_count or 0) for m in matching)
 
     rewrite_id = _resolve_rewrite_id(
         table=table,
@@ -279,9 +269,7 @@ def _plan(
         roll = int(target_size_bytes * _ROLL_FACTOR)
         max_size = max(int(m.manifest_length) for m in matching)
         expected_count = max(1, (bytes_rewritten + target_size_bytes - 1) // target_size_bytes)
-        already_balanced = (
-            abs(len(matching) - expected_count) <= 1 and max_size <= roll
-        )
+        already_balanced = abs(len(matching) - expected_count) <= 1 and max_size <= roll
         below_min_count = len(matching) < min_count_to_merge and already_balanced
         if already_balanced and (below_min_count or len(matching) == expected_count):
             no_op_reason = (
@@ -333,12 +321,8 @@ def _commit_attempt(
             read_concurrency=read_concurrency,
         )
         producer.build_new_manifests()
-        producer.snapshot_properties[SNAPSHOT_PROP_OUTPUT_MANIFESTS] = str(
-            len(producer.new_manifests)
-        )
-        producer.snapshot_properties[SNAPSHOT_PROP_OUTPUT_BYTES] = str(
-            producer.bytes_added
-        )
+        producer.snapshot_properties[SNAPSHOT_PROP_OUTPUT_MANIFESTS] = str(len(producer.new_manifests))
+        producer.snapshot_properties[SNAPSHOT_PROP_OUTPUT_BYTES] = str(producer.bytes_added)
         producer.commit()
         committed_snapshot_id = int(producer.snapshot_id)
         added = len(producer.new_manifests)
@@ -435,18 +419,13 @@ def _producer_class() -> type:
             )
 
             previous_snapshot = (
-                self._transaction.table_metadata.snapshot_by_id(
-                    self._parent_snapshot_id
-                )
+                self._transaction.table_metadata.snapshot_by_id(self._parent_snapshot_id)
                 if self._parent_snapshot_id is not None
                 else None
             )
             prev_props: dict[str, str] = {}
             if previous_snapshot is not None and previous_snapshot.summary is not None:
-                prev_props = dict(
-                    getattr(previous_snapshot.summary, "additional_properties", {})
-                    or {}
-                )
+                prev_props = dict(getattr(previous_snapshot.summary, "additional_properties", {}) or {})
             carry = {
                 k: prev_props[k]
                 for k in (
@@ -478,8 +457,7 @@ def _producer_class() -> type:
             # byte size; derived from the average entry size across the input set.
             avg_bytes = max(
                 1,
-                self._plan.bytes_rewritten
-                // max(1, self._plan.total_live_entries),
+                self._plan.bytes_rewritten // max(1, self._plan.total_live_entries),
             )
             fallback_roll_at_entries = max(1, int(roll_at_bytes / avg_bytes))
 
@@ -525,10 +503,7 @@ def _producer_class() -> type:
             """
             manifests = self._plan.matching_manifests
             if self._read_concurrency == 1 or len(manifests) <= 1:
-                return [
-                    (m, list(m.fetch_manifest_entry(self._io, discard_deleted=True)))
-                    for m in manifests
-                ]
+                return [(m, list(m.fetch_manifest_entry(self._io, discard_deleted=True))) for m in manifests]
             from concurrent.futures import ThreadPoolExecutor
 
             def _read(m: Any) -> list[Any]:
@@ -623,9 +598,7 @@ def _partition_values_in_order(partition: Any, n: int) -> list[Any]:
         return list((getattr(partition, "__dict__", None) or {}).values())[:n]
 
 
-def _cluster_key(
-    data_file: Any, spec: PartitionSpec, sort_by: list[str] | None
-) -> tuple[Any, ...]:
+def _cluster_key(data_file: Any, spec: PartitionSpec, sort_by: list[str] | None) -> tuple[Any, ...]:
     """Stable clustering key for a data file's partition.
 
     Output entries that share this key are grouped into the same manifest, so a
@@ -645,9 +618,7 @@ def _cluster_key(
     return tuple(pairs)
 
 
-def _validate_sort_by(
-    table: PyIcebergTable, spec_id: int, sort_by: list[str] | None
-) -> None:
+def _validate_sort_by(table: PyIcebergTable, spec_id: int, sort_by: list[str] | None) -> None:
     """Reject ``sort_by`` columns that are not partition fields of the spec."""
     if not sort_by:
         return
@@ -656,8 +627,7 @@ def _validate_sort_by(
     bad = [c for c in sort_by if c not in names]
     if bad:
         raise ValueError(
-            f"sort-by columns {bad!r} are not partition fields of spec {spec_id} "
-            f"(available: {sorted(names)})"
+            f"sort-by columns {bad!r} are not partition fields of spec {spec_id} (available: {sorted(names)})"
         )
 
 
@@ -666,8 +636,7 @@ def _resolve_spec_id(table: PyIcebergTable, spec_id: int | None) -> int:
         return int(table.spec().spec_id)
     if int(spec_id) not in {int(s) for s in table.specs().keys()}:
         raise ValueError(
-            f"spec_id={spec_id!r} is not present in table.specs() "
-            f"({sorted(int(s) for s in table.specs().keys())})"
+            f"spec_id={spec_id!r} is not present in table.specs() ({sorted(int(s) for s in table.specs().keys())})"
         )
     return int(spec_id)
 
@@ -702,30 +671,21 @@ def _resolve_rewrite_id(
     }
     import json
 
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, default=str).encode()
-    ).hexdigest()[:16]
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
-def _lookup_idempotent_result(
-    table: PyIcebergTable, rewrite_id: str
-) -> RewriteManifestsResult | None:
+def _lookup_idempotent_result(table: PyIcebergTable, rewrite_id: str) -> RewriteManifestsResult | None:
     if not rewrite_id:
         return None
     for snap in list(table.metadata.snapshots or [])[-50:]:
         summary = _summary_as_dict(snap.summary)
         if (
             summary.get(SNAPSHOT_PROP_REWRITE_ID) == rewrite_id
-            and summary.get(SNAPSHOT_PROP_REWRITE_STRATEGY)
-            == SNAPSHOT_PROP_REWRITE_STRATEGY_VALUE
+            and summary.get(SNAPSHOT_PROP_REWRITE_STRATEGY) == SNAPSHOT_PROP_REWRITE_STRATEGY_VALUE
         ):
             return RewriteManifestsResult(
-                rewritten_manifests_count=int(
-                    summary.get(SNAPSHOT_PROP_INPUT_MANIFESTS, 0)
-                ),
-                added_manifests_count=int(
-                    summary.get(SNAPSHOT_PROP_OUTPUT_MANIFESTS, 0)
-                ),
+                rewritten_manifests_count=int(summary.get(SNAPSHOT_PROP_INPUT_MANIFESTS, 0)),
+                added_manifests_count=int(summary.get(SNAPSHOT_PROP_OUTPUT_MANIFESTS, 0)),
                 bytes_rewritten=int(summary.get(SNAPSHOT_PROP_INPUT_BYTES, 0)),
                 bytes_added=int(summary.get(SNAPSHOT_PROP_OUTPUT_BYTES, 0)),
                 rewrite_id=rewrite_id,

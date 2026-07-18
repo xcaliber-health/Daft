@@ -67,14 +67,8 @@ def test_identity_partition_each_output_has_correct_region(catalog):
         NestedField(1, "id", LongType(), required=False),
         NestedField(2, "region", StringType(), required=False),
     )
-    spec = PartitionSpec(
-        PartitionField(
-            source_id=2, field_id=1000, transform=IdentityTransform(), name="region"
-        )
-    )
-    table = catalog.create_table(
-        "default.t_identity", schema=schema, partition_spec=spec
-    )
+    spec = PartitionSpec(PartitionField(source_id=2, field_id=1000, transform=IdentityTransform(), name="region"))
+    table = catalog.create_table("default.t_identity", schema=schema, partition_spec=spec)
     # Append 4 small files into each of 3 regions.
     for region in ("us", "eu", "ap"):
         for k in range(4):
@@ -90,9 +84,7 @@ def test_identity_partition_each_output_has_correct_region(catalog):
     pre_ids = _read_ids(table)
 
     dt_table = Table.from_iceberg(table)
-    result = dt_table.compact_files(
-        options={"rewrite-all": True, "min-input-files": 2}
-    )
+    result = dt_table.compact_files(options={"rewrite-all": True, "min-input-files": 2})
     table.refresh()
 
     # Each output must carry exactly one non-empty partition tuple equal to its region.
@@ -103,9 +95,7 @@ def test_identity_partition_each_output_has_correct_region(catalog):
     assert regions == {"us", "eu", "ap"}, f"missing/extra regions: {regions}"
 
     # Partition pruning must still return correct rows.
-    us_rows = list(
-        table.scan(row_filter=EqualTo("region", "us")).to_arrow().to_pylist()
-    )
+    us_rows = list(table.scan(row_filter=EqualTo("region", "us")).to_arrow().to_pylist())
     assert us_rows, "partition filter returned no rows after rewrite"
     assert all(r["region"] == "us" for r in us_rows)
 
@@ -131,9 +121,7 @@ def test_bucket_partition_each_output_tagged_with_bucket(catalog):
             name="id_bucket",
         )
     )
-    table = catalog.create_table(
-        "default.t_bucket", schema=schema, partition_spec=spec
-    )
+    table = catalog.create_table("default.t_bucket", schema=schema, partition_spec=spec)
     # Seed enough distinct ids to hit multiple buckets.
     for chunk in range(6):
         rows = list(range(chunk * 10, chunk * 10 + 10))
@@ -148,18 +136,14 @@ def test_bucket_partition_each_output_tagged_with_bucket(catalog):
     pre_ids = _read_ids(table)
 
     dt_table = Table.from_iceberg(table)
-    result = dt_table.compact_files(
-        options={"rewrite-all": True, "min-input-files": 2}
-    )
+    result = dt_table.compact_files(options={"rewrite-all": True, "min-input-files": 2})
     table.refresh()
 
     parts = _partition_tuples(table)
     assert parts, "expected at least one output file"
     # All bucket values must be ints in [0, num_buckets).
     bucket_values = [p[0] for p in parts]
-    assert all(
-        isinstance(b, int) and 0 <= b < 4 for b in bucket_values
-    ), f"bucket values out of range: {bucket_values}"
+    assert all(isinstance(b, int) and 0 <= b < 4 for b in bucket_values), f"bucket values out of range: {bucket_values}"
     # Multiple buckets exercised.
     assert len(set(bucket_values)) >= 2
 
@@ -182,9 +166,7 @@ def test_truncate_partition_each_output_tagged_with_truncated_prefix(catalog):
             name="name_trunc",
         )
     )
-    table = catalog.create_table(
-        "default.t_trunc", schema=schema, partition_spec=spec
-    )
+    table = catalog.create_table("default.t_trunc", schema=schema, partition_spec=spec)
     for prefix in ("alpha", "beta", "gamma"):
         for k in range(3):
             ids = list(range(k * 10, k * 10 + 4))
@@ -192,9 +174,7 @@ def test_truncate_partition_each_output_tagged_with_truncated_prefix(catalog):
                 pa.table(
                     {
                         "id": pa.array(ids, type=pa.int64()),
-                        "name": pa.array(
-                            [f"{prefix}-{i}" for i in ids], type=pa.string()
-                        ),
+                        "name": pa.array([f"{prefix}-{i}" for i in ids], type=pa.string()),
                     }
                 )
             )
@@ -236,9 +216,7 @@ def test_day_partition_each_output_tagged_with_day_int(catalog):
                 pa.table(
                     {
                         "id": pa.array(ids, type=pa.int64()),
-                        "event_ts": pa.array(
-                            [d] * 4, type=pa.timestamp("us")
-                        ),
+                        "event_ts": pa.array([d] * 4, type=pa.timestamp("us")),
                     }
                 )
             )

@@ -42,8 +42,9 @@ from daft.io.iceberg._engine import (
 )
 
 if TYPE_CHECKING:
-    from daft.dataframe import DataFrame
     from pyiceberg.table import Table as PyIcebergTable
+
+    from daft.dataframe import DataFrame
 
 logger = logging.getLogger(__name__)
 
@@ -102,22 +103,14 @@ def run(
     options: dict[str, Any] | None = None,
 ) -> ExpireResult:
     opts = options or {}
-    max_concurrent_deletes = int(
-        opts.get("max-concurrent-deletes", DEFAULT_MAX_CONCURRENT_DELETES)
-    )
-    delete_num_retries = int(
-        opts.get("delete-num-retries", DEFAULT_DELETE_NUM_RETRIES)
-    )
-    delete_backoff_base = float(
-        opts.get("delete-backoff-base-seconds", DEFAULT_DELETE_BACKOFF_BASE_SECONDS)
-    )
+    max_concurrent_deletes = int(opts.get("max-concurrent-deletes", DEFAULT_MAX_CONCURRENT_DELETES))
+    delete_num_retries = int(opts.get("delete-num-retries", DEFAULT_DELETE_NUM_RETRIES))
+    delete_backoff_base = float(opts.get("delete-backoff-base-seconds", DEFAULT_DELETE_BACKOFF_BASE_SECONDS))
 
     validate_gc_enabled(table)
 
     if older_than is None and retain_last is None and not snapshot_ids:
-        max_age_ms = int(
-            table.properties.get(MAX_SNAPSHOT_AGE_MS_KEY, _DEFAULT_MAX_SNAPSHOT_AGE_MS)
-        )
+        max_age_ms = int(table.properties.get(MAX_SNAPSHOT_AGE_MS_KEY, _DEFAULT_MAX_SNAPSHOT_AGE_MS))
         older_than = int(time.time() * 1000) - max_age_ms
 
     if retain_last is not None and retain_last < 1:
@@ -153,8 +146,7 @@ def run(
             if not is_not_found(exc):
                 raise
             logger.warning(
-                "expire_snapshots: cannot enumerate referenced files (%r); "
-                "expiring snapshots without file cleanup",
+                "expire_snapshots: cannot enumerate referenced files (%r); expiring snapshots without file cleanup",
                 exc,
             )
     pre_metadata: set[str] | None = None
@@ -214,9 +206,7 @@ def _expire_file_frame(table: PyIcebergTable) -> DataFrame:
     are handled separately so that retiring an old metadata pointer is not
     mistaken for a data-file deletion.
     """
-    content = content_frame(
-        table.inspect.all_files(), path_col="file_path", content_col="content"
-    )
+    content = content_frame(table.inspect.all_files(), path_col="file_path", content_col="content")
     manifests = manifest_frame(table.inspect.all_manifests(), path_col="path")
     extra: list[tuple[str, str]] = []
     md = table.metadata
@@ -278,18 +268,14 @@ def _protected_snapshot_ids(table: PyIcebergTable) -> set[int]:
     }
 
 
-def _validate_explicit_snapshot_ids(
-    table: PyIcebergTable, snapshot_ids: list[int], protected_ids: set[int]
-) -> None:
+def _validate_explicit_snapshot_ids(table: PyIcebergTable, snapshot_ids: list[int], protected_ids: set[int]) -> None:
     known = {s.snapshot_id for s in table.metadata.snapshots}
     missing = [sid for sid in snapshot_ids if sid not in known]
     if missing:
         raise ValueError(f"snapshot_ids do not exist: {missing!r}")
     illegal = [sid for sid in snapshot_ids if sid in protected_ids]
     if illegal:
-        raise ValueError(
-            f"snapshot_ids are protected by a branch/tag ref and cannot be expired: {illegal!r}"
-        )
+        raise ValueError(f"snapshot_ids are protected by a branch/tag ref and cannot be expired: {illegal!r}")
 
 
 def _resolve_expired_ids(
@@ -315,22 +301,14 @@ def _resolve_expired_ids(
     if retain_last is not None:
         min_keep = max(
             retain_last,
-            int(
-                table.properties.get(
-                    MIN_SNAPSHOTS_TO_KEEP_KEY, _DEFAULT_MIN_SNAPSHOTS_TO_KEEP
-                )
-            ),
+            int(table.properties.get(MIN_SNAPSHOTS_TO_KEEP_KEY, _DEFAULT_MIN_SNAPSHOTS_TO_KEEP)),
         )
         kept = _most_recent_main_snapshot_ids(table, min_keep)
         for s in table.metadata.snapshots:
             if s.snapshot_id not in kept:
                 candidates.add(s.snapshot_id)
     else:
-        min_keep = int(
-            table.properties.get(
-                MIN_SNAPSHOTS_TO_KEEP_KEY, _DEFAULT_MIN_SNAPSHOTS_TO_KEEP
-            )
-        )
+        min_keep = int(table.properties.get(MIN_SNAPSHOTS_TO_KEEP_KEY, _DEFAULT_MIN_SNAPSHOTS_TO_KEEP))
         if min_keep > 0:
             kept = _most_recent_main_snapshot_ids(table, min_keep)
             candidates -= kept
@@ -392,4 +370,3 @@ def _commit_expire(table: PyIcebergTable, expired_ids: set[int]) -> None:
         raise ExpireSnapshotsFailedException(
             "expire_snapshots: metadata commit could not land within the retry budget"
         ) from exc
-

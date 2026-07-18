@@ -9,14 +9,16 @@
 //! Nulls normalize to a zero-filled slice of the column's encoded width and sort
 //! before any concrete value (nulls-first semantics).
 
-use arrow::array::{
-    Array, ArrayData, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
-    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
-    LargeStringArray, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array,
-    UInt8Array,
+use arrow::{
+    array::{
+        Array, ArrayData, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
+        Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        LargeBinaryArray, LargeStringArray, StringArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+        UInt16Array, UInt32Array, UInt64Array,
+    },
+    datatypes::{DataType, TimeUnit},
 };
-use arrow::datatypes::{DataType, TimeUnit};
 
 use crate::errors::IcebergRewriteError;
 
@@ -93,14 +95,9 @@ pub fn normalize_to_ordered_bytes(
         DataType::Utf8 => fill_var!(out, array, StringArray, str_to_bytes, n, var_len),
         DataType::LargeUtf8 => fill_var!(out, array, LargeStringArray, str_to_bytes, n, var_len),
         DataType::Binary => fill_var!(out, array, BinaryArray, bytes_passthrough, n, var_len),
-        DataType::LargeBinary => fill_var!(
-            out,
-            array,
-            LargeBinaryArray,
-            bytes_passthrough,
-            n,
-            var_len
-        ),
+        DataType::LargeBinary => {
+            fill_var!(out, array, LargeBinaryArray, bytes_passthrough, n, var_len);
+        }
         other => {
             return Err(IcebergRewriteError::UnsupportedZOrderType {
                 column: String::new(),
@@ -129,7 +126,7 @@ trait ArrayNullCheck {
 struct NullCheckImpl<'a> {
     array: &'a dyn Array,
 }
-impl<'a> ArrayNullCheck for NullCheckImpl<'a> {
+impl ArrayNullCheck for NullCheckImpl<'_> {
     fn is_null(&self, i: usize) -> bool {
         self.array.is_null(i)
     }
@@ -225,7 +222,6 @@ pub fn interleave_bits(columns: &[Vec<Vec<u8>>], output_size: u64) -> Vec<Vec<u8
     }
     let n_rows = columns[0].len();
     debug_assert!(columns.iter().all(|c| c.len() == n_rows));
-    let n_cols = columns.len();
     let output_bytes = output_size as usize;
     let output_bits = output_bytes * 8;
 
@@ -233,18 +229,14 @@ pub fn interleave_bits(columns: &[Vec<Vec<u8>>], output_size: u64) -> Vec<Vec<u8
     for r in 0..n_rows {
         let mut buf = vec![0u8; output_bytes];
         let mut out_bit = 0usize;
-        let max_col_bits = columns
-            .iter()
-            .map(|c| c[r].len() * 8)
-            .max()
-            .unwrap_or(0);
+        let max_col_bits = columns.iter().map(|c| c[r].len() * 8).max().unwrap_or(0);
         let mut src_bit = 0usize;
         while out_bit < output_bits && src_bit < max_col_bits {
-            for c in 0..n_cols {
+            for col in columns {
                 if out_bit >= output_bits {
                     break;
                 }
-                let bytes = &columns[c][r];
+                let bytes = &col[r];
                 let bit = if src_bit < bytes.len() * 8 {
                     let byte = bytes[src_bit / 8];
                     (byte >> (7 - (src_bit % 8))) & 1
@@ -279,7 +271,7 @@ pub fn build_zorder_key_array(
         });
     }
     let n_rows = arrays[0].len();
-    for a in arrays.iter() {
+    for a in arrays {
         if a.len() != n_rows {
             return Err(IcebergRewriteError::InvalidOption {
                 name: "zorder_by".into(),
@@ -289,7 +281,10 @@ pub fn build_zorder_key_array(
     }
     let mut per_column: Vec<Vec<Vec<u8>>> = Vec::with_capacity(arrays.len());
     for a in arrays {
-        per_column.push(normalize_to_ordered_bytes(a.as_ref(), var_length_contribution)?);
+        per_column.push(normalize_to_ordered_bytes(
+            a.as_ref(),
+            var_length_contribution,
+        )?);
     }
     let keys = interleave_bits(&per_column, max_output_size);
     let arr = BinaryArray::from_iter_values(keys.iter().map(|v| v.as_slice()));
@@ -298,15 +293,16 @@ pub fn build_zorder_key_array(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
+
+    use super::*;
 
     fn assert_lex_order_matches<T, F>(values: Vec<T>, encode: F)
     where
         T: PartialOrd + Copy + std::fmt::Debug,
         F: Fn(T) -> Vec<u8>,
     {
-        let mut sorted = values.clone();
+        let mut sorted = values;
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let encoded: Vec<(T, Vec<u8>)> = sorted.iter().map(|v| (*v, encode(*v))).collect();
         for w in encoded.windows(2) {
@@ -333,7 +329,15 @@ mod tests {
 
     #[test]
     fn int64_ordering_matches_lex() {
-        let vals = vec![-1_000_000_000i64, -1, 0, 1, 1_000_000_000, i64::MIN, i64::MAX];
+        let vals = vec![
+            -1_000_000_000i64,
+            -1,
+            0,
+            1,
+            1_000_000_000,
+            i64::MIN,
+            i64::MAX,
+        ];
         assert_lex_order_matches(vals, |v| {
             let arr = Int64Array::from(vec![v]);
             let bytes = normalize_to_ordered_bytes(&arr, 8).unwrap();
@@ -391,12 +395,24 @@ mod tests {
     #[test]
     fn decimal128_round_trip_preserves_sign_order() {
         use arrow::array::Decimal128Array;
-        let arr = Decimal128Array::from(vec![Some(-100i128), Some(-1), Some(0), Some(1), Some(100), None])
-            .with_precision_and_scale(20, 4)
-            .unwrap();
+        let arr = Decimal128Array::from(vec![
+            Some(-100i128),
+            Some(-1),
+            Some(0),
+            Some(1),
+            Some(100),
+            None,
+        ])
+        .with_precision_and_scale(20, 4)
+        .unwrap();
         let bytes = normalize_to_ordered_bytes(&arr, 8).unwrap();
         for w in bytes[..5].windows(2) {
-            assert!(w[0] <= w[1], "decimal ordering broken: {:?} vs {:?}", w[0], w[1]);
+            assert!(
+                w[0] <= w[1],
+                "decimal ordering broken: {:?} vs {:?}",
+                w[0],
+                w[1]
+            );
         }
         assert_eq!(bytes[5], vec![0u8; 16]);
     }

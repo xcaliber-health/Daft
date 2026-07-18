@@ -27,11 +27,7 @@ def _make_partitioned(local_catalog, name: str, n_partitions: int = 4, files_per
         NestedField(1, "id", LongType(), required=False),
         NestedField(2, "region", StringType(), required=False),
     )
-    spec = PartitionSpec(
-        PartitionField(
-            source_id=2, field_id=1000, transform=IdentityTransform(), name="region"
-        )
-    )
+    spec = PartitionSpec(PartitionField(source_id=2, field_id=1000, transform=IdentityTransform(), name="region"))
     table = local_catalog.create_table(name, schema=schema, partition_spec=spec)
     for r in range(n_partitions):
         region = f"r{r}"
@@ -83,9 +79,7 @@ def test_min_file_size_makes_inputs_well_sized(make_tiny_table):
 
 
 def test_max_failed_commits_raises_when_exceeded(local_catalog, monkeypatch):
-    table = _make_partitioned(
-        local_catalog, "default.t_maxfail", n_partitions=4, files_per_part=2
-    )
+    table = _make_partitioned(local_catalog, "default.t_maxfail", n_partitions=4, files_per_part=2)
 
     txn_type = type(table.transaction())
     calls = {"n": 0}
@@ -111,9 +105,7 @@ def test_max_failed_commits_raises_when_exceeded(local_catalog, monkeypatch):
 
 
 def test_failed_data_files_counted_in_result(local_catalog, monkeypatch):
-    table = _make_partitioned(
-        local_catalog, "default.t_failfiles", n_partitions=4, files_per_part=2
-    )
+    table = _make_partitioned(local_catalog, "default.t_failfiles", n_partitions=4, files_per_part=2)
 
     txn_type = type(table.transaction())
     real_commit_transaction = txn_type.commit_transaction

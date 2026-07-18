@@ -32,9 +32,9 @@ def test_compression_codec_from_write_properties(make_tiny_table):
             for rg in range(pf.num_row_groups)
             for c in range(pf.metadata.num_columns)
         }
-        assert "GZIP" in codecs or "gzip" in {
-            c.lower() for c in codecs
-        }, f"expected gzip codec, got {codecs} for {path}"
+        assert "GZIP" in codecs or "gzip" in {c.lower() for c in codecs}, (
+            f"expected gzip codec, got {codecs} for {path}"
+        )
 
 
 def test_target_file_size_from_write_property(make_tiny_table):
@@ -55,9 +55,7 @@ def test_target_file_size_from_write_property(make_tiny_table):
     _compact._rust_iceberg.validate_options_py = spy
     try:
         dt = Table.from_iceberg(table)
-        dt.rewrite_data_files(
-            "binpack", options={"rewrite-all": True, "min-input-files": 2}
-        )
+        dt.rewrite_data_files("binpack", options={"rewrite-all": True, "min-input-files": 2})
     finally:
         _compact._rust_iceberg.validate_options_py = original
 
@@ -67,9 +65,7 @@ def test_target_file_size_from_write_property(make_tiny_table):
 def test_target_file_size_option_overrides_write_property(make_tiny_table):
     from daft.io.iceberg import _compact
 
-    table = make_tiny_table(
-        name="default.t_target_override", n_files=2, rows_per_file=2
-    )
+    table = make_tiny_table(name="default.t_target_override", n_files=2, rows_per_file=2)
     with table.transaction() as tx:
         tx.set_properties(**{_compact.WRITE_TARGET_FILE_SIZE_BYTES_KEY: "1048576"})
 
@@ -164,9 +160,7 @@ def test_row_group_size_bytes_from_write_properties(make_tiny_table):
                 f"row group {rg} = {pf.metadata.row_group(rg).total_byte_size} bytes "
                 f"exceeded 4 * target with target=4096"
             )
-        assert (
-            pf.num_row_groups > 1
-        ), "tiny row-group cap should produce multiple groups"
+        assert pf.num_row_groups > 1, "tiny row-group cap should produce multiple groups"
 
 
 def test_page_size_bytes_from_write_properties(make_tiny_table):
@@ -222,6 +216,4 @@ def test_avro_compression_codec_applies_to_new_manifests(make_tiny_table):
         if path.startswith("file://"):
             path = path[len("file://") :]
         header = open(path, "rb").read(512)
-        assert (
-            b"deflate" in header
-        ), f"expected deflate codec marker in avro header of {m.manifest_path}"
+        assert b"deflate" in header, f"expected deflate codec marker in avro header of {m.manifest_path}"

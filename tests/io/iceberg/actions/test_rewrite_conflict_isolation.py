@@ -20,9 +20,10 @@ import pytest
 pytest.importorskip("pyiceberg")
 
 from daft.catalog import Table
-from daft.io.iceberg import RewriteConflict
-from daft.io.iceberg import _compact  # noqa: internal — monkeypatching internal helper
-
+from daft.io.iceberg import (
+    RewriteConflict,
+    _compact,  # noqa: internal — monkeypatching internal helper
+)
 from tests.io.iceberg.actions._helpers import _row_count, make_seeded_table
 
 _FOREIGN_ROWS = 20

@@ -61,6 +61,7 @@ _VALID_CONFLICT_ISOLATIONS = (
     CONFLICT_ISOLATION_SNAPSHOT,
 )
 
+
 def _parse_conflict_isolation(raw_options: dict[str, Any]) -> str:
     """Pop and validate the conflict-isolation option from ``raw_options``.
 
@@ -70,10 +71,7 @@ def _parse_conflict_isolation(raw_options: dict[str, Any]) -> str:
     """
     value = raw_options.pop(CONFLICT_ISOLATION_KEY, CONFLICT_ISOLATION_SERIALIZABLE)
     if value not in _VALID_CONFLICT_ISOLATIONS:
-        raise ValueError(
-            f"{CONFLICT_ISOLATION_KEY} must be one of {_VALID_CONFLICT_ISOLATIONS}, "
-            f"got {value!r}"
-        )
+        raise ValueError(f"{CONFLICT_ISOLATION_KEY} must be one of {_VALID_CONFLICT_ISOLATIONS}, got {value!r}")
     return value
 
 
@@ -140,9 +138,7 @@ def run(
     from pyiceberg.manifest import DataFileContent
 
     if strategy not in SUPPORTED_STRATEGIES:
-        raise ValueError(
-            f"strategy must be one of {SUPPORTED_STRATEGIES}, got {strategy!r}"
-        )
+        raise ValueError(f"strategy must be one of {SUPPORTED_STRATEGIES}, got {strategy!r}")
     parsed_sort_order: list[tuple[str, bool, bool]] | None = None
     parsed_zorder_by: list[str] | None = None
     if strategy == "sort":
@@ -169,9 +165,7 @@ def run(
         starting_snapshot = table.snapshot_by_name(branch)
     else:
         starting_snapshot = table.current_snapshot()
-    starting_snapshot_id: int | None = (
-        int(starting_snapshot.snapshot_id) if starting_snapshot is not None else None
-    )
+    starting_snapshot_id: int | None = int(starting_snapshot.snapshot_id) if starting_snapshot is not None else None
     if starting_snapshot_id is not None:
         scan_kwargs["snapshot_id"] = starting_snapshot_id
     scan = table.scan(**scan_kwargs)
@@ -203,21 +197,15 @@ def run(
         plan_by_path[path] = task
 
     if eq_delete_files:
-        raise EqualityDeletesPresent(
-            f"equality deletes present in files: {sorted(set(eq_delete_files))}"
-        )
+        raise EqualityDeletesPresent(f"equality deletes present in files: {sorted(set(eq_delete_files))}")
 
     current_spec_id = int(table.spec().spec_id)
     groups = _rust_iceberg.plan_file_groups_py(candidates, raw_options, current_spec_id)
 
-    rewrite_id = _resolve_rewrite_id(
-        table, branch, strategy, normalized, candidates, raw_options
-    )
+    rewrite_id = _resolve_rewrite_id(table, branch, strategy, normalized, candidates, raw_options)
     cached = _lookup_idempotent_result(table, rewrite_id, strategy)
     if cached is not None:
-        logger.info(
-            "rewrite_data_files: idempotency hit on rewrite_id=%s; skipping", rewrite_id
-        )
+        logger.info("rewrite_data_files: idempotency hit on rewrite_id=%s; skipping", rewrite_id)
         return cached
 
     if not groups:
@@ -339,9 +327,7 @@ def _rewrite_groups(
     return [o for o in outputs if o is not None]
 
 
-def _augment_result_with_dangling(
-    result: RewriteResult, removed_delete_files: int
-) -> RewriteResult:
+def _augment_result_with_dangling(result: RewriteResult, removed_delete_files: int) -> RewriteResult:
     return RewriteResult(
         strategy=result.strategy,
         rewritten_files=result.rewritten_files,
@@ -399,13 +385,10 @@ def _parse_zorder_columns(
         bare = type_str.split("(")[0].strip()
         if bare not in _ZORDER_SUPPORTED_TYPES:
             raise ValueError(
-                f"zorder column {c!r} has unsupported type {type_str!r}; "
-                f"supported: {sorted(_ZORDER_SUPPORTED_TYPES)}"
+                f"zorder column {c!r} has unsupported type {type_str!r}; supported: {sorted(_ZORDER_SUPPORTED_TYPES)}"
             )
         if c == _ZORDER_KEY_COL:
-            raise ValueError(
-                f"column name {_ZORDER_KEY_COL!r} is reserved by the z-order rewrite"
-            )
+            raise ValueError(f"column name {_ZORDER_KEY_COL!r} is reserved by the z-order rewrite")
         out.append(c)
     return out
 
@@ -422,20 +405,14 @@ def _parse_sort_order(
     parsed: list[tuple[str, bool, bool]] = []
     for item in sort_order:
         if not isinstance(item, (list, tuple)) or len(item) != 3:
-            raise ValueError(
-                f"sort_order entries must be (column, asc|desc, nulls-first|nulls-last); got {item!r}"
-            )
+            raise ValueError(f"sort_order entries must be (column, asc|desc, nulls-first|nulls-last); got {item!r}")
         col, direction, null_order = item
         if col not in schema_names:
             raise ValueError(f"sort column {col!r} not in table schema")
         if direction not in _VALID_SORT_DIRECTIONS:
-            raise ValueError(
-                f"sort direction must be one of {_VALID_SORT_DIRECTIONS}, got {direction!r}"
-            )
+            raise ValueError(f"sort direction must be one of {_VALID_SORT_DIRECTIONS}, got {direction!r}")
         if null_order not in _VALID_NULL_ORDERS:
-            raise ValueError(
-                f"null order must be one of {_VALID_NULL_ORDERS}, got {null_order!r}"
-            )
+            raise ValueError(f"null order must be one of {_VALID_NULL_ORDERS}, got {null_order!r}")
         parsed.append((col, direction == "desc", null_order == "nulls-first"))
     return parsed
 
@@ -537,9 +514,7 @@ def _group_dataframe(
     tasks = [plan_by_path[path] for path in input_paths]
     multithreaded_io = runners.get_or_create_runner().name != "ray"
     storage_config = StorageConfig(multithreaded_io, io_config)
-    operator = IcebergFileGroupScanOperator(
-        table, snapshot_id=snapshot_id, storage_config=storage_config, tasks=tasks
-    )
+    operator = IcebergFileGroupScanOperator(table, snapshot_id=snapshot_id, storage_config=storage_config, tasks=tasks)
     handle = ScanOperatorHandle.from_python_scan_operator(operator)
     builder = LogicalPlanBuilder.from_tabular_scan(scan_operator=handle)
     return DataFrame(builder)
@@ -572,9 +547,7 @@ def _apply_zorder(
 _MIN_SHUFFLED_TARGET_BYTES = 1024 * 1024
 
 
-def _coalesce_binpack(
-    df: DataFrame, *, n_inputs: int, bytes_rewritten: int, target_size: int
-) -> DataFrame:
+def _coalesce_binpack(df: DataFrame, *, n_inputs: int, bytes_rewritten: int, target_size: int) -> DataFrame:
     """Coalesce a binpack group to roughly target-sized partitions on a cluster.
 
     A distributed write emits one output file per input partition, so packing
@@ -671,9 +644,7 @@ def _resolve_rewrite_id(
         "options": {k: normalized_options[k] for k in sorted(normalized_options)},
         "files": sorted(c["path"] for c in candidates),
     }
-    h = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, default=str).encode()
-    ).hexdigest()
+    h = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
     return h[:16]
 
 
@@ -706,13 +677,11 @@ def _lookup_idempotent_result(
         return None
     rewritten_total = sum(int(s.get(SNAPSHOT_PROP_INPUT_FILES, 0)) for _, s in matches)
     added_total = sum(int(s.get(SNAPSHOT_PROP_OUTPUT_FILES, 0)) for _, s in matches)
-    bytes_rewritten_total = sum(
-        int(s.get("removed-files-size", 0)) for _, s in matches
-    )
+    bytes_rewritten_total = sum(int(s.get("removed-files-size", 0)) for _, s in matches)
     bytes_added_total = sum(int(s.get("added-files-size", 0)) for _, s in matches)
-    strat = matches[-1][1].get(SNAPSHOT_PROP_STRATEGY, strategy)
+    recorded_strategy = matches[-1][1].get(SNAPSHOT_PROP_STRATEGY, strategy)
     return RewriteResult(
-        strategy=strat,
+        strategy=recorded_strategy,
         rewritten_files=rewritten_total,
         added_files=added_total,
         bytes_rewritten=bytes_rewritten_total,
@@ -725,16 +694,11 @@ def _lookup_idempotent_result(
     )
 
 
-def _find_batch_snapshot(
-    table: PyIcebergTable, rewrite_id: str, batch_label: str
-) -> Any | None:
+def _find_batch_snapshot(table: PyIcebergTable, rewrite_id: str, batch_label: str) -> Any | None:
     snapshots = list(table.metadata.snapshots or [])
     for snap in reversed(snapshots[-50:]):
         summary = _summary_as_dict(snap.summary)
-        if (
-            summary.get(SNAPSHOT_PROP_REWRITE_ID) == rewrite_id
-            and summary.get(SNAPSHOT_PROP_BATCH) == batch_label
-        ):
+        if summary.get(SNAPSHOT_PROP_REWRITE_ID) == rewrite_id and summary.get(SNAPSHOT_PROP_BATCH) == batch_label:
             return snap
     return None
 
@@ -873,8 +837,7 @@ def _commit_partial(
         if result is None:
             orphan_paths = _orphan_output_paths(batch)
             logger.warning(
-                "rewrite_data_files: batch %s of %s failed after retries (%s); "
-                "orphan outputs: %s",
+                "rewrite_data_files: batch %s of %s failed after retries (%s); orphan outputs: %s",
                 label,
                 n_actual,
                 type(err).__name__ if err else "unknown",
@@ -927,14 +890,10 @@ def _commit_batch(
 ) -> tuple[RewriteResult | None, Exception | None]:
     all_data_files = [df_ for o in batch for df_ in o.data_files]
     input_paths = sorted({p for o in batch for p in o.input_data_files})
-    delete_files_consumed = sorted(
-        {p for o in batch for p in o.input_positional_delete_files}
-    )
+    delete_files_consumed = sorted({p for o in batch for p in o.input_positional_delete_files})
     total_in = sum(o.bytes_rewritten for o in batch)
     total_out = sum(o.bytes_added for o in batch)
-    touched_partitions = {
-        _stable_partition_key(plan_by_path[p].file.partition) for p in input_paths
-    }
+    touched_partitions = {_stable_partition_key(plan_by_path[p].file.partition) for p in input_paths}
 
     snapshot_props: dict[str, str] = {
         SNAPSHOT_PROP_MAINTENANCE_OP: SNAPSHOT_PROP_MAINTENANCE_OP_VALUE,
@@ -998,11 +957,7 @@ def _commit_batch(
                 ow.append_data_file(df_)
         tx.commit_transaction()
         table.refresh()
-        snap = (
-            table.snapshot_by_name(branch)
-            if branch is not None
-            else table.current_snapshot()
-        )
+        snap = table.snapshot_by_name(branch) if branch is not None else table.current_snapshot()
         snapshot_id = int(snap.snapshot_id) if snap else 0
         return _success_result(snapshot_id)
 
@@ -1094,10 +1049,7 @@ def _raise_if_inputs_vanished(
     missing = [p for p in input_paths if p not in live]
     if missing:
         orphans = _orphan_output_paths(batch)
-        raise RewriteConflict(
-            f"input files vanished before commit: {missing!r}; "
-            f"orphan outputs: {orphans!r}"
-        )
+        raise RewriteConflict(f"input files vanished before commit: {missing!r}; orphan outputs: {orphans!r}")
 
 
 def _snapshot_rewrite_id(snapshot: Any) -> str | None:
@@ -1135,8 +1087,7 @@ def _added_data_files(snapshot: Any, table: PyIcebergTable) -> list[Any]:
 
 
 def _remove_dangling_deletes(table: PyIcebergTable, branch: str | None) -> int:
-    """Drop delete files whose sequence number is at or below the partition's
-    minimum data-file sequence number.
+    """Drop delete files whose sequence number is at or below the partition's minimum data-file sequence number.
 
     A delete with no live data file at or after its sequence number can never
     apply to anything, so removing it is safe. Commits a single snapshot. Returns
@@ -1145,11 +1096,7 @@ def _remove_dangling_deletes(table: PyIcebergTable, branch: str | None) -> int:
     from pyiceberg.manifest import DataFileContent
 
     table.refresh()
-    snap = (
-        table.snapshot_by_name(branch)
-        if branch is not None
-        else table.current_snapshot()
-    )
+    snap = table.snapshot_by_name(branch) if branch is not None else table.current_snapshot()
     if snap is None:
         return 0
 

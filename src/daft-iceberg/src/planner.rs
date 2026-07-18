@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{errors::IcebergRewriteError, options::{JobOrder, RewriteOptions}};
+use crate::{
+    errors::IcebergRewriteError,
+    options::{JobOrder, RewriteOptions},
+};
 
 /// One Iceberg data file considered for rewrite.
 ///
@@ -100,7 +103,12 @@ pub fn plan_file_groups(
             continue;
         }
 
-        groups.extend(pack(survivors, &part_key, output_spec_id, opts.max_file_group_size_bytes));
+        groups.extend(pack(
+            survivors,
+            &part_key,
+            output_spec_id,
+            opts.max_file_group_size_bytes,
+        ));
     }
 
     sort_groups(&mut groups, opts.job_order);
@@ -198,7 +206,10 @@ mod tests {
             .map(|i| cf(&format!("/f{i}.parquet"), 1024, "{}", 0))
             .collect();
         let groups = plan_file_groups(candidates, &o, 0).unwrap();
-        assert!(groups.is_empty(), "expected skip when below min-input-files");
+        assert!(
+            groups.is_empty(),
+            "expected skip when below min-input-files"
+        );
     }
 
     #[test]
@@ -269,7 +280,10 @@ mod tests {
         let mut c = cf("/f0.parquet", 1024, "{}", 0);
         c.has_equality_deletes = true;
         let err = plan_file_groups(vec![c], &o, 0).unwrap_err();
-        assert!(matches!(err, IcebergRewriteError::EqualityDeletesPresent { .. }));
+        assert!(matches!(
+            err,
+            IcebergRewriteError::EqualityDeletesPresent { .. }
+        ));
     }
 
     #[test]
@@ -305,7 +319,12 @@ mod tests {
         ];
         let groups = plan_file_groups(candidates, &o, 0).unwrap();
         let total_files: usize = groups.iter().map(|g| g.files.len()).sum();
-        assert!(total_files <= 3, "cap not honored: {} files in {} groups", total_files, groups.len());
+        assert!(
+            total_files <= 3,
+            "cap not honored: {} files in {} groups",
+            total_files,
+            groups.len()
+        );
         assert_eq!(groups.len(), 1);
     }
 

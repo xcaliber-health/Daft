@@ -31,9 +31,7 @@ def _random_strings(n: int, width: int, rng: random.Random) -> list[str]:
     return ["".join(rng.choices(alphabet, k=width)) for _ in range(n)]
 
 
-def _make_multifile_table(
-    local_catalog, name: str, n_files: int = 4, rows_per_file: int = 25_000
-):
+def _make_multifile_table(local_catalog, name: str, n_files: int = 4, rows_per_file: int = 25_000):
     """Create an unpartitioned table with `n_files` parquet files each ~700KB.
 
     With target/max-group set to 1 MiB (the validator minimum), two of these files
@@ -220,9 +218,9 @@ def test_partial_progress_failed_batch_aggregated(local_catalog, monkeypatch, ca
     assert result.commits == 1, "only the first batch should have committed"
     assert result.failed_groups > 0
     assert _snapshot_count(table) == pre_snaps + 1
-    assert any(
-        "orphan outputs" in rec.message for rec in caplog.records
-    ), f"expected an orphan-outputs WARNING; got: {[r.message for r in caplog.records]}"
+    assert any("orphan outputs" in rec.message for rec in caplog.records), (
+        f"expected an orphan-outputs WARNING; got: {[r.message for r in caplog.records]}"
+    )
 
 
 def test_idempotent_replay_across_partial_progress(local_catalog):
@@ -241,9 +239,7 @@ def test_idempotent_replay_across_partial_progress(local_catalog):
     assert r1.commits == 2
 
     r2 = dt.compact_files(options=common_opts)
-    assert (
-        _snapshot_count(table) == snaps_after_first
-    ), "replay must not create new snapshots"
+    assert _snapshot_count(table) == snaps_after_first, "replay must not create new snapshots"
     assert r2.rewrite_id == rid
     assert r2.commits == r1.commits == 2
     assert sorted(r2.snapshot_ids) == sorted(r1.snapshot_ids)

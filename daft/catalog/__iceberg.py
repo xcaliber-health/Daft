@@ -56,9 +56,7 @@ class IcebergCatalog(Catalog):
     _inner: InnerCatalog
 
     def __init__(self) -> None:
-        raise RuntimeError(
-            "IcebergCatalog.__init__ is not supported, please use `Catalog.from_iceberg` instead."
-        )
+        raise RuntimeError("IcebergCatalog.__init__ is not supported, please use `Catalog.from_iceberg` instead.")
 
     @staticmethod
     def _from_obj(obj: object) -> IcebergCatalog:
@@ -146,9 +144,7 @@ class IcebergCatalog(Catalog):
                     width=pf.transform.width,
                 )
             else:
-                raise NotImplementedError(
-                    f"Unsupported partition transform: {pf.transform}"
-                )
+                raise NotImplementedError(f"Unsupported partition transform: {pf.transform}")
 
             iceberg_partition_fields.append(
                 PyIcebergPartitionField(
@@ -164,9 +160,7 @@ class IcebergCatalog(Catalog):
     # create_*
     ###
 
-    def _create_function(
-        self, ident: Identifier, function: Function | Callable[..., Any]
-    ) -> None:
+    def _create_function(self, ident: Identifier, function: Function | Callable[..., Any]) -> None:
         raise NotImplementedError("Iceberg does not support function registration.")
 
     def _get_function(self, ident: Identifier) -> Function:
@@ -185,12 +179,8 @@ class IcebergCatalog(Catalog):
     ) -> Table:
         i = _to_pyiceberg_ident(identifier)
         pa_schema = schema.to_pyarrow_schema()
-        iceberg_schema = assign_fresh_schema_ids(
-            _pyarrow_to_schema_without_ids(pa_schema)
-        )
-        partition_spec = self._partition_fields_to_pyiceberg_spec(
-            iceberg_schema, partition_fields
-        )
+        iceberg_schema = assign_fresh_schema_ids(_pyarrow_to_schema_without_ids(pa_schema))
+        partition_spec = self._partition_fields_to_pyiceberg_spec(iceberg_schema, partition_fields)
         t = IcebergTable.__new__(IcebergTable)
         if partition_spec is not None:
             t._inner = self._inner.create_table(
@@ -251,9 +241,7 @@ class IcebergCatalog(Catalog):
             raise NotFoundError() from ex
         except Exception as ex:
             # wrap original exceptions
-            raise Exception(
-                "pyiceberg raised an exception while calling get_table"
-            ) from ex
+            raise Exception("pyiceberg raised an exception while calling get_table") from ex
 
     ###
     # list_*
@@ -280,9 +268,7 @@ class IcebergTable(Table):
     _write_options: set[str] = set()
 
     def __init__(self) -> None:
-        raise RuntimeError(
-            "IcebergTable.__init__ is not supported, please use `Table.from_iceberg` instead."
-        )
+        raise RuntimeError("IcebergTable.__init__ is not supported, please use `Table.from_iceberg` instead.")
 
     @property
     def name(self) -> str:
@@ -300,7 +286,7 @@ class IcebergTable(Table):
             return t
         raise ValueError(f"Unsupported iceberg table type: {type(obj)}")
 
-    def read(self, **options: int | None) -> DataFrame:
+    def read(self, **options: Any) -> DataFrame:
         Table._validate_options("Iceberg read", options, IcebergTable._read_options)
         ignore_corrupt_files: bool = options.get("ignore_corrupt_files", False)
         return read_iceberg(
@@ -383,13 +369,13 @@ class IcebergTable(Table):
             ``commit.retry.min-wait-ms``, ``commit.retry.max-wait-ms``,
             ``commit.retry.total-timeout-ms``.
 
-        Returns
+        Returns:
         -------
         RewriteResult
             File and byte counts, commit count, snapshot ids, and a stable
             ``rewrite_id`` used for idempotent replay.
 
-        Raises
+        Raises:
         ------
         ValueError
             On unknown ``strategy`` or invalid ``sort_order`` / ``zorder_by``.
@@ -400,7 +386,7 @@ class IcebergTable(Table):
             When a concurrent writer modified a partition this call is
             rewriting, or removed one of its input files.
 
-        Examples
+        Examples:
         --------
         >>> table.rewrite_data_files("binpack")  # doctest: +SKIP
         >>> table.rewrite_data_files(  # doctest: +SKIP
@@ -475,19 +461,19 @@ class IcebergTable(Table):
             ``commit.retry.num-retries``, ``commit.retry.min-wait-ms``,
             ``commit.retry.max-wait-ms``, ``commit.retry.total-timeout-ms``.
 
-        Returns
+        Returns:
         -------
         ExpireResult
             Counts of files removed, broken out by file type.
 
-        Raises
+        Raises:
         ------
         ValueError
             If the table property ``gc.enabled`` is false, or if
             ``snapshot_ids`` contains protected or unknown IDs, or if
             ``retain_last < 1``.
 
-        Examples
+        Examples:
         --------
         >>> table.expire_snapshots(retain_last=10)  # doctest: +SKIP
         >>> from datetime import datetime, timedelta, timezone
@@ -567,12 +553,12 @@ class IcebergTable(Table):
             - ``allow-recent`` (bool, default False) — disables the 24-hour
               floor; for tests only.
 
-        Returns
+        Returns:
         -------
         RemoveOrphanResult
             Counts and a bounded sample of orphan paths.
 
-        Raises
+        Raises:
         ------
         ValueError
             If the table property ``gc.enabled`` is false, if ``older_than`` is
@@ -583,7 +569,7 @@ class IcebergTable(Table):
             With ``prefix_mismatch_mode='error'``, when any listed file uses a
             scheme/authority absent from the reachable set.
 
-        Examples
+        Examples:
         --------
         >>> table.remove_orphan_files(dry_run=True)  # doctest: +SKIP
         >>> from datetime import datetime, timedelta, timezone
@@ -648,19 +634,19 @@ class IcebergTable(Table):
             ``commit.retry.num-retries``, ``commit.retry.min-wait-ms``,
             ``commit.retry.max-wait-ms``, ``commit.retry.total-timeout-ms``.
 
-        Returns
+        Returns:
         -------
         RewriteManifestsResult
             Counts and byte totals for the rewritten and added manifests, plus
             the new snapshot id (``None`` when nothing needed rewriting).
 
-        Raises
+        Raises:
         ------
         ValueError
             If the table property ``gc.enabled`` is false, ``spec_id`` is not a
             valid spec on the table, or ``branch`` does not exist (or is a tag).
 
-        Examples
+        Examples:
         --------
         >>> table.rewrite_manifests()  # doctest: +SKIP
         >>> table.rewrite_manifests(spec_id=0)  # doctest: +SKIP
@@ -684,7 +670,7 @@ class IcebergTable(Table):
     ) -> RewriteResult:
         """Compact small files. Alias for ``rewrite_data_files("binpack", ...)``.
 
-        Examples
+        Examples:
         --------
         >>> table.compact_files()  # doctest: +SKIP
         >>> table.compact_files(where="region = 'us'")  # doctest: +SKIP

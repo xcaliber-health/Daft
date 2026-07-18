@@ -7,9 +7,10 @@ import pytest
 pytest.importorskip("pyiceberg")
 
 from daft.catalog import Table
-
 from tests.io.iceberg.actions._helpers import (
     read_ids as _read_ids,
+)
+from tests.io.iceberg.actions._helpers import (
     scan_file_count as _scan_file_count,
 )
 
@@ -30,9 +31,7 @@ def test_binpack_reduces_file_count(make_tiny_table):
 
     table.refresh()
     post_count = _scan_file_count(table)
-    assert (
-        post_count < pre_count
-    ), f"expected fewer files, got {pre_count} -> {post_count}"
+    assert post_count < pre_count, f"expected fewer files, got {pre_count} -> {post_count}"
     assert result.rewritten_files == pre_count
     assert result.added_files == post_count
     assert result.commits == 1
@@ -64,13 +63,9 @@ def test_binpack_idempotent_replay(make_tiny_table):
     table = make_tiny_table(name="default.t_idemp", n_files=6, rows_per_file=3)
     dt = Table.from_iceberg(table)
     rid = "replay-me"
-    r1 = dt.compact_files(
-        options={"rewrite-all": True, "min-input-files": 2, "rewrite-id": rid}
-    )
+    r1 = dt.compact_files(options={"rewrite-all": True, "min-input-files": 2, "rewrite-id": rid})
     table.refresh()
-    r2 = dt.compact_files(
-        options={"rewrite-all": True, "min-input-files": 2, "rewrite-id": rid}
-    )
+    r2 = dt.compact_files(options={"rewrite-all": True, "min-input-files": 2, "rewrite-id": rid})
     assert r1.rewrite_id == rid == r2.rewrite_id
     assert r2.commits == r1.commits
     assert r2.rewritten_files == r1.rewritten_files

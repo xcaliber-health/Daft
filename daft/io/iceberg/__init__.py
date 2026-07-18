@@ -28,13 +28,10 @@ from daft.io.iceberg._rewrite_manifests import (
     RewriteManifestsResult,
 )
 
-IcebergMaintenanceOptions = Mapping[str, Union[str, int, float, bool]]
-"""Tuning knobs for the maintenance APIs.
-
-A mapping of option name to a scalar value. Recognized keys and their
-defaults are documented on each maintenance method; unknown keys are
-rejected at validation time.
-"""
+# Tuning knobs for the maintenance APIs: a mapping of option name to a scalar
+# value. Recognized keys and their defaults are documented on each
+# maintenance method; unknown keys are rejected at validation time.
+IcebergMaintenanceOptions = Mapping[str, str | int | float | bool]
 
 __all__ = [
     "CommitRetryExhausted",

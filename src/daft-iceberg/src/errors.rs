@@ -20,6 +20,6 @@ pub enum IcebergRewriteError {
 
 impl From<IcebergRewriteError> for DaftError {
     fn from(e: IcebergRewriteError) -> Self {
-        DaftError::ValueError(e.to_string())
+        Self::ValueError(e.to_string())
     }
 }

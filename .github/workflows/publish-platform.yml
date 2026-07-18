@@ -11,7 +11,7 @@ name: Build and publish platform wheels
 on:
   push:
     tags:
-      - 'v[0-9]*.[0-9]*.[0-9]*-platform.[0-9]*'
+    - 'v[0-9]*.[0-9]*.[0-9]*-platform.[0-9]*'
 
 permissions:
   contents: write
@@ -34,18 +34,18 @@ jobs:
       cargo: ${{ steps.parse.outputs.cargo }}
       tag: ${{ steps.parse.outputs.tag }}
     steps:
-      - name: Parse tag to PEP 440 and Cargo versions
-        id: parse
-        run: |
-          TAG="${{ github.ref_name }}"
-          # v0.7.14-platform.2 → BASE=0.7.14, NUM=2
-          BASE=$(echo "$TAG" | sed 's/-platform\..*//' | sed 's/^v//')
-          NUM=$(echo "$TAG" | grep -oP '(?<=-platform\.)\d+')
-          PEP440="${BASE}.post${NUM}"
-          echo "tag=$TAG"      >> "$GITHUB_OUTPUT"
-          echo "pep440=$PEP440" >> "$GITHUB_OUTPUT"
-          echo "cargo=$BASE"   >> "$GITHUB_OUTPUT"
-          echo "Tag: $TAG → PEP 440: $PEP440 | Cargo: $BASE"
+    - name: Parse tag to PEP 440 and Cargo versions
+      id: parse
+      run: |
+        TAG="${{ github.ref_name }}"
+        # v0.7.14-platform.2 → BASE=0.7.14, NUM=2
+        BASE=$(echo "$TAG" | sed 's/-platform\..*//' | sed 's/^v//')
+        NUM=$(echo "$TAG" | grep -oP '(?<=-platform\.)\d+')
+        PEP440="${BASE}.post${NUM}"
+        echo "tag=$TAG"      >> "$GITHUB_OUTPUT"
+        echo "pep440=$PEP440" >> "$GITHUB_OUTPUT"
+        echo "cargo=$BASE"   >> "$GITHUB_OUTPUT"
+        echo "Tag: $TAG → PEP 440: $PEP440 | Cargo: $BASE"
 
   build:
     needs: compute-version
@@ -55,81 +55,81 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu
-            arch: x86_64
-            runner: ubuntu-22.04
-            manylinux: "2_24"
-          - os: macos
-            arch: aarch64
-            runner: macos-14
+        - os: ubuntu
+          arch: x86_64
+          runner: ubuntu-22.04
+          manylinux: "2_24"
+        - os: macos
+          arch: aarch64
+          runner: macos-14
 
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
 
-      - name: Setup Python and uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          enable-cache: false
+    - name: Setup Python and uv
+      uses: astral-sh/setup-uv@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        enable-cache: false
 
-      - name: Patch versions
-        env:
-          PEP440: ${{ needs.compute-version.outputs.pep440 }}
-          CARGO: ${{ needs.compute-version.outputs.cargo }}
-        run: |
-          echo "Cargo version: $CARGO | Wheel version: $PEP440"
-          # Patch version ONLY in [workspace.package] section of Cargo.toml.
-          # [workspace.dependencies.*] also have bare `version = "..."` lines — must not touch those.
-          awk -v cargo="$CARGO" '
-            /^\[workspace\.package\]/            { in_wp=1 }
-            /^\[/ && !/^\[workspace\.package\]/  { in_wp=0 }
-            in_wp && /^version = /               { sub(/version = "[^"]*"/, "version = \"" cargo "\"") }
-            { print }
-          ' Cargo.toml > /tmp/Cargo.toml.patched && mv /tmp/Cargo.toml.patched Cargo.toml
-          # In pyproject.toml: replace `dynamic = [...]` line with static version
-          perl -i -pe "s/^dynamic = \[.*\]\$/version = \"$PEP440\"/" pyproject.toml
+    - name: Patch versions
+      env:
+        PEP440: ${{ needs.compute-version.outputs.pep440 }}
+        CARGO: ${{ needs.compute-version.outputs.cargo }}
+      run: |
+        echo "Cargo version: $CARGO | Wheel version: $PEP440"
+        # Patch version ONLY in [workspace.package] section of Cargo.toml.
+        # [workspace.dependencies.*] also have bare `version = "..."` lines — must not touch those.
+        awk -v cargo="$CARGO" '
+          /^\[workspace\.package\]/            { in_wp=1 }
+          /^\[/ && !/^\[workspace\.package\]/  { in_wp=0 }
+          in_wp && /^version = /               { sub(/version = "[^"]*"/, "version = \"" cargo "\"") }
+          { print }
+        ' Cargo.toml > /tmp/Cargo.toml.patched && mv /tmp/Cargo.toml.patched Cargo.toml
+        # In pyproject.toml: replace `dynamic = [...]` line with static version
+        perl -i -pe "s/^dynamic = \[.*\]\$/version = \"$PEP440\"/" pyproject.toml
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: "npm"
-          cache-dependency-path: src/daft-dashboard/frontend/package-lock.json
+    - name: Setup Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: "22"
+        cache: "npm"
+        cache-dependency-path: src/daft-dashboard/frontend/package-lock.json
 
-      - name: Build dashboard
-        working-directory: ./src/daft-dashboard/frontend
-        run: npm ci && npm run build
+    - name: Build dashboard
+      working-directory: ./src/daft-dashboard/frontend
+      run: npm ci && npm run build
 
-      - name: Build wheel (Linux x86_64)
-        if: matrix.os == 'ubuntu'
-        uses: PyO3/maturin-action@v1
-        with:
-          target: x86_64
-          manylinux: ${{ matrix.manylinux }}
-          args: -i python${{ env.PYTHON_VERSION }} --profile release --out dist
-        env:
-          RUST_DAFT_PKG_BUILD_TYPE: release
-          GITHUB_ACTIONS: "true"
+    - name: Build wheel (Linux x86_64)
+      if: matrix.os == 'ubuntu'
+      uses: PyO3/maturin-action@v1
+      with:
+        target: x86_64
+        manylinux: ${{ matrix.manylinux }}
+        args: -i python${{ env.PYTHON_VERSION }} --profile release --out dist
+      env:
+        RUST_DAFT_PKG_BUILD_TYPE: release
+        GITHUB_ACTIONS: "true"
 
-      - name: Build wheel (macOS aarch64)
-        if: matrix.os == 'macos'
-        uses: PyO3/maturin-action@v1
-        with:
-          target: aarch64
-          args: -i python${{ env.PYTHON_VERSION }} --profile release --out dist
-        env:
-          RUST_DAFT_PKG_BUILD_TYPE: release
-          RUSTFLAGS: -Ctarget-cpu=apple-m1
-          CFLAGS: -mtune=apple-m1
-          GITHUB_ACTIONS: "true"
+    - name: Build wheel (macOS aarch64)
+      if: matrix.os == 'macos'
+      uses: PyO3/maturin-action@v1
+      with:
+        target: aarch64
+        args: -i python${{ env.PYTHON_VERSION }} --profile release --out dist
+      env:
+        RUST_DAFT_PKG_BUILD_TYPE: release
+        RUSTFLAGS: -Ctarget-cpu=apple-m1
+        CFLAGS: -mtune=apple-m1
+        GITHUB_ACTIONS: "true"
 
-      - name: Upload wheel artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels-${{ matrix.os }}-${{ matrix.arch }}
-          path: dist/*.whl
+    - name: Upload wheel artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: wheels-${{ matrix.os }}-${{ matrix.arch }}
+        path: dist/*.whl
 
   publish:
     needs: [compute-version, build]
@@ -137,111 +137,111 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
 
-      - name: Download wheels
-        uses: actions/download-artifact@v4
-        with:
-          pattern: wheels-*
-          merge-multiple: true
-          path: dist
+    - name: Download wheels
+      uses: actions/download-artifact@v4
+      with:
+        pattern: wheels-*
+        merge-multiple: true
+        path: dist
 
-      - name: Create GitHub Release and upload wheels
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          TAG="${{ needs.compute-version.outputs.tag }}"
-          PEP440="${{ needs.compute-version.outputs.pep440 }}"
+    - name: Create GitHub Release and upload wheels
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        TAG="${{ needs.compute-version.outputs.tag }}"
+        PEP440="${{ needs.compute-version.outputs.pep440 }}"
 
-          # Write release notes to a file to avoid YAML/shell quoting issues
-          cat > /tmp/release-notes.md << NOTES
-          Pre-built platform wheels for daft==$PEP440.
+        # Write release notes to a file to avoid YAML/shell quoting issues
+        cat > /tmp/release-notes.md << NOTES
+        Pre-built platform wheels for daft==$PEP440.
 
-          pip install:
-            pip install daft==$PEP440 --extra-index-url https://xcaliber-health.github.io/Daft/simple/
+        pip install:
+          pip install daft==$PEP440 --extra-index-url https://xcaliber-health.github.io/Daft/simple/
 
-          pyproject.toml (uv):
-            dependencies = ["daft==$PEP440"]
-            [[tool.uv.indexes]]
-            name = "xcaliber-daft"
-            url = "https://xcaliber-health.github.io/Daft/simple/"
-            explicit = true
-            [tool.uv.sources]
-            daft = { index = "xcaliber-daft" }
-          NOTES
+        pyproject.toml (uv):
+          dependencies = ["daft==$PEP440"]
+          [[tool.uv.indexes]]
+          name = "xcaliber-daft"
+          url = "https://xcaliber-health.github.io/Daft/simple/"
+          explicit = true
+          [tool.uv.sources]
+          daft = { index = "xcaliber-daft" }
+        NOTES
 
-          # Create release if it doesn't exist yet
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
-            gh release create "$TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "Platform release $TAG (daft==$PEP440)" \
-              --notes-file /tmp/release-notes.md
-
-          gh release upload "$TAG" dist/*.whl \
+        # Create release if it doesn't exist yet
+        gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+          gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --clobber
+            --title "Platform release $TAG (daft==$PEP440)" \
+            --notes-file /tmp/release-notes.md
 
-      - name: Fetch existing simple index from gh-pages
-        run: |
-          mkdir -p _site/simple/daft
-          git fetch origin gh-pages 2>/dev/null || true
+        gh release upload "$TAG" dist/*.whl \
+          --repo "$GITHUB_REPOSITORY" \
+          --clobber
 
-          # Restore existing index files from gh-pages (accumulate across releases)
-          if git rev-parse --verify origin/gh-pages >/dev/null 2>&1; then
-            git show origin/gh-pages:simple/daft/index.html > _site/simple/daft/index.html 2>/dev/null || true
-            git show origin/gh-pages:simple/index.html      > _site/simple/index.html      2>/dev/null || true
-          fi
+    - name: Fetch existing simple index from gh-pages
+      run: |
+        mkdir -p _site/simple/daft
+        git fetch origin gh-pages 2>/dev/null || true
 
-          # Create root index if missing
-          if [ ! -f _site/simple/index.html ]; then
-            cat > _site/simple/index.html <<'EOF'
-          <!DOCTYPE html>
-          <html>
-          <head><title>Simple index</title></head>
-          <body>
-          <h1>Simple index</h1>
-          <a href="daft/">daft</a>
-          </body>
-          </html>
-          EOF
-          fi
+        # Restore existing index files from gh-pages (accumulate across releases)
+        if git rev-parse --verify origin/gh-pages >/dev/null 2>&1; then
+          git show origin/gh-pages:simple/daft/index.html > _site/simple/daft/index.html 2>/dev/null || true
+          git show origin/gh-pages:simple/index.html      > _site/simple/index.html      2>/dev/null || true
+        fi
 
-          # Create package index if missing
-          if [ ! -f _site/simple/daft/index.html ]; then
-            cat > _site/simple/daft/index.html <<'EOF'
-          <!DOCTYPE html>
-          <html>
-          <head><title>Links for daft</title></head>
-          <body>
-          <h1>Links for daft</h1>
-          </body>
-          </html>
-          EOF
-          fi
+        # Create root index if missing
+        if [ ! -f _site/simple/index.html ]; then
+          cat > _site/simple/index.html <<'EOF'
+        <!DOCTYPE html>
+        <html>
+        <head><title>Simple index</title></head>
+        <body>
+        <h1>Simple index</h1>
+        <a href="daft/">daft</a>
+        </body>
+        </html>
+        EOF
+        fi
 
-      - name: Append new wheel links to index
-        run: |
-          TAG="${{ needs.compute-version.outputs.tag }}"
-          REPO_URL="https://github.com/$GITHUB_REPOSITORY"
+        # Create package index if missing
+        if [ ! -f _site/simple/daft/index.html ]; then
+          cat > _site/simple/daft/index.html <<'EOF'
+        <!DOCTYPE html>
+        <html>
+        <head><title>Links for daft</title></head>
+        <body>
+        <h1>Links for daft</h1>
+        </body>
+        </html>
+        EOF
+        fi
 
-          for whl in dist/*.whl; do
-            FILENAME=$(basename "$whl")
-            SHA256=$(sha256sum "$whl" | awk '{print $1}')
-            DOWNLOAD_URL="${REPO_URL}/releases/download/${TAG}/${FILENAME}"
+    - name: Append new wheel links to index
+      run: |
+        TAG="${{ needs.compute-version.outputs.tag }}"
+        REPO_URL="https://github.com/$GITHUB_REPOSITORY"
 
-            # Skip duplicates
-            grep -q "$FILENAME" _site/simple/daft/index.html && continue
+        for whl in dist/*.whl; do
+          FILENAME=$(basename "$whl")
+          SHA256=$(sha256sum "$whl" | awk '{print $1}')
+          DOWNLOAD_URL="${REPO_URL}/releases/download/${TAG}/${FILENAME}"
 
-            LINK="<a href=\"${DOWNLOAD_URL}#sha256=${SHA256}\">${FILENAME}</a><br/>"
-            sed -i "s|</body>|${LINK}\n</body>|" _site/simple/daft/index.html
-          done
+          # Skip duplicates
+          grep -q "$FILENAME" _site/simple/daft/index.html && continue
 
-      - name: Deploy index to gh-pages
-        uses: peaceiris/actions-gh-pages@v3
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./_site
-          keep_files: true
-          commit_message: "Add wheels for ${{ needs.compute-version.outputs.tag }}"
+          LINK="<a href=\"${DOWNLOAD_URL}#sha256=${SHA256}\">${FILENAME}</a><br/>"
+          sed -i "s|</body>|${LINK}\n</body>|" _site/simple/daft/index.html
+        done
+
+    - name: Deploy index to gh-pages
+      uses: peaceiris/actions-gh-pages@v3
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: ./_site
+        keep_files: true
+        commit_message: "Add wheels for ${{ needs.compute-version.outputs.tag }}"

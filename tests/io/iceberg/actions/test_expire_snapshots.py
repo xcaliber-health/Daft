@@ -16,10 +16,10 @@ from pyiceberg.exceptions import CommitFailedException
 from daft.catalog import Table
 from daft.io.iceberg import ExpireResult
 from daft.io.iceberg._expire import _resolve_expired_ids  # noqa: internal
-
 from tests.io.iceberg.actions._helpers import (
     scan_paths as _data_file_paths,
-    snapshot_count as _snapshot_count,
+)
+from tests.io.iceberg.actions._helpers import (
     strip_scheme as _strip_scheme,
 )
 
@@ -69,12 +69,8 @@ def _capped_metadata_table(local_catalog, simple_schema, name: str, n: int):
     return table
 
 
-def test_clean_expired_metadata_deletes_stale_metadata_json(
-    local_catalog, simple_schema
-):
-    table = _capped_metadata_table(
-        local_catalog, simple_schema, "default.t_exp_md", n=5
-    )
+def test_clean_expired_metadata_deletes_stale_metadata_json(local_catalog, simple_schema):
+    table = _capped_metadata_table(local_catalog, simple_schema, "default.t_exp_md", n=5)
     before = set(_metadata_json_files(table))
     assert len(before) >= 3
 
@@ -90,12 +86,8 @@ def test_clean_expired_metadata_deletes_stale_metadata_json(
     assert os.path.exists(_strip_scheme(table.metadata_location))
 
 
-def test_clean_expired_metadata_default_keeps_metadata_json(
-    local_catalog, simple_schema
-):
-    table = _capped_metadata_table(
-        local_catalog, simple_schema, "default.t_exp_md_off", n=5
-    )
+def test_clean_expired_metadata_default_keeps_metadata_json(local_catalog, simple_schema):
+    table = _capped_metadata_table(local_catalog, simple_schema, "default.t_exp_md_off", n=5)
     before = set(_metadata_json_files(table))
 
     dt = Table.from_iceberg(table)
@@ -193,9 +185,7 @@ def test_explicit_protected_id_rejected(local_catalog, simple_schema):
         schema=simple_schema,
         partition_spec=UNPARTITIONED_PARTITION_SPEC,
     )
-    table.append(
-        pa.table({"id": pa.array([1], type=pa.int64()), "label": pa.array(["a"])})
-    )
+    table.append(pa.table({"id": pa.array([1], type=pa.int64()), "label": pa.array(["a"])}))
     snap = table.current_snapshot().snapshot_id
 
     with table.manage_snapshots() as ms:
@@ -327,9 +317,7 @@ def test_parallel_delete_observable(make_tiny_table, monkeypatch):
         retain_last=1,
         options={"max-concurrent-deletes": 4},
     )
-    assert (
-        active["peak"] >= 2
-    ), f"expected >= 2 concurrent deletes, peak={active['peak']}"
+    assert active["peak"] >= 2, f"expected >= 2 concurrent deletes, peak={active['peak']}"
 
 
 def test_notfound_during_delete_is_success(make_tiny_table, monkeypatch):
@@ -338,9 +326,7 @@ def test_notfound_during_delete_is_success(make_tiny_table, monkeypatch):
     state = {"fail_path": None}
 
     def flaky(self, location):
-        path_str = (
-            location if isinstance(location, str) else getattr(location, "location", "")
-        )
+        path_str = location if isinstance(location, str) else getattr(location, "location", "")
         if state["fail_path"] is None:
             state["fail_path"] = path_str
             raise FileNotFoundError(path_str)
@@ -351,17 +337,11 @@ def test_notfound_during_delete_is_success(make_tiny_table, monkeypatch):
     dt_table = Table.from_iceberg(table)
     result = dt_table.expire_snapshots(retain_last=1)
     # FileNotFoundError on the first delete was suppressed; rest proceeded.
-    total = (
-        result.deleted_data_files_count
-        + result.deleted_manifest_files_count
-        + result.deleted_manifest_lists_count
-    )
+    total = result.deleted_data_files_count + result.deleted_manifest_files_count + result.deleted_manifest_lists_count
     assert total >= 1
 
 
-def test_manifest_read_tolerates_aws_resource_not_found(
-    make_tiny_table, monkeypatch
-):
+def test_manifest_read_tolerates_aws_resource_not_found(make_tiny_table, monkeypatch):
     from pyiceberg.manifest import ManifestFile
 
     table = make_tiny_table(name="default.t_exp_s3_nf", n_files=4, rows_per_file=3)
@@ -385,24 +365,17 @@ def test_manifest_read_tolerates_aws_resource_not_found(
     assert isinstance(result, ExpireResult)
 
 
-def test_collect_paths_tolerates_aws_resource_not_found_on_manifests_list(
-    make_tiny_table, monkeypatch
-):
+def test_collect_paths_tolerates_aws_resource_not_found_on_manifests_list(make_tiny_table, monkeypatch):
     from pyiceberg.table.snapshots import Snapshot
 
-    table = make_tiny_table(
-        name="default.t_exp_s3_nf_ml", n_files=4, rows_per_file=3
-    )
+    table = make_tiny_table(name="default.t_exp_s3_nf_ml", n_files=4, rows_per_file=3)
     real_manifests = Snapshot.manifests
     state = {"raised": False}
 
     def flaky_manifests(self, io):
         if not state["raised"]:
             state["raised"] = True
-            raise OSError(
-                "AWS Error RESOURCE_NOT_FOUND during GetObject operation: "
-                "manifest list gone"
-            )
+            raise OSError("AWS Error RESOURCE_NOT_FOUND during GetObject operation: manifest list gone")
         return real_manifests(self, io)
 
     monkeypatch.setattr(Snapshot, "manifests", flaky_manifests)

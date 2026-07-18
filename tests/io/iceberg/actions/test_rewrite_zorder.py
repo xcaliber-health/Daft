@@ -134,8 +134,7 @@ def test_zorder_improves_locality(cluster_table):
     # With multiple post-rewrite files, a narrow predicate must read fewer files.
     if len(post_paths) > 1:
         assert post_touched < pre_touched, (
-            f"expected locality improvement, pre={pre_touched}/{len(pre_paths)} "
-            f"post={post_touched}/{len(post_paths)}"
+            f"expected locality improvement, pre={pre_touched}/{len(pre_paths)} post={post_touched}/{len(post_paths)}"
         )
 
 

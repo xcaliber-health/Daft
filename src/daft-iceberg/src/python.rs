@@ -167,7 +167,7 @@ fn plan_file_groups_py<'py>(
         let d = item
             .cast::<PyDict>()
             .map_err(|_| PyValueError::new_err("candidate must be a dict"))?;
-        cs.push(candidate_from_dict(&d)?);
+        cs.push(candidate_from_dict(d)?);
     }
     let groups = plan_file_groups(cs, &opts, current_spec_id).map_err(err_to_py)?;
     let out = PyList::empty(py);
@@ -204,9 +204,8 @@ fn validate_options_py<'py>(
         "max-concurrent-file-group-rewrites",
         o.max_concurrent_file_group_rewrites,
     )?;
-    match o.output_spec_id {
-        Some(v) => d.set_item("output-spec-id", v)?,
-        None => {}
+    if let Some(v) = o.output_spec_id {
+        d.set_item("output-spec-id", v)?;
     }
     d.set_item(
         "use-starting-sequence-number",
@@ -230,14 +229,8 @@ fn validate_options_py<'py>(
     )?;
     d.set_item("compression-factor", o.compression_factor)?;
     d.set_item("max-output-size", o.zorder_max_output_size)?;
-    d.set_item(
-        "var-length-contribution",
-        o.zorder_var_length_contribution,
-    )?;
-    d.set_item(
-        "shuffle-partitions-per-file",
-        o.shuffle_partitions_per_file,
-    )?;
+    d.set_item("var-length-contribution", o.zorder_var_length_contribution)?;
+    d.set_item("shuffle-partitions-per-file", o.shuffle_partitions_per_file)?;
     Ok(d)
 }
 

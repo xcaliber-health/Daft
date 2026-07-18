@@ -16,7 +16,6 @@ pytest.importorskip("pyiceberg")
 
 from daft.catalog import Table
 from daft.io.iceberg import RewriteConflict
-
 from tests.io.iceberg.actions._helpers import (
     Appender,
     _row_count,
@@ -30,9 +29,7 @@ _ZORDER_KEY_COL = "__daft_zorder_key__"  # noqa: internal
 
 
 def _await_first_append(appender: Appender) -> None:
-    assert appender.wait_for_first_commit(
-        timeout=10.0
-    ), "appender did not commit within 10s"
+    assert appender.wait_for_first_commit(timeout=10.0), "appender did not commit within 10s"
 
 
 def test_atomic_rewrite_raises_conflict_on_same_partition_append(local_catalog):
@@ -45,8 +42,7 @@ def test_atomic_rewrite_raises_conflict_on_same_partition_append(local_catalog):
         with pytest.raises(Exception) as exc_info:
             dt.compact_files(options={"rewrite-all": True, "min-input-files": 2})
         assert isinstance(exc_info.value, RewriteConflict) or (
-            "partition" in str(exc_info.value).lower()
-            or "vanished" in str(exc_info.value).lower()
+            "partition" in str(exc_info.value).lower() or "vanished" in str(exc_info.value).lower()
         ), f"unexpected error: {exc_info.value!r}"
     finally:
         appender.stop()
@@ -72,12 +68,8 @@ _REWRITE_STRATEGIES = [
 
 
 @pytest.mark.parametrize("strategy,strategy_kwargs", _REWRITE_STRATEGIES)
-def test_partial_progress_rewrite_progresses_under_appends(
-    local_catalog, strategy, strategy_kwargs
-):
-    table = make_seeded_table(
-        local_catalog, f"default.t_pp_{strategy}_appends", n_files=8
-    )
+def test_partial_progress_rewrite_progresses_under_appends(local_catalog, strategy, strategy_kwargs):
+    table = make_seeded_table(local_catalog, f"default.t_pp_{strategy}_appends", n_files=8)
     # A generous, fast commit-retry budget so the rewrite deterministically wins
     # the optimistic-concurrency race against the aggressive appender on any
     # runner — the production posture for compacting under heavy ingest.
@@ -133,9 +125,7 @@ def test_zorder_key_column_is_dropped_from_committed_files(local_catalog):
     table.refresh()
     for snap in table.metadata.snapshots:
         for manifest in snap.manifests(table.io):
-            for entry in manifest.fetch_manifest_entry(
-                table.io, discard_deleted=False
-            ):
+            for entry in manifest.fetch_manifest_entry(table.io, discard_deleted=False):
                 assert _ZORDER_KEY_COL not in (entry.data_file.file_path or "")
 
 
@@ -146,9 +136,7 @@ def test_rewrite_manifests_succeeds_under_appends(local_catalog):
     try:
         _await_first_append(appender)
         dt = Table.from_iceberg(table)
-        result = dt.rewrite_manifests(
-            options={"manifest-target-size-bytes": 8 * 1024 * 1024}
-        )
+        result = dt.rewrite_manifests(options={"manifest-target-size-bytes": 8 * 1024 * 1024})
         assert result.rewrite_id
     finally:
         appender.stop()
@@ -167,9 +155,7 @@ def test_expire_snapshots_succeeds_under_appends(local_catalog):
             clean_expired_files=False,
         )
         assert (
-            result.deleted_data_files_count
-            + result.deleted_manifest_files_count
-            + result.deleted_manifest_lists_count
+            result.deleted_data_files_count + result.deleted_manifest_files_count + result.deleted_manifest_lists_count
             >= 0
         )
     finally:

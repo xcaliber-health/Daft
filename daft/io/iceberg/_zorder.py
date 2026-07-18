@@ -25,7 +25,7 @@ def _zorder_key_batch(
     *columns: Series,
     var_length_contribution: int,
     max_output_size: int,
-) -> "pa.Array":
+) -> pa.Array:
     """Compute the interleaved key for one batch of the given columns."""
     import pyarrow as pa
 
@@ -58,7 +58,7 @@ def zorder_key(
         Maximum length in bytes of each row's key; the interleaved result is
         truncated to this size.
 
-    Returns
+    Returns:
     -------
     Expression
         A binary-valued expression. Sorting by it clusters nearby rows together.

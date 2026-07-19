@@ -30,6 +30,7 @@ __all__ = [
     "DEFAULT_QUEUE_TIMEOUT_SECS",
     "CatalogSpec",
     "ServeSettings",
+    "TenantSpec",
     "load_settings",
     "start_server",
 ]
@@ -76,6 +77,40 @@ class CatalogSpec:
 
 
 @dataclasses.dataclass(frozen=True)
+class TenantSpec:
+    """One named tenant sharing the server, with optional limit overrides.
+
+    Each tenant authenticates with its own bearer token and may override
+    the server-wide limits; ``None`` inherits the server default. Tenants
+    with their own ``max_concurrent_queries`` get a dedicated execution-slot
+    pool, so saturating it never delays other tenants.
+
+    Parameters
+    ----------
+    name:
+        Tenant name; appears in admission errors and logs, never secret.
+    token:
+        Bearer token identifying this tenant's requests.
+    max_concurrent_queries:
+        Dedicated execution slots; ``None`` shares the default pool.
+    queue_timeout_secs:
+        Seconds a query may wait for one of this tenant's slots.
+    query_timeout_secs:
+        Wall-clock execution limit for this tenant's queries; ``0``
+        disables the limit.
+    max_pset_bytes:
+        Cap on in-memory data shipped with one of this tenant's queries.
+    """
+
+    name: str
+    token: str
+    max_concurrent_queries: int | None = None
+    queue_timeout_secs: int | None = None
+    query_timeout_secs: int | None = None
+    max_pset_bytes: int | None = None
+
+
+@dataclasses.dataclass(frozen=True)
 class ServeSettings:
     """Complete configuration of one serving process.
 
@@ -101,6 +136,9 @@ class ServeSettings:
     query_timeout_secs:
         Wall-clock seconds one query may execute before being cancelled;
         ``0`` disables the limit.
+    tenants:
+        Named tenants sharing this server. When non-empty, every request
+        must present one of the tenant tokens and ``token`` is ignored.
     catalogs:
         Catalogs to attach to the server session at startup.
     """
@@ -114,7 +152,49 @@ class ServeSettings:
     max_pset_bytes: int = DEFAULT_MAX_PSET_BYTES
     disable_plan_payload: bool = False
     query_timeout_secs: int = DEFAULT_QUERY_TIMEOUT_SECS
+    tenants: tuple[TenantSpec, ...] = ()
     catalogs: tuple[CatalogSpec, ...] = ()
+
+
+def _parse_tenants(raw: dict[str, object]) -> tuple[TenantSpec, ...]:
+    """Build tenant specifications from a parsed configuration mapping.
+
+    Tenant tokens never come from the file: each tenant's token is read
+    from the environment variable ``DAFT_SERVE_TOKEN_<NAME>`` (name
+    upper-cased, dashes mapped to underscores).
+    """
+    raw_tenants = raw.get("tenants", [])
+    if not isinstance(raw_tenants, list):
+        raise TypeError("`tenants` must be a list of tenant mappings")
+    tenants: list[TenantSpec] = []
+    for entry in raw_tenants:
+        if not isinstance(entry, dict) or "name" not in entry:
+            raise ValueError(f"tenant entry must be a mapping with a `name`: {entry!r}")
+        name = str(entry["name"])
+        token_env = f"DAFT_SERVE_TOKEN_{name.upper().replace('-', '_')}"
+        token = os.environ.get(token_env)
+        if not token:
+            raise ValueError(f"tenant `{name}`: set its token in the environment variable {token_env}")
+
+        def _opt_int(key: str, entry: dict[str, object] = entry, name: str = name) -> int | None:
+            value = entry.get(key)
+            if value is None:
+                return None
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"tenant `{name}`: `{key}` must be an integer, got {value!r}")
+            return value
+
+        tenants.append(
+            TenantSpec(
+                name=name,
+                token=token,
+                max_concurrent_queries=_opt_int("max_concurrent_queries"),
+                queue_timeout_secs=_opt_int("queue_timeout_secs"),
+                query_timeout_secs=_opt_int("query_timeout_secs"),
+                max_pset_bytes=_opt_int("max_pset_bytes"),
+            )
+        )
+    return tuple(tenants)
 
 
 def _parse_settings(raw: dict[str, object], token: str | None) -> ServeSettings:
@@ -156,6 +236,7 @@ def _parse_settings(raw: dict[str, object], token: str | None) -> ServeSettings:
         max_pset_bytes=_int("max_pset_bytes", DEFAULT_MAX_PSET_BYTES),
         disable_plan_payload=bool(raw.get("disable_plan_payload", False)),
         query_timeout_secs=_int("query_timeout_secs", DEFAULT_QUERY_TIMEOUT_SECS),
+        tenants=_parse_tenants(raw),
         catalogs=tuple(catalogs),
     )
 
@@ -238,6 +319,17 @@ def start_server(settings: ServeSettings) -> DaftServeServer:
         max_pset_bytes=settings.max_pset_bytes,
         disable_plan_payload=settings.disable_plan_payload,
         query_timeout_secs=settings.query_timeout_secs,
+        tenants=[
+            (
+                tenant.name,
+                tenant.token,
+                tenant.max_concurrent_queries,
+                tenant.queue_timeout_secs,
+                tenant.query_timeout_secs,
+                tenant.max_pset_bytes,
+            )
+            for tenant in settings.tenants
+        ],
         session=session,
         catalogs=catalog_names,
     )

@@ -27,13 +27,31 @@ use futures::Stream;
 use tonic::{Request, Response, Status, transport::Server};
 
 use crate::{
-    admission::Admission,
+    admission::{Admission, TenantAdmission},
     auth::{AUTHORIZATION_KEY, AuthPolicy},
     error::{ServeError, ServeResult},
     execute,
     registry::QueryRegistry,
     wire::{self, ExplainResult, QueryRequest, ServerInfo, actions},
 };
+
+/// Per-tenant limit overrides; `None` inherits the server-wide default.
+#[derive(Debug, Clone)]
+pub struct TenantConfig {
+    /// Tenant name; identifies the tenant in admission, ownership, and logs.
+    pub name: String,
+    /// Bearer token identifying this tenant's requests.
+    pub token: String,
+    /// Dedicated execution-slot count; `None` shares the default pool.
+    pub max_concurrent_queries: Option<usize>,
+    /// Seconds a query may wait for one of this tenant's slots.
+    pub queue_timeout_secs: Option<u64>,
+    /// Wall-clock execution limit for this tenant's queries; `0` disables.
+    pub query_timeout_secs: Option<u64>,
+    /// Cap on in-memory partition bytes shipped with one of this tenant's
+    /// queries.
+    pub max_pset_bytes: Option<usize>,
+}
 
 /// Runtime configuration of one serving process.
 #[derive(Debug, Clone)]
@@ -47,7 +65,7 @@ pub struct ServeConfig {
     /// Whether an insecure policy is explicitly permitted on a non-loopback
     /// bind.
     pub allow_insecure_remote: bool,
-    /// Maximum concurrently executing queries.
+    /// Maximum concurrently executing queries in the shared default pool.
     pub max_concurrent_queries: usize,
     /// Seconds a query may wait for an execution slot.
     pub queue_timeout_secs: u64,
@@ -58,6 +76,9 @@ pub struct ServeConfig {
     /// Wall-clock seconds one query may execute before being cancelled;
     /// `0` disables the limit.
     pub query_timeout_secs: u64,
+    /// Named tenants with per-tenant limits; empty for single-credential
+    /// or unauthenticated servers.
+    pub tenants: Vec<TenantConfig>,
 }
 
 impl ServeConfig {
@@ -83,14 +104,50 @@ impl ServeConfig {
                 "max_concurrent_queries must be at least 1".to_string(),
             ));
         }
+        let mut names = std::collections::HashSet::with_capacity(self.tenants.len());
+        let mut tokens = std::collections::HashSet::with_capacity(self.tenants.len());
+        for tenant in &self.tenants {
+            if tenant.name.is_empty() {
+                return Err(ServeError::InvalidEnvelope(
+                    "tenant names must be non-empty".to_string(),
+                ));
+            }
+            if !names.insert(tenant.name.as_str()) {
+                return Err(ServeError::InvalidEnvelope(format!(
+                    "duplicate tenant name `{}`",
+                    tenant.name
+                )));
+            }
+            // Duplicate credentials would make identity resolution
+            // ambiguous; the credential itself is never echoed back.
+            if !tokens.insert(tenant.token.as_str()) {
+                return Err(ServeError::InvalidEnvelope(format!(
+                    "tenant `{}` reuses another tenant's token",
+                    tenant.name
+                )));
+            }
+            if tenant.max_concurrent_queries == Some(0) {
+                return Err(ServeError::InvalidEnvelope(format!(
+                    "tenant `{}`: max_concurrent_queries must be at least 1",
+                    tenant.name
+                )));
+            }
+        }
         Ok(())
     }
+}
+
+/// Limits in effect for one request after tenant resolution.
+#[derive(Debug, Clone, Copy)]
+struct EffectiveLimits {
+    query_timeout_secs: u64,
+    max_pset_bytes: usize,
 }
 
 /// Shared state of the serving process.
 pub struct DaftServeService {
     config: ServeConfig,
-    admission: Admission,
+    admission: TenantAdmission,
     registry: QueryRegistry,
     server_version: String,
     draining: Arc<AtomicBool>,
@@ -107,18 +164,51 @@ impl DaftServeService {
         sql_session: Option<Arc<pyo3::Py<pyo3::PyAny>>>,
         catalogs: Vec<String>,
     ) -> Self {
-        let admission = Admission::new(
+        let default_admission = Admission::new(
             config.max_concurrent_queries,
             Duration::from_secs(config.queue_timeout_secs),
         );
+        let mut per_tenant = std::collections::HashMap::with_capacity(config.tenants.len());
+        for tenant in &config.tenants {
+            // Only tenants with a dedicated slot count get their own pool;
+            // the rest share the default pool.
+            if let Some(slots) = tenant.max_concurrent_queries {
+                let timeout = tenant
+                    .queue_timeout_secs
+                    .unwrap_or(config.queue_timeout_secs);
+                per_tenant.insert(
+                    tenant.name.clone(),
+                    Admission::new(slots, Duration::from_secs(timeout)),
+                );
+            }
+        }
         Self {
-            config,
-            admission,
+            admission: TenantAdmission::new(default_admission, per_tenant),
             registry: QueryRegistry::new(),
             server_version,
             draining: Arc::new(AtomicBool::new(false)),
             sql_session,
             catalogs,
+            config,
+        }
+    }
+
+    /// Limits in effect for a caller: the tenant's overrides where present,
+    /// otherwise the server-wide defaults.
+    fn effective_limits(&self, tenant: Option<&str>) -> EffectiveLimits {
+        let overrides = tenant.and_then(|name| {
+            self.config
+                .tenants
+                .iter()
+                .find(|candidate| candidate.name == name)
+        });
+        EffectiveLimits {
+            query_timeout_secs: overrides
+                .and_then(|t| t.query_timeout_secs)
+                .unwrap_or(self.config.query_timeout_secs),
+            max_pset_bytes: overrides
+                .and_then(|t| t.max_pset_bytes)
+                .unwrap_or(self.config.max_pset_bytes),
         }
     }
 
@@ -134,7 +224,7 @@ impl DaftServeService {
         self.draining.clone()
     }
 
-    fn check_auth<T>(&self, request: &Request<T>) -> ServeResult<()> {
+    fn check_auth<T>(&self, request: &Request<T>) -> ServeResult<crate::auth::TenantId> {
         let header = request
             .metadata()
             .get(AUTHORIZATION_KEY)
@@ -142,8 +232,13 @@ impl DaftServeService {
         self.config.auth.check(header)
     }
 
-    /// Parses and policy-checks a request envelope into a query request.
-    fn admit_request(&self, ticket_bytes: &[u8]) -> ServeResult<QueryRequest> {
+    /// Parses and policy-checks a request envelope into a query request,
+    /// applying the caller's effective payload limit.
+    fn admit_request(
+        &self,
+        ticket_bytes: &[u8],
+        max_pset_bytes: usize,
+    ) -> ServeResult<QueryRequest> {
         if self.draining.load(Ordering::Acquire) {
             return Err(ServeError::Draining);
         }
@@ -154,7 +249,7 @@ impl DaftServeService {
             &envelope.sender_version,
             &self.server_version,
             self.config.disable_plan_payload,
-            self.config.max_pset_bytes,
+            max_pset_bytes,
         )?;
         Ok(request)
     }
@@ -164,16 +259,16 @@ impl DaftServeService {
             version: self.server_version.clone(),
             wire_version: wire::WIRE_VERSION,
             plan_payload_enabled: !self.config.disable_plan_payload,
-            max_concurrent_queries: self.admission.max_concurrent(),
+            max_concurrent_queries: self.admission.default_max_concurrent(),
             max_pset_bytes: self.config.max_pset_bytes,
             catalogs: self.catalogs.clone(),
         }
     }
 
     /// Renders the server-side optimized plan for a request without
-    /// executing it.
-    fn explain(&self, body: &[u8]) -> ServeResult<ExplainResult> {
-        let request = self.admit_request(body)?;
+    /// executing it, under the caller's effective payload limit.
+    fn explain(&self, body: &[u8], max_pset_bytes: usize) -> ServeResult<ExplainResult> {
+        let request = self.admit_request(body, max_pset_bytes)?;
         let exec_config = execute::resolve_exec_config(&request)?;
         let builder = execute::payload_to_builder(&request.payload, self.sql_session.as_ref())?;
         let optimized = builder.optimize(exec_config)?;
@@ -217,7 +312,7 @@ impl FlightService for DaftServeService {
         &self,
         request: Request<tonic::Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
-        self.check_auth(&request).map_err(Status::from)?;
+        let _ = self.check_auth(&request).map_err(Status::from)?;
         let response = HandshakeResponse {
             protocol_version: u64::from(wire::WIRE_VERSION),
             payload: self.server_version.clone().into_bytes().into(),
@@ -262,20 +357,31 @@ impl FlightService for DaftServeService {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        self.check_auth(&request).map_err(Status::from)?;
+        let tenant = self.check_auth(&request).map_err(Status::from)?;
+        let limits = self.effective_limits(tenant.as_deref());
         let ticket = request.into_inner();
-        let query = self.admit_request(&ticket.ticket).map_err(Status::from)?;
+        let query = self
+            .admit_request(&ticket.ticket, limits.max_pset_bytes)
+            .map_err(Status::from)?;
 
-        let permit = self.admission.acquire().await.map_err(Status::from)?;
-        let guard = self.registry.register(&query.query_id);
+        let permit = self
+            .admission
+            .pool(tenant.as_deref())
+            .acquire()
+            .await
+            .map_err(Status::from)?;
+        let guard = self.registry.register(&query.query_id, tenant.as_deref());
         let cancel = guard.token();
+        if let Some(tenant_name) = tenant.as_deref() {
+            log::info!("query {} admitted for tenant {tenant_name}", query.query_id);
+        }
 
         // Buffer a handful of encoded messages so encoding overlaps with
         // network sends without unbounded memory growth.
         let buffer = query.results_buffer_size.unwrap_or(8).clamp(1, 64);
         let (tx, rx) = async_channel::bounded(buffer);
         let sql_session = self.sql_session.clone();
-        let query_timeout_secs = self.config.query_timeout_secs;
+        let query_timeout_secs = limits.query_timeout_secs;
         let task = common_runtime::get_io_runtime(true).spawn(async move {
             execute::run_query(
                 query,
@@ -318,7 +424,7 @@ impl FlightService for DaftServeService {
         &self,
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
-        self.check_auth(&request).map_err(Status::from)?;
+        let tenant = self.check_auth(&request).map_err(Status::from)?;
         let action = request.into_inner();
         let body: Vec<u8> = match action.r#type.as_str() {
             actions::HEALTH => vec![],
@@ -326,11 +432,14 @@ impl FlightService for DaftServeService {
             actions::CANCEL_QUERY => {
                 let query_id = String::from_utf8(action.body.to_vec())
                     .map_err(|e| Status::invalid_argument(format!("query id not UTF-8: {e}")))?;
-                let found = self.registry.cancel(&query_id);
+                let found = self.registry.cancel(&query_id, tenant.as_deref());
                 vec![u8::from(found)]
             }
             actions::EXPLAIN => {
-                let explained = self.explain(&action.body).map_err(Status::from)?;
+                let limits = self.effective_limits(tenant.as_deref());
+                let explained = self
+                    .explain(&action.body, limits.max_pset_bytes)
+                    .map_err(Status::from)?;
                 wire::encode(&explained).map_err(Status::from)?
             }
             other => {
@@ -346,7 +455,7 @@ impl FlightService for DaftServeService {
         &self,
         request: Request<Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
-        self.check_auth(&request).map_err(Status::from)?;
+        let _ = self.check_auth(&request).map_err(Status::from)?;
         let all = [
             (actions::HEALTH, "liveness probe"),
             (actions::SERVER_INFO, "server version, capabilities, limits"),
@@ -497,7 +606,12 @@ pub fn start_server(service: DaftServeService) -> ServeResult<ServeHandle> {
         // covers the plan and envelope alongside the partition bytes.
         let max_inbound_bytes = service
             .config
-            .max_pset_bytes
+            .tenants
+            .iter()
+            .filter_map(|tenant| tenant.max_pset_bytes)
+            .chain(std::iter::once(service.config.max_pset_bytes))
+            .max()
+            .unwrap_or(service.config.max_pset_bytes)
             .saturating_add(64 * 1024 * 1024);
         Server::builder()
             .add_service(health_service)
@@ -549,6 +663,7 @@ mod tests {
             max_pset_bytes: 64 * 1024 * 1024,
             disable_plan_payload: false,
             query_timeout_secs: 0,
+            tenants: vec![],
         }
     }
 

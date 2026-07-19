@@ -24,7 +24,7 @@ use crate::{
     client::{QueryResultStream, ServeClient, referenced_pset_keys},
     codec,
     error::ServeError,
-    server::{DaftServeService, ServeConfig, ServeShutdownHandle, start_server},
+    server::{DaftServeService, ServeConfig, ServeShutdownHandle, TenantConfig, start_server},
     wire::{self, NamedPartitionSet, QueryPayload, QueryRequest},
 };
 
@@ -64,6 +64,7 @@ impl PyDaftServer {
         max_pset_bytes=256 * 1024 * 1024,
         disable_plan_payload=false,
         query_timeout_secs=0,
+        tenants=Vec::new(),
         session=None,
         catalogs=Vec::new(),
     ))]
@@ -79,10 +80,47 @@ impl PyDaftServer {
         max_pset_bytes: usize,
         disable_plan_payload: bool,
         query_timeout_secs: u64,
+        tenants: Vec<(
+            String,
+            String,
+            Option<usize>,
+            Option<u64>,
+            Option<u64>,
+            Option<usize>,
+        )>,
         session: Option<Py<PyAny>>,
         catalogs: Vec<String>,
     ) -> PyResult<Self> {
-        let auth = token.map_or(AuthPolicy::Insecure, AuthPolicy::Token);
+        let tenants: Vec<TenantConfig> = tenants
+            .into_iter()
+            .map(
+                |(name, tenant_token, max_concurrent, queue_timeout, query_timeout, pset_cap)| {
+                    TenantConfig {
+                        name,
+                        token: tenant_token,
+                        max_concurrent_queries: max_concurrent,
+                        queue_timeout_secs: queue_timeout,
+                        query_timeout_secs: query_timeout,
+                        max_pset_bytes: pset_cap,
+                    }
+                },
+            )
+            .collect();
+        // Tenant credentials take precedence: when tenants are configured,
+        // every caller must present one of the tenant tokens.
+        let auth = if tenants.is_empty() {
+            token.map_or(AuthPolicy::Insecure, AuthPolicy::Token)
+        } else {
+            AuthPolicy::Tenants(
+                tenants
+                    .iter()
+                    .map(|tenant| crate::auth::TenantAuth {
+                        name: tenant.name.clone(),
+                        token: tenant.token.clone(),
+                    })
+                    .collect(),
+            )
+        };
         let config = ServeConfig {
             host,
             port,
@@ -93,6 +131,7 @@ impl PyDaftServer {
             max_pset_bytes,
             disable_plan_payload,
             query_timeout_secs,
+            tenants,
         };
         let service = DaftServeService::new(
             config,

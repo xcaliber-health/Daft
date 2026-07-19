@@ -2550,6 +2550,7 @@ class DaftServeServer:
         max_pset_bytes: int = 268435456,
         disable_plan_payload: bool = False,
         query_timeout_secs: int = 0,
+        tenants: list[tuple[str, str, int | None, int | None, int | None, int | None]] = ...,
         session: object | None = None,
         catalogs: list[str] = ...,
     ) -> None: ...

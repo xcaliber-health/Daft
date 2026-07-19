@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 struct Entry {
     token: CancellationToken,
     generation: u64,
+    owner: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -61,12 +62,12 @@ impl QueryRegistry {
         Self::default()
     }
 
-    /// Registers a query and returns its guard.
+    /// Registers a query owned by the given caller and returns its guard.
     ///
     /// If the id is already registered, the previous entry is replaced and
     /// the superseded guard becomes a no-op on drop.
     #[must_use]
-    pub fn register(&self, query_id: &str) -> QueryGuard {
+    pub fn register(&self, query_id: &str, owner: Option<&str>) -> QueryGuard {
         let token = CancellationToken::new();
         let generation = {
             let mut inner = lock_inner(&self.inner);
@@ -77,6 +78,7 @@ impl QueryRegistry {
                 Entry {
                     token: token.clone(),
                     generation,
+                    owner: owner.map(str::to_string),
                 },
             );
             generation
@@ -89,16 +91,25 @@ impl QueryRegistry {
         }
     }
 
-    /// Trips the cancellation token for `query_id`.
+    /// Trips the cancellation token for `query_id` when the caller owns it.
     ///
-    /// Returns whether a running query with that id was found. Cancelling an
-    /// unknown or already-finished query is a no-op, making cancellation
-    /// idempotent.
-    pub fn cancel(&self, query_id: &str) -> bool {
+    /// A query is cancellable only by the identity that registered it, so
+    /// one tenant can never cancel another tenant's query; a mismatched
+    /// caller sees the same "not found" outcome as for an unknown id.
+    /// Cancelling an unknown or already-finished query is a no-op, making
+    /// cancellation idempotent.
+    ///
+    /// Returns whether a running query with that id was found and owned by
+    /// the caller.
+    pub fn cancel(&self, query_id: &str, caller: Option<&str>) -> bool {
         let inner = lock_inner(&self.inner);
         inner.entries.get(query_id).is_some_and(|entry| {
-            entry.token.cancel();
-            true
+            if entry.owner.as_deref() == caller {
+                entry.token.cancel();
+                true
+            } else {
+                false
+            }
         })
     }
 
@@ -152,7 +163,7 @@ mod tests {
     fn register_and_drop_leaves_registry_empty() {
         let registry = QueryRegistry::new();
         {
-            let _guard = registry.register("q1");
+            let _guard = registry.register("q1", None);
             assert_eq!(registry.len(), 1);
         }
         assert!(registry.is_empty());
@@ -161,39 +172,39 @@ mod tests {
     #[test]
     fn cancel_trips_token_of_registered_query() {
         let registry = QueryRegistry::new();
-        let guard = registry.register("q1");
+        let guard = registry.register("q1", None);
         assert!(!guard.token().is_cancelled());
-        assert!(registry.cancel("q1"));
+        assert!(registry.cancel("q1", None));
         assert!(guard.token().is_cancelled());
     }
 
     #[test]
     fn cancel_unknown_query_is_noop() {
         let registry = QueryRegistry::new();
-        assert!(!registry.cancel("missing"));
+        assert!(!registry.cancel("missing", None));
     }
 
     #[test]
     fn double_cancel_is_idempotent() {
         let registry = QueryRegistry::new();
-        let guard = registry.register("q1");
-        assert!(registry.cancel("q1"));
-        assert!(registry.cancel("q1"));
+        let guard = registry.register("q1", None);
+        assert!(registry.cancel("q1", None));
+        assert!(registry.cancel("q1", None));
         assert!(guard.token().is_cancelled());
     }
 
     #[test]
     fn cancel_after_completion_is_noop() {
         let registry = QueryRegistry::new();
-        drop(registry.register("q1"));
-        assert!(!registry.cancel("q1"));
+        drop(registry.register("q1", None));
+        assert!(!registry.cancel("q1", None));
     }
 
     #[test]
     fn resubmission_replaces_entry_and_old_guard_is_inert() {
         let registry = QueryRegistry::new();
-        let old_guard = registry.register("q1");
-        let new_guard = registry.register("q1");
+        let old_guard = registry.register("q1", None);
+        let new_guard = registry.register("q1", None);
         assert_eq!(registry.len(), 1);
 
         // Dropping the superseded guard must not deregister the new attempt.
@@ -201,7 +212,7 @@ mod tests {
         assert_eq!(registry.len(), 1);
 
         // Cancellation targets the new attempt's token.
-        assert!(registry.cancel("q1"));
+        assert!(registry.cancel("q1", None));
         assert!(new_guard.token().is_cancelled());
 
         drop(new_guard);
@@ -209,10 +220,34 @@ mod tests {
     }
 
     #[test]
+    fn cancel_requires_matching_owner() {
+        let registry = QueryRegistry::new();
+        let guard = registry.register("q1", Some("alpha"));
+
+        // A different tenant or an anonymous caller sees "not found".
+        assert!(!registry.cancel("q1", Some("beta")));
+        assert!(!registry.cancel("q1", None));
+        assert!(!guard.token().is_cancelled());
+
+        // The owner can cancel.
+        assert!(registry.cancel("q1", Some("alpha")));
+        assert!(guard.token().is_cancelled());
+    }
+
+    #[test]
+    fn anonymous_owner_scopes_to_anonymous_callers() {
+        let registry = QueryRegistry::new();
+        let guard = registry.register("q1", None);
+        assert!(!registry.cancel("q1", Some("alpha")));
+        assert!(registry.cancel("q1", None));
+        assert!(guard.token().is_cancelled());
+    }
+
+    #[test]
     fn cancel_all_trips_every_token() {
         let registry = QueryRegistry::new();
-        let g1 = registry.register("q1");
-        let g2 = registry.register("q2");
+        let g1 = registry.register("q1", None);
+        let g2 = registry.register("q2", None);
         registry.cancel_all();
         assert!(g1.token().is_cancelled());
         assert!(g2.token().is_cancelled());

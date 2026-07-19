@@ -14,46 +14,96 @@ pub const AUTHORIZATION_KEY: &str = "authorization";
 /// Scheme prefix expected on the credential value.
 pub const BEARER_PREFIX: &str = "Bearer ";
 
+/// Identity resolved from a request's credential: the tenant name for a
+/// tenant-scoped credential, or `None` for the anonymous single-credential
+/// and unauthenticated modes.
+pub type TenantId = Option<String>;
+
+/// One named tenant and the credential that identifies it.
+#[derive(Debug, Clone)]
+pub struct TenantAuth {
+    /// Tenant name; used for admission routing and query ownership, never
+    /// secret.
+    pub name: String,
+    /// Bearer token identifying this tenant.
+    pub token: String,
+}
+
 /// Server-side authentication policy.
 #[derive(Debug, Clone)]
 pub enum AuthPolicy {
-    /// Every request must present the configured bearer token.
+    /// Every request must present the configured bearer token; callers are
+    /// anonymous (no tenant identity).
     Token(String),
+    /// Every request must present one of the tenant tokens; the matching
+    /// tenant's name becomes the caller's identity.
+    Tenants(Vec<TenantAuth>),
     /// No authentication; only permitted for loopback binds or explicit
-    /// opt-out.
+    /// opt-out. Callers are anonymous.
     Insecure,
 }
 
 impl AuthPolicy {
-    /// Validates the `authorization` metadata value for one request.
+    /// Validates the `authorization` metadata value for one request and
+    /// resolves the caller's identity.
     ///
     /// `header` is the raw metadata value if present, e.g. `Bearer abc`.
+    /// Every configured credential is compared in constant time, and all
+    /// candidates are always examined, so response timing reveals neither
+    /// token contents nor which tenant matched.
     ///
     /// # Errors
-    /// Returns [`ServeError::Unauthenticated`] if a token is required and the
-    /// header is missing, malformed, or does not match.
-    pub fn check(&self, header: Option<&str>) -> ServeResult<()> {
+    /// Returns [`ServeError::Unauthenticated`] if a credential is required
+    /// and the header is missing, malformed, or matches no configured token.
+    pub fn check(&self, header: Option<&str>) -> ServeResult<TenantId> {
         match self {
-            Self::Insecure => Ok(()),
+            Self::Insecure => Ok(None),
             Self::Token(expected) => {
-                let Some(header) = header else {
-                    return Err(ServeError::Unauthenticated(
-                        "missing authorization; pass the server token".to_string(),
-                    ));
-                };
-                let Some(presented) = header.strip_prefix(BEARER_PREFIX) else {
-                    return Err(ServeError::Unauthenticated(
-                        "malformed authorization; expected `Bearer <token>`".to_string(),
-                    ));
-                };
+                let presented = extract_bearer(header)?;
                 if constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
-                    Ok(())
+                    Ok(None)
                 } else {
                     Err(ServeError::Unauthenticated("invalid token".to_string()))
                 }
             }
+            Self::Tenants(tenants) => {
+                let presented = extract_bearer(header)?;
+                // Examine every candidate unconditionally so the number of
+                // comparisons performed does not depend on which (if any)
+                // tenant matched.
+                let mut matched: Option<&str> = None;
+                for tenant in tenants {
+                    if constant_time_eq(presented.as_bytes(), tenant.token.as_bytes())
+                        && matched.is_none()
+                    {
+                        matched = Some(tenant.name.as_str());
+                    }
+                }
+                matched.map_or_else(
+                    || Err(ServeError::Unauthenticated("invalid token".to_string())),
+                    |name| Ok(Some(name.to_string())),
+                )
+            }
         }
     }
+}
+
+/// Extracts the bearer credential from a raw `authorization` value.
+///
+/// # Errors
+/// Returns [`ServeError::Unauthenticated`] if the header is absent or does
+/// not carry the expected scheme prefix.
+fn extract_bearer(header: Option<&str>) -> ServeResult<&str> {
+    let Some(header) = header else {
+        return Err(ServeError::Unauthenticated(
+            "missing authorization; pass the server token".to_string(),
+        ));
+    };
+    header.strip_prefix(BEARER_PREFIX).ok_or_else(|| {
+        ServeError::Unauthenticated(
+            "malformed authorization; expected `Bearer <token>`".to_string(),
+        )
+    })
 }
 
 /// Compares two byte strings without early exit on mismatch.
@@ -110,6 +160,54 @@ mod tests {
             let err = policy.check(Some(wrong)).unwrap_err();
             assert!(matches!(err, ServeError::Unauthenticated(_)), "{wrong}");
         }
+    }
+
+    fn two_tenants() -> AuthPolicy {
+        AuthPolicy::Tenants(vec![
+            TenantAuth {
+                name: "alpha".to_string(),
+                token: "tok-alpha".to_string(),
+            },
+            TenantAuth {
+                name: "beta".to_string(),
+                token: "tok-beta".to_string(),
+            },
+        ])
+    }
+
+    #[test]
+    fn tenant_policy_resolves_matching_tenant() {
+        let policy = two_tenants();
+        assert_eq!(
+            policy.check(Some("Bearer tok-alpha")).unwrap(),
+            Some("alpha".to_string())
+        );
+        assert_eq!(
+            policy.check(Some("Bearer tok-beta")).unwrap(),
+            Some("beta".to_string())
+        );
+    }
+
+    #[test]
+    fn tenant_policy_rejects_unknown_and_malformed() {
+        let policy = two_tenants();
+        for header in [None, Some("Bearer nope"), Some("tok-alpha"), Some("")] {
+            let err = policy.check(header).unwrap_err();
+            assert!(matches!(err, ServeError::Unauthenticated(_)), "{header:?}");
+        }
+    }
+
+    #[test]
+    fn empty_tenant_list_rejects_everything() {
+        let policy = AuthPolicy::Tenants(vec![]);
+        assert!(policy.check(Some("Bearer anything")).is_err());
+    }
+
+    #[test]
+    fn single_token_policy_yields_anonymous_identity() {
+        let policy = AuthPolicy::Token("s3cr3t".to_string());
+        assert_eq!(policy.check(Some("Bearer s3cr3t")).unwrap(), None);
+        assert_eq!(AuthPolicy::Insecure.check(None).unwrap(), None);
     }
 
     #[test]

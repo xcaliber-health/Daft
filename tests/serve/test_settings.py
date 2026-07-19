@@ -92,3 +92,51 @@ def test_token_env_variable_name_is_configurable(tmp_path: pathlib.Path, monkeyp
     monkeypatch.delenv("DAFT_SERVE_TOKEN", raising=False)
 
     assert load_settings(path, token_env="MY_TOKEN").token == "abc"
+
+
+def test_load_settings_reads_tenant_tokens_from_environment(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.json"
+    path.write_text('{"tenants": [{"name": "alpha", "max_concurrent_queries": 2}, {"name": "team-b"}]}')
+    monkeypatch.delenv("DAFT_SERVE_TOKEN", raising=False)
+    monkeypatch.setenv("DAFT_SERVE_TOKEN_ALPHA", "tok-a")
+    monkeypatch.setenv("DAFT_SERVE_TOKEN_TEAM_B", "tok-b")
+
+    settings = load_settings(path)
+
+    assert [t.name for t in settings.tenants] == ["alpha", "team-b"]
+    assert settings.tenants[0].token == "tok-a"
+    assert settings.tenants[0].max_concurrent_queries == 2
+    assert settings.tenants[1].token == "tok-b"
+    assert settings.tenants[1].max_concurrent_queries is None
+
+
+def test_load_settings_requires_tenant_token_in_environment(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.json"
+    path.write_text('{"tenants": [{"name": "alpha"}]}')
+    monkeypatch.delenv("DAFT_SERVE_TOKEN_ALPHA", raising=False)
+
+    with pytest.raises(ValueError, match="DAFT_SERVE_TOKEN_ALPHA"):
+        load_settings(path)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        '{"tenants": "not-a-list"}',
+        '{"tenants": [{"max_concurrent_queries": 2}]}',
+        '{"tenants": [{"name": "a", "max_concurrent_queries": "two"}]}',
+    ],
+)
+def test_load_settings_rejects_invalid_tenants(
+    tmp_path: pathlib.Path, config: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(config)
+    monkeypatch.setenv("DAFT_SERVE_TOKEN_A", "tok")
+
+    with pytest.raises((TypeError, ValueError)):
+        load_settings(path)

@@ -39,6 +39,18 @@ means the remote result is asserted equal to the in-process result.
 | version mismatch | plan lane rejected with a clear error; text lane tolerant | `test_auth_limits.py::test_version_mismatch_rejects_plan_lane_end_to_end` |
 | server lifecycle (subprocess, SIGTERM drain, crash) | graceful drain exits 0; crash surfaces an error, never hangs | `test_lifecycle.py` |
 
+## Multi-tenancy
+
+| Behavior | Status | Proven by |
+|---|---|---|
+| per-tenant bearer tokens resolve tenant identity | enforced, constant-time | `test_tenancy.py`, `auth.rs` unit tests |
+| per-tenant admission slots (dedicated pool per tenant with a slot override) | one tenant's saturation never blocks another | `test_tenancy.py::test_saturated_tenant_*` |
+| per-tenant execution timeout | typed error; other tenants unaffected | `test_tenancy.py::test_tenant_query_timeout_*` |
+| per-tenant payload cap | typed size error; other tenants unaffected | `test_tenancy.py::test_tenant_payload_cap_*` |
+| cancel scoped to owning tenant | cross-tenant cancel sees "not found" | `test_tenancy.py::test_cancel_is_scoped_*`, `registry.rs` unit tests |
+| legacy single-token / insecure modes | unchanged | `test_auth_limits.py` |
+| per-tenant memory caps | not yet — requires engine memory accounting + spilling (roadmap Phase C); use dedicated pods for hard memory isolation | `docs/serve-roadmap.md` |
+
 ## Known limitations (by design)
 
 - **Plan lane requires identical client/server engine versions** — serialized

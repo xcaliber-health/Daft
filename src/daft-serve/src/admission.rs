@@ -4,7 +4,7 @@
 //! exceeds the queue timeout is rejected with an actionable capacity error so
 //! clients can back off or retry elsewhere.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -61,9 +61,78 @@ impl Admission {
     }
 }
 
+/// Routes admission by caller identity: named tenants with their own slot
+/// pools, and a shared default pool for anonymous callers or tenants
+/// without an override.
+///
+/// Each tenant's pool is independent, so one tenant saturating its slots
+/// never delays another tenant's queries.
+#[derive(Debug)]
+pub struct TenantAdmission {
+    default: Admission,
+    per_tenant: HashMap<String, Admission>,
+}
+
+impl TenantAdmission {
+    /// Creates identity-routed admission from the shared default pool and
+    /// per-tenant pools. `per_tenant` maps tenant names to their dedicated
+    /// pools; tenants absent from the map share the default pool.
+    #[must_use]
+    pub fn new(default: Admission, per_tenant: HashMap<String, Admission>) -> Self {
+        Self {
+            default,
+            per_tenant,
+        }
+    }
+
+    /// The pool serving the given caller: the tenant's dedicated pool when
+    /// one exists, otherwise the shared default.
+    #[must_use]
+    pub fn pool(&self, tenant: Option<&str>) -> &Admission {
+        tenant
+            .and_then(|name| self.per_tenant.get(name))
+            .unwrap_or(&self.default)
+    }
+
+    /// Configured slot count of the shared default pool.
+    #[must_use]
+    pub const fn default_max_concurrent(&self) -> usize {
+        self.default.max_concurrent()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tenant_pools_are_independent() {
+        let mut per_tenant = HashMap::new();
+        per_tenant.insert(
+            "alpha".to_string(),
+            Admission::new(1, Duration::from_millis(20)),
+        );
+        let routed = TenantAdmission::new(Admission::new(4, Duration::from_millis(20)), per_tenant);
+
+        // Saturate alpha's single slot.
+        let held = routed.pool(Some("alpha")).acquire().await.unwrap();
+        assert!(routed.pool(Some("alpha")).acquire().await.is_err());
+
+        // Other identities are unaffected.
+        assert!(routed.pool(Some("beta")).acquire().await.is_ok());
+        assert!(routed.pool(None).acquire().await.is_ok());
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn unknown_tenant_uses_default_pool() {
+        let routed =
+            TenantAdmission::new(Admission::new(1, Duration::from_millis(20)), HashMap::new());
+        let held = routed.pool(Some("anyone")).acquire().await.unwrap();
+        // Default pool is shared, so anonymous callers contend with it.
+        assert!(routed.pool(None).acquire().await.is_err());
+        drop(held);
+    }
 
     #[tokio::test]
     async fn grants_up_to_capacity() {

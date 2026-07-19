@@ -96,27 +96,36 @@ pub fn decode_psets(
     Ok(out)
 }
 
-/// Collects the partition sets registered in this process's cache.
+/// Collects the requested partition sets from this process's cache.
 ///
 /// Textual queries planned server-side register literal values and other
 /// in-memory data in the process-global cache rather than shipping them, so
 /// execution must see those sets in addition to any shipped with the
-/// request.
+/// request. Only the named keys are read and converted: fetching the whole
+/// cache would leak unrelated (possibly other clients') data into the query
+/// and cost time proportional to everything cached rather than everything
+/// referenced. Keys absent from the cache are skipped; the caller decides
+/// whether a missing set is fatal.
 ///
 /// # Errors
 /// Returns an execution error if the cache cannot be read.
-fn server_local_psets() -> ServeResult<HashMap<String, Vec<MicroPartitionRef>>> {
+fn server_local_psets_for(keys: &[String]) -> ServeResult<HashMap<String, Vec<MicroPartitionRef>>> {
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods};
 
+    if keys.is_empty() {
+        return Ok(HashMap::new());
+    }
     Python::attach(
         |py| -> pyo3::PyResult<HashMap<String, Vec<MicroPartitionRef>>> {
             let module = py.import(intern!(py, "daft.runners.runner"))?;
             let cache = module.getattr(intern!(py, "LOCAL_PARTITION_SET_CACHE"))?;
             let all = cache.call_method0(intern!(py, "get_all_partition_sets"))?;
             let dict = all.cast_into::<PyDict>()?;
-            let mut out = HashMap::with_capacity(dict.len());
-            for (key, pset) in &dict {
-                let key: String = key.extract()?;
+            let mut out = HashMap::with_capacity(keys.len());
+            for key in keys {
+                let Some(pset) = dict.get_item(key.as_str())? else {
+                    continue;
+                };
                 let values = pset.call_method0(intern!(py, "values"))?;
                 let mut parts = Vec::new();
                 for item in values.try_iter()? {
@@ -126,7 +135,7 @@ fn server_local_psets() -> ServeResult<HashMap<String, Vec<MicroPartitionRef>>> 
                         .extract::<daft_micropartition::python::PyMicroPartition>()?;
                     parts.push(part.inner);
                 }
-                out.insert(key, parts);
+                out.insert(key.clone(), parts);
             }
             Ok(out)
         },
@@ -151,8 +160,10 @@ pub fn resolve_exec_config(request: &QueryRequest) -> ServeResult<Arc<DaftExecut
 /// Runs one admitted query, sending encoded messages into `tx`.
 ///
 /// The admission permit and registry guard are held for the duration of the
-/// send loop and released on return, whether the query completes, fails, or
-/// is cancelled.
+/// send loop and released on return, whether the query completes, fails,
+/// times out, or is cancelled. A nonzero `query_timeout_secs` bounds
+/// execution wall-clock time: on expiry the execution future is dropped,
+/// which cancels the running pipeline and frees the admission slot.
 pub async fn run_query(
     request: QueryRequest,
     sql_session: Option<Arc<Py<PyAny>>>,
@@ -160,13 +171,26 @@ pub async fn run_query(
     permit: AdmissionPermit,
     guard: QueryGuard,
     tx: async_channel::Sender<Result<FlightData, Status>>,
+    query_timeout_secs: u64,
 ) {
     let query_id = request.query_id.clone();
-    let result = run_query_inner(request, sql_session, &cancel, &tx).await;
+    let inner = run_query_inner(request, sql_session, &cancel, &tx);
+    let result = if query_timeout_secs > 0 {
+        match tokio::time::timeout(std::time::Duration::from_secs(query_timeout_secs), inner).await
+        {
+            Ok(result) => result,
+            Err(_) => Err(ServeError::Timeout {
+                query_id: query_id.clone(),
+                limit_secs: query_timeout_secs,
+            }),
+        }
+    } else {
+        inner.await
+    };
     drop(guard);
     drop(permit);
     if let Err(err) = result {
-        let err = if cancel.is_cancelled() {
+        let err = if cancel.is_cancelled() && !matches!(err, ServeError::Timeout { .. }) {
             ServeError::Cancelled(query_id)
         } else {
             err
@@ -201,14 +225,25 @@ async fn run_query_inner(
             let builder = payload_to_builder(&payload, sql_session.as_ref())?;
             let optimized = builder.optimize(exec_config)?;
             let schema = optimized.schema();
-            let mut all_psets = server_local_psets()?;
-            all_psets.extend(decode_psets(&psets)?);
             let optimized_plan = optimized.build();
+            // Shipped sets are decoded first (pure engine work, no
+            // interpreter); only referenced keys they do not cover are then
+            // read from the process cache, so unrelated cached data is never
+            // touched and the interpreter is not entered at all in the common
+            // file-scan case.
+            let mut all_psets = decode_psets(&psets)?;
+            let referenced = crate::client::referenced_pset_keys(&optimized_plan);
+            let missing: Vec<String> = referenced
+                .iter()
+                .filter(|key| !all_psets.contains_key(key.as_str()))
+                .cloned()
+                .collect();
+            all_psets.extend(server_local_psets_for(&missing)?);
             // A referenced set missing from both the request and the local
             // cache would leave the pipeline waiting for input forever;
             // fail fast instead.
-            for key in crate::client::referenced_pset_keys(&optimized_plan) {
-                if !all_psets.contains_key(&key) {
+            for key in &referenced {
+                if !all_psets.contains_key(key) {
                     return Err(ServeError::MalformedPayload(format!(
                         "in-memory data `{key}` referenced by the plan was not \
                          shipped with the request and is not present on the server"
@@ -232,13 +267,6 @@ async fn run_query_inner(
         return Err(ServeError::Cancelled(query_id));
     }
 
-    let mut encoder = BatchEncoder::try_new(&schema)?;
-    let schema_message = encoder.schema_message(&schema)?;
-    if tx.send(Ok(schema_message)).await.is_err() {
-        // Client disconnected before the stream started.
-        return Ok(());
-    }
-
     let ctx = daft_context::get_context();
     let subscribers = ctx.subscribers();
     let mut executor = NativeExecutor::new(false, "");
@@ -257,15 +285,43 @@ async fn run_query_inner(
     log::debug!("serve query {query_id}: execution started");
     let mut results = enqueue_future.await?;
     log::debug!("serve query {query_id}: inputs enqueued");
+
+    // The stream's schema comes from the first produced partition rather
+    // than the logical plan: operators with runtime-derived output columns
+    // can order or type columns differently than planning predicted, and the
+    // wire schema must describe the batches actually sent. The plan schema
+    // is the fallback for empty results.
+    let first = tokio::select! {
+        () = cancel.cancelled() => {
+            executor.cancel_plan(fingerprint);
+            return Err(ServeError::Cancelled(query_id));
+        }
+        partition = results.next_partition() => partition,
+    };
+    let stream_schema = first
+        .as_ref()
+        .map_or(schema, |partition| partition.schema());
+    let mut encoder = BatchEncoder::try_new(&stream_schema)?;
+    let schema_message = encoder.schema_message(&stream_schema)?;
+    if tx.send(Ok(schema_message)).await.is_err() {
+        // Client disconnected before the stream started.
+        executor.cancel_plan(fingerprint);
+        return Ok(());
+    }
+
     let mut rows: u64 = 0;
     let mut bytes: u64 = 0;
+    let mut pending = first;
     loop {
-        let partition = tokio::select! {
-            () = cancel.cancelled() => {
-                executor.cancel_plan(fingerprint);
-                return Err(ServeError::Cancelled(query_id));
-            }
-            partition = results.next_partition() => partition,
+        let partition = match pending.take() {
+            Some(partition) => Some(partition),
+            None => tokio::select! {
+                () = cancel.cancelled() => {
+                    executor.cancel_plan(fingerprint);
+                    return Err(ServeError::Cancelled(query_id));
+                }
+                partition = results.next_partition() => partition,
+            },
         };
         let Some(partition) = partition else {
             break;

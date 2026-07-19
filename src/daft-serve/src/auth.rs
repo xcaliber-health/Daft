@@ -116,7 +116,7 @@ mod tests {
     fn constant_time_eq_handles_lengths_and_content() {
         assert!(constant_time_eq(b"", b""));
         assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abz"));
         assert!(!constant_time_eq(b"abc", b"ab"));
         assert!(!constant_time_eq(b"ab", b"abc"));
     }

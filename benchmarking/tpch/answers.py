@@ -399,7 +399,7 @@ def q13(get_df: GetDFFunc) -> DataFrame:
 
     daft_df = (
         customers.join(
-            orders.where(~col("O_COMMENT").match(".*special.*requests.*")),
+            orders.where(~col("O_COMMENT").regexp(".*special.*requests.*")),
             left_on="C_CUSTKEY",
             right_on="O_CUSTKEY",
             how="left",
@@ -442,7 +442,10 @@ def q15(get_df: GetDFFunc) -> DataFrame:
             (col("L_SHIPDATE") >= datetime.date(1996, 1, 1)) & (col("L_SHIPDATE") < datetime.date(1996, 4, 1))
         )
         .groupby(col("L_SUPPKEY"))
-        .agg((col("L_EXTENDEDPRICE") * (1 - col("L_DISCOUNT"))).sum().alias("total_revenue"))
+        # Round to cents so the max-revenue equality join below is stable:
+        # parallel floating-point summation is order-dependent, and joining
+        # on an un-rounded float sum intermittently matches nothing.
+        .agg((col("L_EXTENDEDPRICE") * (1 - col("L_DISCOUNT"))).sum().round(2).alias("total_revenue"))
         .select(col("L_SUPPKEY").alias("supplier_no"), "total_revenue")
     )
 

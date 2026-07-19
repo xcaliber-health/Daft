@@ -48,6 +48,40 @@ python -m benchmarking.serve.bench --warehouse /tmp/tpch-sf1 \
     --lanes daft-serve --serve-address daft://localhost:9494 --serve-token bench
 ```
 
+## Methodology
+
+- Iteration order is query-major (`for query: for lane:`) so every lane sees
+  the same page-cache and module-import state for a given query; no lane
+  systematically pays all cold-start costs.
+- `--warmup N` (default 1) runs and discards N iterations per (lane, query)
+  before timing; the first is reported separately in the report's
+  "Cold start" table. Timing percentiles cover warm iterations only
+  (`--iterations`, default 5).
+
+## Native A/B regression check
+
+To prove a branch introduces no native-engine regression, benchmark the
+`daft-inprocess` lane on the parent commit and compare the branch against
+that baseline:
+
+```bash
+# 1. Build the parent commit in a separate worktree.
+git worktree add ../daft-parent <parent-sha>
+(cd ../daft-parent && make .venv && make build)
+
+# 2. Record the parent baseline (native lane only).
+(cd ../daft-parent && python -m benchmarking.serve.bench \
+    --warehouse /tmp/tpch-sf1 --scale-factor 1 \
+    --lanes daft-inprocess --record-baseline)
+
+# 3. Copy the baseline into this tree and run the branch against it.
+cp ../daft-parent/benchmarking/serve/baselines/sf1.0.json benchmarking/serve/baselines/
+python -m benchmarking.serve.bench --warehouse /tmp/tpch-sf1 \
+    --scale-factor 1 --lanes daft-inprocess --skip-datagen
+```
+
+A non-zero exit flags any query whose warm p50 regressed more than 15%.
+
 ## Notes
 
 - The `duckdb-quack` lane requires the `quack` core extension (DuckDB

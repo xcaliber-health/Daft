@@ -55,6 +55,9 @@ pub struct ServeConfig {
     pub max_pset_bytes: usize,
     /// Whether serialized-plan payloads are rejected (text-only server).
     pub disable_plan_payload: bool,
+    /// Wall-clock seconds one query may execute before being cancelled;
+    /// `0` disables the limit.
+    pub query_timeout_secs: u64,
 }
 
 impl ServeConfig {
@@ -272,8 +275,18 @@ impl FlightService for DaftServeService {
         let buffer = query.results_buffer_size.unwrap_or(8).clamp(1, 64);
         let (tx, rx) = async_channel::bounded(buffer);
         let sql_session = self.sql_session.clone();
+        let query_timeout_secs = self.config.query_timeout_secs;
         let task = common_runtime::get_io_runtime(true).spawn(async move {
-            execute::run_query(query, sql_session, cancel, permit, guard, tx).await;
+            execute::run_query(
+                query,
+                sql_session,
+                cancel,
+                permit,
+                guard,
+                tx,
+                query_timeout_secs,
+            )
+            .await;
         });
 
         // The response stream owns the execution task: dropping the stream
@@ -368,7 +381,7 @@ impl ServeShutdownHandle {
         let signal = self
             .shutdown_signal
             .lock()
-            .expect("shutdown signal lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         if let Some(signal) = signal {
             let _ = signal.send(());
@@ -476,9 +489,23 @@ pub fn start_server(service: DaftServeService) -> ServeResult<ServeHandle> {
             .set_serving::<FlightServiceServer<DaftServeService>>()
             .await;
 
+        // Inbound requests carry the whole query (plan plus any shipped
+        // partition data) in one message, so the transport's decode limit
+        // must track the configured payload cap — otherwise requests between
+        // the transport default and `max_pset_bytes` die with an opaque
+        // transport error before the friendly size check runs. Headroom
+        // covers the plan and envelope alongside the partition bytes.
+        let max_inbound_bytes = service
+            .config
+            .max_pset_bytes
+            .saturating_add(64 * 1024 * 1024);
         Server::builder()
             .add_service(health_service)
-            .add_service(FlightServiceServer::new(service))
+            .add_service(
+                FlightServiceServer::new(service)
+                    .max_decoding_message_size(max_inbound_bytes)
+                    .max_encoding_message_size(usize::MAX),
+            )
             .serve_with_incoming_shutdown(incoming, async move {
                 let _ = shutdown_rx.await;
             })
@@ -521,6 +548,7 @@ mod tests {
             queue_timeout_secs: 30,
             max_pset_bytes: 64 * 1024 * 1024,
             disable_plan_payload: false,
+            query_timeout_secs: 0,
         }
     }
 

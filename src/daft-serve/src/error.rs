@@ -79,6 +79,19 @@ pub enum ServeError {
     #[error("query `{0}` was cancelled")]
     Cancelled(String),
 
+    /// The query exceeded the server's per-query execution time limit and was
+    /// cancelled.
+    #[error(
+        "query `{query_id}` exceeded the server's execution time limit of \
+         {limit_secs}s and was cancelled"
+    )]
+    Timeout {
+        /// Identifier of the timed-out query.
+        query_id: String,
+        /// Configured per-query execution limit in seconds.
+        limit_secs: u64,
+    },
+
     /// The server is draining ahead of shutdown and not accepting new queries.
     #[error("server is shutting down and not accepting new queries")]
     Draining,
@@ -102,6 +115,7 @@ impl ServeError {
             Self::PsetTooLarge { .. } => "PsetTooLarge",
             Self::AtCapacity { .. } => "AtCapacity",
             Self::Cancelled(_) => "Cancelled",
+            Self::Timeout { .. } => "Timeout",
             Self::Draining => "Draining",
             Self::Execution(_) => "Execution",
         }
@@ -121,6 +135,7 @@ impl From<ServeError> for tonic::Status {
             ServeError::PsetTooLarge { .. } => Self::resource_exhausted(err.to_string()),
             ServeError::AtCapacity { .. } => Self::resource_exhausted(err.to_string()),
             ServeError::Cancelled(_) => Self::cancelled(err.to_string()),
+            ServeError::Timeout { .. } => Self::deadline_exceeded(err.to_string()),
             ServeError::Draining => Self::unavailable(err.to_string()),
             ServeError::Execution(_) => Self::internal(err.to_string()),
         };
@@ -178,6 +193,13 @@ mod tests {
                 "AtCapacity",
             ),
             (ServeError::Cancelled("q".into()), "Cancelled"),
+            (
+                ServeError::Timeout {
+                    query_id: "q".into(),
+                    limit_secs: 1,
+                },
+                "Timeout",
+            ),
             (ServeError::Draining, "Draining"),
         ];
         for (err, expected) in cases {
@@ -224,6 +246,13 @@ mod tests {
                 tonic::Code::ResourceExhausted,
             ),
             (ServeError::Cancelled("q".into()), tonic::Code::Cancelled),
+            (
+                ServeError::Timeout {
+                    query_id: "q".into(),
+                    limit_secs: 1,
+                },
+                tonic::Code::DeadlineExceeded,
+            ),
             (ServeError::Draining, tonic::Code::Unavailable),
         ];
         for (err, code) in cases {

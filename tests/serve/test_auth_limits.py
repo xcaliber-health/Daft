@@ -70,6 +70,48 @@ def test_single_slot_server_serializes_queries() -> None:
         server.shutdown(drain_timeout_secs=5)
 
 
+def test_medium_payload_above_transport_default_is_accepted() -> None:
+    """Mid-sized payloads round-trip instead of dying in the transport.
+
+    Covers the window between the transport's stock message cap (4 MiB)
+    and the configured data cap.
+    """
+    server = start_server(ServeSettings(host="127.0.0.1", port=0))
+    try:
+        runner = RemoteRunner(server.address())
+        # ~8 MiB of int64 data — over the stock transport cap, under the
+        # 256 MiB default data cap.
+        n = 1_000_000
+        df = daft.from_pydict({"a": list(range(n))})
+        got = collect_via(runner, df)
+        assert len(got["a"]) == n
+    finally:
+        server.shutdown(drain_timeout_secs=5)
+
+
+def test_over_cap_payload_gets_typed_size_error_not_transport_error() -> None:
+    server = start_server(ServeSettings(host="127.0.0.1", port=0, max_pset_bytes=2 * 1024 * 1024))
+    try:
+        runner = RemoteRunner(server.address())
+        df = daft.from_pydict({"a": list(range(1_000_000))})
+        with pytest.raises(Exception, match="(?i)exceeds the server cap"):
+            collect_via(runner, df)
+    finally:
+        server.shutdown(drain_timeout_secs=5)
+
+
+def test_version_mismatch_rejects_plan_lane_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = start_server(ServeSettings(host="127.0.0.1", port=0))
+    try:
+        monkeypatch.setenv("DAFT_SERVE_CLIENT_VERSION_OVERRIDE", "0.0.0-mismatch")
+        runner = RemoteRunner(server.address())
+        df = daft.from_pydict({"a": [1]})
+        with pytest.raises(Exception, match="(?i)version mismatch"):
+            collect_via(runner, df)
+    finally:
+        server.shutdown(drain_timeout_secs=5)
+
+
 def test_server_info_reports_configuration() -> None:
     server = start_server(ServeSettings(host="127.0.0.1", port=0, max_concurrent_queries=7, max_pset_bytes=12345))
     try:

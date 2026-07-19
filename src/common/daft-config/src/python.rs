@@ -90,6 +90,7 @@ impl PyDaftExecutionConfig {
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         enable_scan_task_split_and_merge=None,
+        enable_scan_task_row_group_splitting=None,
         scan_tasks_min_size_bytes=None,
         scan_tasks_max_size_bytes=None,
         max_sources_per_scan_task=None,
@@ -128,6 +129,7 @@ impl PyDaftExecutionConfig {
     fn with_config_values(
         &self,
         enable_scan_task_split_and_merge: Option<bool>,
+        enable_scan_task_row_group_splitting: Option<bool>,
         scan_tasks_min_size_bytes: Option<usize>,
         scan_tasks_max_size_bytes: Option<usize>,
         max_sources_per_scan_task: Option<usize>,
@@ -167,6 +169,9 @@ impl PyDaftExecutionConfig {
 
         if let Some(enable_scan_task_split_and_merge) = enable_scan_task_split_and_merge {
             config.enable_scan_task_split_and_merge = enable_scan_task_split_and_merge;
+        }
+        if let Some(enable_scan_task_row_group_splitting) = enable_scan_task_row_group_splitting {
+            config.enable_scan_task_row_group_splitting = enable_scan_task_row_group_splitting;
         }
         if let Some(scan_tasks_min_size_bytes) = scan_tasks_min_size_bytes {
             config.scan_tasks_min_size_bytes = scan_tasks_min_size_bytes;
@@ -325,6 +330,11 @@ impl PyDaftExecutionConfig {
     #[getter]
     fn get_enable_scan_task_split_and_merge(&self) -> PyResult<bool> {
         Ok(self.config.enable_scan_task_split_and_merge)
+    }
+
+    #[getter]
+    fn get_enable_scan_task_row_group_splitting(&self) -> PyResult<bool> {
+        Ok(self.config.enable_scan_task_row_group_splitting)
     }
 
     #[getter]

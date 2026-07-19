@@ -24,8 +24,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-QUERY_NAMES = ("q1", "q3", "q5", "q6")
-_TPCH_QUERY_IDS = {"q1": 1, "q3": 3, "q5": 5, "q6": 6}
+QUERY_NAMES = tuple(f"q{number}" for number in range(1, 23))
+_TPCH_QUERY_IDS = {name: int(name[1:]) for name in QUERY_NAMES}
 
 
 class Lane(Protocol):

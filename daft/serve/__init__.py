@@ -26,6 +26,7 @@ __all__ = [
     "DEFAULT_MAX_CONCURRENT_QUERIES",
     "DEFAULT_MAX_PSET_BYTES",
     "DEFAULT_PORT",
+    "DEFAULT_QUERY_TIMEOUT_SECS",
     "DEFAULT_QUEUE_TIMEOUT_SECS",
     "CatalogSpec",
     "ServeSettings",
@@ -39,6 +40,7 @@ DEFAULT_PORT = 9494
 DEFAULT_MAX_CONCURRENT_QUERIES = 4
 DEFAULT_QUEUE_TIMEOUT_SECS = 60
 DEFAULT_MAX_PSET_BYTES = 256 * 1024 * 1024
+DEFAULT_QUERY_TIMEOUT_SECS = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -96,6 +98,9 @@ class ServeSettings:
         Cap on in-memory data shipped with a single query.
     disable_plan_payload:
         Reject serialized-plan payloads, accepting only textual queries.
+    query_timeout_secs:
+        Wall-clock seconds one query may execute before being cancelled;
+        ``0`` disables the limit.
     catalogs:
         Catalogs to attach to the server session at startup.
     """
@@ -108,6 +113,7 @@ class ServeSettings:
     queue_timeout_secs: int = DEFAULT_QUEUE_TIMEOUT_SECS
     max_pset_bytes: int = DEFAULT_MAX_PSET_BYTES
     disable_plan_payload: bool = False
+    query_timeout_secs: int = DEFAULT_QUERY_TIMEOUT_SECS
     catalogs: tuple[CatalogSpec, ...] = ()
 
 
@@ -149,6 +155,7 @@ def _parse_settings(raw: dict[str, object], token: str | None) -> ServeSettings:
         queue_timeout_secs=_int("queue_timeout_secs", DEFAULT_QUEUE_TIMEOUT_SECS),
         max_pset_bytes=_int("max_pset_bytes", DEFAULT_MAX_PSET_BYTES),
         disable_plan_payload=bool(raw.get("disable_plan_payload", False)),
+        query_timeout_secs=_int("query_timeout_secs", DEFAULT_QUERY_TIMEOUT_SECS),
         catalogs=tuple(catalogs),
     )
 
@@ -230,6 +237,7 @@ def start_server(settings: ServeSettings) -> DaftServeServer:
         queue_timeout_secs=settings.queue_timeout_secs,
         max_pset_bytes=settings.max_pset_bytes,
         disable_plan_payload=settings.disable_plan_payload,
+        query_timeout_secs=settings.query_timeout_secs,
         session=session,
         catalogs=catalog_names,
     )

@@ -130,8 +130,10 @@ def connect(address: str, token: str | None = None) -> RemoteConnection:
     >>> conn = daft.connect("daft://analytics.internal:9494", token="...")  # doctest: +SKIP
     >>> daft.read_iceberg(tbl).filter(df["x"] > 1).collect()  # runs on the server  # doctest: +SKIP
     """
+    from typing import cast
+
     from daft.runners.remote_runner import RemoteRunner
 
-    runner = set_runner_remote(address, token)
+    runner = cast("RemoteRunner", set_runner_remote(address, token))
     assert isinstance(runner, RemoteRunner)
     return RemoteConnection(runner)

@@ -80,6 +80,106 @@ def _udf_batch() -> DataFrame:
     return daft.from_pydict({"v": [1, 2, 3]}).select(add_one(col("v")).alias("v1"))
 
 
+def _window_row_number() -> DataFrame:
+    from daft.functions import row_number
+    from daft.window import Window
+
+    window = Window().partition_by("group").order_by("id")
+    return _base_df().select(col("id"), col("group"), row_number().over(window).alias("rn"))
+
+
+def _window_rank() -> DataFrame:
+    from daft.functions import dense_rank, rank
+    from daft.window import Window
+
+    window = Window().partition_by("group").order_by("value")
+    return _base_df().select(
+        col("id"),
+        rank().over(window).alias("rk"),
+        dense_rank().over(window).alias("drk"),
+    )
+
+
+def _window_partition_sum() -> DataFrame:
+    from daft.window import Window
+
+    window = Window().partition_by("group")
+    return _base_df().select(col("id"), col("value").sum().over(window).alias("group_total"))
+
+
+def _pivot() -> DataFrame:
+    df = daft.from_pydict({"g": ["a", "a", "b"], "k": ["x", "y", "x"], "v": [1.0, 2.0, 3.0]})
+    return df.pivot(group_by="g", pivot_col="k", value_col="v", agg_fn="sum", names=["x", "y"])
+
+
+def _unpivot() -> DataFrame:
+    df = daft.from_pydict({"k": [1, 2], "a": [10, 20], "b": [30, 40]})
+    return df.unpivot(ids="k", values=["a", "b"])
+
+
+def _struct_get_and_unnest() -> DataFrame:
+    from daft.functions import unnest
+
+    df = daft.from_pydict({"st": [{"x": 1, "y": "a"}, {"x": 2, "y": "b"}]})
+    return df.select(unnest(col("st")))
+
+
+def _string_namespace() -> DataFrame:
+    from daft.functions import contains
+
+    df = daft.from_pydict({"s": ["apple", "banana", None, "cherry"]})
+    return df.select(col("s"), contains(col("s"), "an").alias("has_an"))
+
+
+def _list_namespace() -> DataFrame:
+    from daft.functions import list_join, list_sum
+
+    df = daft.from_pydict({"l": [[1, 2, 3], [4], []], "w": [["a", "b"], ["c"], []]})
+    return df.select(list_sum(col("l")).alias("total"), list_join(col("w"), "-").alias("joined"))
+
+
+def _map_namespace() -> DataFrame:
+    import pyarrow as pa
+
+    from daft.functions import map_get
+
+    entries = pa.array(
+        [[("k1", 1), ("k2", 2)], [("k3", 3)]],
+        type=pa.map_(pa.string(), pa.int64()),
+    )
+    df = daft.from_arrow(pa.table({"m": entries}))
+    return df.select(map_get(col("m"), "k1").alias("k1"))
+
+
+def _temporal_namespace() -> DataFrame:
+    import datetime
+
+    from daft.functions import day, month, year
+
+    df = daft.from_pydict({"d": [datetime.date(2020, 1, 2), datetime.date(2021, 6, 30), None]})
+    return df.select(year(col("d")).alias("y"), month(col("d")).alias("m"), day(col("d")).alias("dy"))
+
+
+def _extended_aggs() -> DataFrame:
+    from daft.functions import list_agg, string_agg
+
+    return _base_df().agg(
+        col("value").stddev().alias("sd"),
+        col("id").count_distinct().alias("cd"),
+        list_agg(col("id")).alias("ids"),
+        string_agg(col("group")).alias("groups"),
+        col("value").any_value().alias("any_v"),
+    )
+
+
+def _into_partitions() -> DataFrame:
+    return _base_df().into_partitions(3).where(col("id") > 1)
+
+
+def _repartition() -> DataFrame:
+    return _base_df().repartition(2, "group")
+
+
 CASES: dict[str, tuple[Callable[[], DataFrame], str | None]] = {
     "filter_select": (lambda: _filter_select(_base_df()), None),
     "with_columns": (lambda: _with_columns(_base_df()), None),
@@ -91,6 +191,19 @@ CASES: dict[str, tuple[Callable[[], DataFrame], str | None]] = {
     "explode": (_explode, None),
     "concat": (_concat, "x"),
     "udf_batch": (_udf_batch, None),
+    "window_row_number": (_window_row_number, "id"),
+    "window_rank": (_window_rank, "id"),
+    "window_partition_sum": (_window_partition_sum, "id"),
+    "pivot": (_pivot, "g"),
+    "unpivot": (_unpivot, "k"),
+    "struct_get_and_unnest": (_struct_get_and_unnest, None),
+    "string_namespace": (_string_namespace, None),
+    "list_namespace": (_list_namespace, None),
+    "map_namespace": (_map_namespace, None),
+    "temporal_namespace": (_temporal_namespace, None),
+    "extended_aggs": (_extended_aggs, None),
+    "into_partitions": (_into_partitions, "id"),
+    "repartition": (_repartition, "id"),
 }
 
 

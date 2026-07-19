@@ -40,12 +40,15 @@ use crate::{
 /// already performed schema inference on this side at build time, so
 /// planning them here adds no new access requirement.
 ///
+/// Returns the plan to ship plus whether it was optimized on this side, so
+/// callers can surface where scan planning ran.
+///
 /// # Errors
 /// Returns an error if client-side optimization fails.
 pub fn prepare_plan_for_shipping(
     plan: Arc<LogicalPlan>,
     exec_config: &Arc<common_daft_config::DaftExecutionConfig>,
-) -> Result<Arc<LogicalPlan>, common_error::DaftError> {
+) -> Result<(Arc<LogicalPlan>, bool), common_error::DaftError> {
     use common_treenode::{TreeNode, TreeNodeRecursion};
     use daft_logical_plan::source_info::SourceInfo;
     use daft_scan::scan_state::ScanState;
@@ -74,14 +77,14 @@ pub fn prepare_plan_for_shipping(
     })?;
 
     if all_ship {
-        return Ok(plan);
+        return Ok((plan, false));
     }
     // Materializing scans without running the optimizer would bake in empty
     // pushdowns and force the server to scan full-width tables; optimize
     // here instead so tasks carry their projections and predicates.
     let optimized =
         daft_logical_plan::LogicalPlanBuilder::new(plan, None).optimize(exec_config.clone())?;
-    Ok(optimized.build())
+    Ok((optimized.build(), true))
 }
 
 /// Collects the in-memory cache keys referenced by a plan, so a client ships
@@ -139,10 +142,15 @@ impl ServeClient {
         let inner = FlightServiceClient::new(channel)
             .max_decoding_message_size(usize::MAX)
             .max_encoding_message_size(usize::MAX);
+        // The override exists solely so integration tests can exercise the
+        // server's version-mismatch rejection end to end without building a
+        // second engine version.
+        let client_version = std::env::var("DAFT_SERVE_CLIENT_VERSION_OVERRIDE")
+            .unwrap_or_else(|_| common_version::VERSION.to_string());
         Ok(Self {
             inner,
             token,
-            client_version: common_version::VERSION.to_string(),
+            client_version,
         })
     }
 

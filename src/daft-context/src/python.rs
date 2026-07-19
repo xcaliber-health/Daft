@@ -237,6 +237,12 @@ impl PyDaftContext {
         Ok(())
     }
 
+    /// Whether any subscriber is attached; lets callers skip preparing
+    /// notification payloads nobody will consume.
+    pub fn has_subscribers(&self, py: Python) -> bool {
+        py.detach(|| !self.inner.subscribers().is_empty())
+    }
+
     pub fn notify_query_start(
         &self,
         py: Python,

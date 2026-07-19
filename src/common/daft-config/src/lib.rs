@@ -119,6 +119,7 @@ impl DaftPlanningConfig {
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub struct DaftExecutionConfig {
     pub enable_scan_task_split_and_merge: bool,
+    pub enable_scan_task_row_group_splitting: bool,
     pub scan_tasks_min_size_bytes: usize,
     pub scan_tasks_max_size_bytes: usize,
     pub max_sources_per_scan_task: usize,
@@ -166,6 +167,7 @@ impl Default for DaftExecutionConfig {
     fn default() -> Self {
         Self {
             enable_scan_task_split_and_merge: false,
+            enable_scan_task_row_group_splitting: false,
             scan_tasks_min_size_bytes: 96 * 1024 * 1024, // 96MB
             scan_tasks_max_size_bytes: 384 * 1024 * 1024, // 384MB
             max_sources_per_scan_task: 10,

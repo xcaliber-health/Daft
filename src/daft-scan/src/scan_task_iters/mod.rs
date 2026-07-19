@@ -190,6 +190,171 @@ impl Iterator for MergeByFileSize<'_> {
     }
 }
 
+/// Splits one single-source file scan task into row-group-aligned tasks.
+///
+/// Row groups are accumulated in file order until a split reaches
+/// `min_size_bytes` of compressed data; each split carries a chunk
+/// specification naming its row groups, footer metadata trimmed to those row
+/// groups (so readers skip the footer fetch), and exact row-count and
+/// per-column size metadata. Concatenating the splits in order yields
+/// exactly the original task's rows in the original order.
+///
+/// The caller must have verified the task has exactly one file source; the
+/// source's row-group inventory comes from `file_metadata`.
+fn split_task_by_row_group_metadata(
+    t: &ScanTask,
+    file_metadata: &daft_parquet::DaftParquetMetadata,
+    min_size_bytes: usize,
+) -> Vec<ScanTaskRef> {
+    let source = &t.sources[0];
+    let mut new_tasks: Vec<ScanTaskRef> = Vec::new();
+    let mut curr_row_group_indices = Vec::new();
+    let mut curr_row_groups: RowGroupList = IndexMap::new();
+    let mut curr_size_bytes: usize = 0;
+    let mut curr_num_rows: usize = 0;
+    // Per-column materialized sizes for the row groups in this split, so
+    // the resulting ScanTask carries an accurate (projection-aware) size
+    // estimate for every file — not just the first file in the scan, and
+    // not the whole-file sizes reused across splits.
+    let mut curr_column_sizes: BTreeMap<String, u64> = BTreeMap::new();
+
+    let all_row_groups: Vec<_> = file_metadata.row_groups().collect();
+    let last_original_index = all_row_groups.last().map(|(i, _)| *i);
+    for (i, rg) in all_row_groups {
+        curr_row_group_indices.push(i as i64);
+        curr_size_bytes += rg.compressed_size();
+        curr_num_rows += rg.num_rows();
+        for (name, bytes) in rg.column_materialized_sizes() {
+            *curr_column_sizes.entry(name).or_insert(0) += bytes;
+        }
+        curr_row_groups.insert(i, rg);
+
+        if curr_size_bytes >= min_size_bytes || Some(i) == last_original_index {
+            let mut new_source = source.clone();
+
+            if let ScanSourceKind::File {
+                chunk_spec,
+                parquet_metadata,
+                ..
+            } = &mut new_source.kind
+            {
+                // only keep relevant row groups in the metadata
+                let new_metadata =
+                    file_metadata.clone_with_row_groups(curr_num_rows, curr_row_groups);
+                *parquet_metadata = Some(Arc::new(new_metadata));
+
+                *chunk_spec = Some(ChunkSpec::Parquet(curr_row_group_indices));
+                new_source.size_bytes = Some(curr_size_bytes as u64);
+            } else {
+                unreachable!("Parquet file format should only be used with ScanSourceKind::File");
+            }
+
+            // Attach the exact row count and per-column materialized
+            // sizes for this split (we read the footer above, so this is
+            // accurate for every file).
+            let column_sizes = std::mem::take(&mut curr_column_sizes);
+            new_source.metadata = Some(TableMetadata {
+                length: curr_num_rows,
+                column_sizes: (!column_sizes.is_empty()).then_some(column_sizes),
+            });
+
+            // Reset accumulators
+            curr_row_groups = IndexMap::new();
+            curr_row_group_indices = Vec::new();
+            curr_size_bytes = 0;
+            curr_num_rows = 0;
+
+            new_tasks.push(
+                ScanTask::new(
+                    vec![new_source],
+                    t.source_config.clone(),
+                    t.schema.clone(),
+                    t.storage_config.clone(),
+                    t.pushdowns.clone(),
+                    t.generated_fields.clone(),
+                )
+                .into(),
+            );
+        }
+    }
+    new_tasks
+}
+
+/// Whether a materialized scan task is eligible for row-group splitting:
+/// a single file source in a columnar format with native storage, no
+/// pre-assigned chunk specification, no row limit, and no positional
+/// delete files (all of which tie correctness to whole-file reads).
+fn eligible_for_row_group_split(t: &ScanTask) -> bool {
+    matches!(
+        (
+            t.source_config.as_ref(),
+            &t.sources[..],
+            t.sources.first().map(|s| s.get_chunk_spec()),
+            t.pushdowns.limit,
+        ),
+        (
+            SourceConfig::File(FileFormatConfig::Parquet(_)),
+            [_],
+            Some(None),
+            None,
+        )
+    ) && t
+        .sources
+        .first()
+        .and_then(|s| s.get_iceberg_delete_files())
+        .is_none_or(std::vec::Vec::is_empty)
+}
+
+/// Splits a materialized scan task into row-group-aligned tasks for
+/// intra-file parallel reading, targeting `target_chunk_bytes` of compressed
+/// data per split.
+///
+/// Footer metadata attached to the task is reused; otherwise the file's
+/// footer is fetched. Tasks that are not eligible (non-columnar source,
+/// multiple sources, pre-assigned chunks, row limits, delete files) or hold
+/// a single row group are returned unchanged. Splits concatenated in order
+/// reproduce the original task's rows in the original order.
+///
+/// # Errors
+/// Returns an error if the file's footer metadata cannot be read.
+pub async fn split_scan_task_by_row_groups(
+    task: ScanTaskRef,
+    target_chunk_bytes: usize,
+) -> DaftResult<Vec<ScanTaskRef>> {
+    if !eligible_for_row_group_split(&task) {
+        return Ok(vec![task]);
+    }
+    let source = &task.sources[0];
+    let attached = source.get_parquet_metadata().cloned();
+    let file_metadata = match attached {
+        Some(metadata) => metadata,
+        None => {
+            let field_id_mapping = match task.source_config.as_ref() {
+                SourceConfig::File(FileFormatConfig::Parquet(ParquetSourceConfig {
+                    field_id_mapping,
+                    ..
+                })) => field_id_mapping.clone(),
+                _ => None,
+            };
+            let (_, io_client) = task.storage_config.get_io_client_and_runtime()?;
+            let path = source.get_path();
+            let io_stats =
+                IOStatsContext::new(format!("split_scan_task_by_row_groups for {path:#?}"));
+            Arc::new(
+                read_parquet_metadata(path, io_client, Some(io_stats), field_id_mapping).await?,
+            )
+        }
+    };
+    if file_metadata.row_groups().nth(1).is_none() {
+        return Ok(vec![task]);
+    }
+    Ok(split_task_by_row_group_metadata(
+        &task,
+        &file_metadata,
+        target_chunk_bytes,
+    ))
+}
+
 #[must_use]
 fn split_by_row_groups(
     scan_tasks: BoxScanTaskIter,
@@ -217,7 +382,8 @@ fn split_by_row_groups(
                     */
                     if let (
                         SourceConfig::File(FileFormatConfig::Parquet(ParquetSourceConfig {
-                            field_id_mapping, ..
+                            field_id_mapping,
+                            ..
                         })),
                         [source],
                         Some(None),
@@ -227,12 +393,10 @@ fn split_by_row_groups(
                         &t.sources[..],
                         t.sources.first().map(|s| s.get_chunk_spec()),
                         t.pushdowns.limit,
-                    ) && source
-                        .size_bytes
-                        .is_none_or(|s| s > max_size_bytes as u64)
-                      && source
-                        .get_iceberg_delete_files()
-                        .is_none_or(std::vec::Vec::is_empty)
+                    ) && source.size_bytes.is_none_or(|s| s > max_size_bytes as u64)
+                        && source
+                            .get_iceberg_delete_files()
+                            .is_none_or(std::vec::Vec::is_empty)
                     {
                         let (io_runtime, io_client) =
                             t.storage_config.get_io_client_and_runtime()?;
@@ -242,81 +406,19 @@ fn split_by_row_groups(
                         let io_stats =
                             IOStatsContext::new(format!("split_by_row_groups for {path:#?}"));
 
-                        let file_metadata = io_runtime
-                            .block_on_current_thread(read_parquet_metadata(
+                        let file_metadata =
+                            io_runtime.block_on_current_thread(read_parquet_metadata(
                                 path,
                                 io_client,
                                 Some(io_stats),
                                 field_id_mapping.clone(),
                             ))?;
 
-                        let mut new_tasks: Vec<DaftResult<ScanTaskRef>> = Vec::new();
-                        let mut curr_row_group_indices = Vec::new();
-                        let mut curr_row_groups: RowGroupList = IndexMap::new();
-                        let mut curr_size_bytes: usize = 0;
-                        let mut curr_num_rows: usize = 0;
-                        // Per-column materialized sizes for the row groups in this split, so
-                        // the resulting ScanTask carries an accurate (projection-aware) size
-                        // estimate for every file — not just the first file in the scan, and
-                        // not the whole-file sizes reused across splits.
-                        let mut curr_column_sizes: BTreeMap<String, u64> = BTreeMap::new();
-
-                        let all_row_groups: Vec<_> = file_metadata.row_groups().collect();
-                        let last_original_index = all_row_groups.last().map(|(i, _)| *i);
-                        for (i, rg) in all_row_groups {
-                            curr_row_group_indices.push(i as i64);
-                            curr_size_bytes += rg.compressed_size();
-                            curr_num_rows += rg.num_rows();
-                            for (name, bytes) in rg.column_materialized_sizes() {
-                                *curr_column_sizes.entry(name).or_insert(0) += bytes;
-                            }
-                            curr_row_groups.insert(i, rg);
-
-                            if curr_size_bytes >= min_size_bytes || Some(i) == last_original_index {
-                                let mut new_source = source.clone();
-
-                                if let ScanSourceKind::File {
-                                    chunk_spec,
-                                    parquet_metadata,
-                                    ..
-                                } = &mut new_source.kind
-                                {
-                                    // only keep relevant row groups in the metadata
-                                    let new_metadata = file_metadata.clone_with_row_groups(curr_num_rows, curr_row_groups);
-                                    *parquet_metadata = Some(Arc::new(new_metadata));
-
-                                    *chunk_spec = Some(ChunkSpec::Parquet(curr_row_group_indices));
-                                    new_source.size_bytes = Some(curr_size_bytes as u64);
-                                } else {
-                                    unreachable!("Parquet file format should only be used with ScanSourceKind::File");
-                                }
-
-                                // Attach the exact row count and per-column materialized
-                                // sizes for this split (we read the footer above, so this is
-                                // accurate for every file).
-                                let column_sizes = std::mem::take(&mut curr_column_sizes);
-                                new_source.metadata = Some(TableMetadata {
-                                    length: curr_num_rows,
-                                    column_sizes: (!column_sizes.is_empty()).then_some(column_sizes),
-                                });
-
-                                // Reset accumulators
-                                curr_row_groups = IndexMap::new();
-                                curr_row_group_indices = Vec::new();
-                                curr_size_bytes = 0;
-                                curr_num_rows = 0;
-
-                                new_tasks.push(Ok(ScanTask::new(
-                                    vec![new_source],
-                                    t.source_config.clone(),
-                                    t.schema.clone(),
-                                    t.storage_config.clone(),
-                                    t.pushdowns.clone(),
-                                    t.generated_fields.clone(),
-                                )
-                                .into()));
-                            }
-                        }
+                        let new_tasks: Vec<DaftResult<ScanTaskRef>> =
+                            split_task_by_row_group_metadata(&t, &file_metadata, min_size_bytes)
+                                .into_iter()
+                                .map(Ok)
+                                .collect();
 
                         Ok(Box::new(new_tasks.into_iter()))
                     } else {

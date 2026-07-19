@@ -95,6 +95,12 @@ class NativeRunner(Runner[MicroPartition]):
         emit_query_id(query_id)
         output_schema = builder.schema()
 
+        # Notification payloads (plan renderings) and the heartbeat thread
+        # only matter when a subscriber is listening; skip their per-query
+        # cost entirely otherwise.
+        if not ctx.has_subscribers():
+            return (yield from self._optimize_and_execute(builder, query_id))
+
         entrypoint = "python " + " ".join(sys.argv)
         python_version = platform.python_version()
         daft_version = daft.get_version()
@@ -133,17 +139,21 @@ class NativeRunner(Runner[MicroPartition]):
     ) -> Generator[LocalMaterializedResult, None, ExecutionMetadata]:
         ctx = get_context()
 
-        try:
-            ctx._notify_optimization_start(query_id)
-        except Exception as e:
-            logger.warning("Failed to send optimization start notification: %s", e)
+        has_subscribers = ctx.has_subscribers()
+        if has_subscribers:
+            try:
+                ctx._notify_optimization_start(query_id)
+            except Exception as e:
+                logger.warning("Failed to send optimization start notification: %s", e)
 
         builder = builder.optimize(ctx.daft_execution_config)
 
-        try:
-            ctx._notify_optimization_end(query_id, builder.repr_json())
-        except Exception as e:
-            logger.warning("Failed to send optimization end notification: %s", e)
+        if has_subscribers:
+            try:
+                # The plan rendering is built only when someone is listening.
+                ctx._notify_optimization_end(query_id, builder.repr_json())
+            except Exception as e:
+                logger.warning("Failed to send optimization end notification: %s", e)
 
         psets = {
             k: [v.micropartition()._micropartition for v in v.values()]

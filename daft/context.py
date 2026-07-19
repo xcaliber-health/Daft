@@ -77,6 +77,14 @@ class DaftContext:
         """
         self._ctx.detach_subscriber(alias)
 
+    def has_subscribers(self) -> bool:
+        """Whether any subscriber is attached to this context.
+
+        Lets callers skip building notification payloads (plan renderings,
+        heartbeat threads) when nothing is listening.
+        """
+        return self._ctx.has_subscribers()
+
     def _notify_query_start(self, query_id: str, metadata: PyQueryMetadata) -> None:
         self._ctx.notify_query_start(query_id, metadata)
 
@@ -211,6 +219,7 @@ def execution_config_ctx(**kwargs: Any) -> Generator[None, None, None]:
 def set_execution_config(
     config: PyDaftExecutionConfig | None = None,
     enable_scan_task_split_and_merge: bool | None = None,
+    enable_scan_task_row_group_splitting: bool | None = None,
     scan_tasks_min_size_bytes: int | None = None,
     scan_tasks_max_size_bytes: int | None = None,
     max_sources_per_scan_task: int | None = None,
@@ -255,6 +264,8 @@ def set_execution_config(
         config: A PyDaftExecutionConfig object to set the config to, before applying other kwargs. Defaults to None which indicates
             that the old (current) config should be used.
         enable_scan_task_split_and_merge: Whether to enable scan task split and merge. Defaults to False.
+        enable_scan_task_row_group_splitting: Whether the local executor further splits file scan tasks by
+            row group at execution time, so one file can be read by several workers in parallel. Defaults to False.
         scan_tasks_min_size_bytes: Minimum size of scan tasks in bytes. Defaults to 96MB.
         scan_tasks_max_size_bytes: Maximum size of scan tasks in bytes. Defaults to 384MB.
         max_sources_per_scan_task: Maximum number of sources per scan task. Defaults to 10.
@@ -311,6 +322,7 @@ def set_execution_config(
 
         new_daft_execution_config = old_daft_execution_config.with_config_values(
             enable_scan_task_split_and_merge=enable_scan_task_split_and_merge,
+            enable_scan_task_row_group_splitting=enable_scan_task_row_group_splitting,
             scan_tasks_min_size_bytes=scan_tasks_min_size_bytes,
             scan_tasks_max_size_bytes=scan_tasks_max_size_bytes,
             max_sources_per_scan_task=max_sources_per_scan_task,

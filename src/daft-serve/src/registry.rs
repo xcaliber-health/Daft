@@ -34,6 +34,17 @@ pub struct QueryRegistry {
     inner: Arc<Mutex<Inner>>,
 }
 
+/// Locks registry state, recovering from a poisoned lock.
+///
+/// The guarded map has no cross-field invariants, so state left by a
+/// panicking holder is safe to keep using; recovering keeps cancellation and
+/// cleanup working instead of cascading panics through request handlers.
+fn lock_inner(inner: &Mutex<Inner>) -> std::sync::MutexGuard<'_, Inner> {
+    inner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Deregisters a query when dropped.
 #[derive(Debug)]
 pub struct QueryGuard {
@@ -58,7 +69,7 @@ impl QueryRegistry {
     pub fn register(&self, query_id: &str) -> QueryGuard {
         let token = CancellationToken::new();
         let generation = {
-            let mut inner = self.inner.lock().expect("registry lock poisoned");
+            let mut inner = lock_inner(&self.inner);
             let generation = inner.next_generation;
             inner.next_generation += 1;
             inner.entries.insert(
@@ -84,7 +95,7 @@ impl QueryRegistry {
     /// unknown or already-finished query is a no-op, making cancellation
     /// idempotent.
     pub fn cancel(&self, query_id: &str) -> bool {
-        let inner = self.inner.lock().expect("registry lock poisoned");
+        let inner = lock_inner(&self.inner);
         inner.entries.get(query_id).is_some_and(|entry| {
             entry.token.cancel();
             true
@@ -94,11 +105,7 @@ impl QueryRegistry {
     /// Number of currently registered queries.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
-            .entries
-            .len()
+        lock_inner(&self.inner).entries.len()
     }
 
     /// Whether no queries are registered.
@@ -109,7 +116,7 @@ impl QueryRegistry {
 
     /// Cancels every registered query; used when a shutdown drain times out.
     pub fn cancel_all(&self) {
-        let inner = self.inner.lock().expect("registry lock poisoned");
+        let inner = lock_inner(&self.inner);
         for entry in inner.entries.values() {
             entry.token.cancel();
         }
@@ -126,7 +133,7 @@ impl QueryGuard {
 
 impl Drop for QueryGuard {
     fn drop(&mut self) {
-        let mut inner = self.registry.inner.lock().expect("registry lock poisoned");
+        let mut inner = lock_inner(&self.registry.inner);
         if inner
             .entries
             .get(&self.query_id)

@@ -28,7 +28,7 @@ TYPE_CASES: dict[str, pa.Array] = {
     "binary": pa.array([b"\x00\x01", b"", None], type=pa.large_binary()),
     "date32": pa.array([datetime.date(2020, 1, 1), None], type=pa.date32()),
     "timestamp_us": pa.array(
-        [datetime.datetime(2024, 5, 1, 12, 30, 15, 123456), None],  # noqa: DTZ001
+        [datetime.datetime(2024, 5, 1, 12, 30, 15, 123456), None],
         type=pa.timestamp("us"),
     ),
     "timestamp_tz": pa.array(

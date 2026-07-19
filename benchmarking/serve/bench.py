@@ -110,33 +110,46 @@ def check_correctness(reference: lanes.Lane, candidate: lanes.Lane, query: str) 
 
 
 def run_benchmark(
-    active: list[lanes.Lane], queries: list[str], iterations: int
+    active: list[lanes.Lane], queries: list[str], iterations: int, warmup: int
 ) -> dict[str, dict[str, dict[str, float]]]:
-    """Time every lane over every query; returns lane -> query -> stats."""
-    results: dict[str, dict[str, dict[str, float]]] = {}
-    for lane in active:
-        lane_results: dict[str, dict[str, float]] = {}
-        for query in queries:
+    """Time every lane over every query; returns lane -> query -> stats.
+
+    Iterates query-major so every lane sees the same cache state for a given
+    query rather than one lane paying all cold-start costs. The first warm-up
+    iteration is reported separately as ``cold_start_s`` and excluded from the
+    timing percentiles.
+    """
+    results: dict[str, dict[str, dict[str, float]]] = {lane.name: {} for lane in active}
+    for query in queries:
+        for lane in active:
+            cold_start: float | None = None
+            for i in range(warmup):
+                _, elapsed = lane.run(query)
+                if i == 0:
+                    cold_start = elapsed
             times: list[float] = []
             rows = 0
             for _ in range(iterations):
                 rows, elapsed = lane.run(query)
                 times.append(elapsed)
-            lane_results[query] = {
+            stats = {
                 "rows": float(rows),
                 "p50_s": statistics.median(times),
                 "min_s": min(times),
                 "max_s": max(times),
             }
+            if cold_start is not None:
+                stats["cold_start_s"] = cold_start
+            results[lane.name][query] = stats
             logger.info(
-                "%-18s %-4s p50=%7.3fs min=%7.3fs rows=%d",
+                "%-18s %-4s p50=%7.3fs min=%7.3fs cold=%s rows=%d",
                 lane.name,
                 query,
-                lane_results[query]["p50_s"],
-                lane_results[query]["min_s"],
+                stats["p50_s"],
+                stats["min_s"],
+                f"{cold_start:7.3f}s" if cold_start is not None else "      —",
                 rows,
             )
-        results[lane.name] = lane_results
     return results
 
 
@@ -167,17 +180,24 @@ def write_report(
     correctness: dict[str, bool],
     scale_factor: float,
     iterations: int,
+    warmup: int,
 ) -> None:
     """Render a Markdown comparison report."""
-    queries = sorted({q for lane in results.values() for q in lane})
+
+    def _query_sort_key(name: str) -> tuple[int, str]:
+        digits = name[1:]
+        return (int(digits), name) if digits.isdigit() else (999, name)
+
+    queries = sorted({q for lane in results.values() for q in lane}, key=_query_sort_key)
     lines = [
         "# Query server benchmark",
         "",
         f"- scale factor: {scale_factor}",
-        f"- iterations per query: {iterations} (median reported)",
+        f"- warm iterations per query: {iterations} (median reported)",
+        f"- warm-up iterations (excluded from stats): {warmup}",
         f"- generated: {time.strftime('%Y-%m-%d %H:%M:%S %Z')}",
         "",
-        "## Timings (p50 seconds)",
+        "## Timings (p50 seconds, warm)",
         "",
         "| query | " + " | ".join(results) + " |",
         "|---" * (len(results) + 1) + "|",
@@ -188,6 +208,21 @@ def write_report(
             stats = lane_results.get(query)
             row.append(f"{stats['p50_s']:.3f}" if stats else "—")
         lines.append("| " + " | ".join(row) + " |")
+    if warmup > 0:
+        lines += [
+            "",
+            "## Cold start (first warm-up iteration, seconds)",
+            "",
+            "| query | " + " | ".join(results) + " |",
+            "|---" * (len(results) + 1) + "|",
+        ]
+        for query in queries:
+            row = [query]
+            for lane_results in results.values():
+                stats = lane_results.get(query)
+                cold = stats.get("cold_start_s") if stats else None
+                row.append(f"{cold:.3f}" if cold is not None else "—")
+            lines.append("| " + " | ".join(row) + " |")
     lines += ["", "## Correctness gate", ""]
     for key, ok in sorted(correctness.items()):
         lines.append(f"- {key}: {'PASS' if ok else 'FAIL'}")
@@ -197,11 +232,21 @@ def write_report(
 
 def main() -> int:
     """Command-line entrypoint; returns process exit code."""
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    # Root stays at WARNING so engine-internal span/log records neither clutter
+    # the output nor add logging overhead inside the timed loop.
+    logging.basicConfig(level=logging.WARNING, format="%(message)s")
+    logging.getLogger("benchmarking").setLevel(logging.INFO)
+    logger.setLevel(logging.INFO)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--warehouse", required=True)
     parser.add_argument("--scale-factor", type=float, default=0.01)
-    parser.add_argument("--iterations", type=int, default=3)
+    parser.add_argument("--iterations", type=int, default=5, help="warm iterations per query")
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=1,
+        help="warm-up iterations per (lane, query); excluded from stats, first reported as cold start",
+    )
     parser.add_argument(
         "--lanes",
         nargs="+",
@@ -210,10 +255,23 @@ def main() -> int:
     parser.add_argument("--queries", nargs="+", default=list(lanes.QUERY_NAMES))
     parser.add_argument("--serve-address", default=None, help="existing server; otherwise one is started")
     parser.add_argument("--serve-token", default=None)
+    parser.add_argument(
+        "--rg-split",
+        choices=["on", "off"],
+        default="off",
+        help="enable execution-time row-group splitting of file scans (applies to both engine lanes)",
+    )
     parser.add_argument("--record-baseline", action="store_true")
     parser.add_argument("--skip-datagen", action="store_true")
     parser.add_argument("--report", default=None, help="report path (default: report.md beside this file)")
     args = parser.parse_args()
+
+    if args.rg_split == "on":
+        import daft
+
+        # The execution configuration ships with served queries, so this
+        # applies to the in-process and served engine lanes symmetrically.
+        daft.set_execution_config(enable_scan_task_row_group_splitting=True)
 
     warehouse = pathlib.Path(args.warehouse)
     if args.skip_datagen and warehouse.exists():
@@ -226,7 +284,7 @@ def main() -> int:
         logger.error("no lanes available")
         return 2
 
-    results = run_benchmark(active, args.queries, args.iterations)
+    results = run_benchmark(active, args.queries, args.iterations, args.warmup)
 
     # Correctness: every lane must agree with the first available lane.
     correctness: dict[str, bool] = {}
@@ -240,21 +298,24 @@ def main() -> int:
         cleanup()  # type: ignore[operator]
 
     report = pathlib.Path(args.report) if args.report else pathlib.Path(__file__).parent / "report.md"
-    write_report(report, results, correctness, args.scale_factor, args.iterations)
+    write_report(report, results, correctness, args.scale_factor, args.iterations, args.warmup)
+
+    failed = [k for k, ok in correctness.items() if not ok]
+    if failed:
+        logger.error("correctness failures: %s", failed)
 
     if args.record_baseline:
         BASELINE_DIR.mkdir(exist_ok=True)
         path = BASELINE_DIR / f"sf{args.scale_factor}.json"
         path.write_text(json.dumps(results, indent=2))
         logger.info("baseline recorded at %s", path)
-        return 0
+        # A baseline recorded from incorrect results would lock in garbage;
+        # correctness still gates the exit code.
+        return 1 if failed else 0
 
-    failed = [k for k, ok in correctness.items() if not ok]
     regressions = compare_to_baseline(results, args.scale_factor)
     for regression in regressions:
         logger.error("REGRESSION: %s", regression)
-    if failed:
-        logger.error("correctness failures: %s", failed)
     return 1 if failed or regressions else 0
 
 

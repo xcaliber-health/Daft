@@ -63,6 +63,7 @@ impl PyDaftServer {
         queue_timeout_secs=60,
         max_pset_bytes=256 * 1024 * 1024,
         disable_plan_payload=false,
+        query_timeout_secs=0,
         session=None,
         catalogs=Vec::new(),
     ))]
@@ -77,6 +78,7 @@ impl PyDaftServer {
         queue_timeout_secs: u64,
         max_pset_bytes: usize,
         disable_plan_payload: bool,
+        query_timeout_secs: u64,
         session: Option<Py<PyAny>>,
         catalogs: Vec<String>,
     ) -> PyResult<Self> {
@@ -90,6 +92,7 @@ impl PyDaftServer {
             queue_timeout_secs,
             max_pset_bytes,
             disable_plan_payload,
+            query_timeout_secs,
         };
         let service = DaftServeService::new(
             config,
@@ -129,7 +132,10 @@ impl PyDaftServer {
     /// from another thread, or the process is torn down).
     pub fn wait(&self, py: Python<'_>) -> PyResult<()> {
         let task = {
-            let mut guard = self.task.lock().expect("server task lock poisoned");
+            let mut guard = self
+                .task
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard.take()
         };
         if let Some(task) = task {
@@ -192,10 +198,18 @@ impl PyServeServerInfo {
 #[pyclass(module = "daft.daft", name = "DaftServeQueryResult", frozen)]
 pub struct PyServeQueryResult {
     stream: tokio::sync::Mutex<QueryResultStream>,
+    optimized_locally: bool,
 }
 
 #[pymethods]
 impl PyServeQueryResult {
+    /// Whether scan planning ran on the client because a source could not
+    /// travel; the server then executed pre-materialized scan tasks.
+    #[getter]
+    pub fn optimized_locally(&self) -> bool {
+        self.optimized_locally
+    }
+
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
@@ -243,7 +257,7 @@ impl PyDaftServeClient {
         exec_config: Option<&PyDaftExecutionConfig>,
         query_id: String,
         results_buffer_size: Option<usize>,
-    ) -> PyResult<QueryRequest> {
+    ) -> PyResult<(QueryRequest, bool)> {
         let plan = builder.builder.plan.clone();
         let exec_config_bytes = exec_config
             .map(|cfg| wire::encode(cfg.config.as_ref()))
@@ -254,9 +268,10 @@ impl PyDaftServeClient {
             |cfg| cfg.config.clone(),
         );
         let request = py
-            .detach(|| -> Result<QueryRequest, ServeError> {
-                let plan = crate::client::prepare_plan_for_shipping(plan, &effective_config)
-                    .map_err(ServeError::Execution)?;
+            .detach(|| -> Result<(QueryRequest, bool), ServeError> {
+                let (plan, optimized_locally) =
+                    crate::client::prepare_plan_for_shipping(plan, &effective_config)
+                        .map_err(ServeError::Execution)?;
                 let plan_bytes = wire::encode(&plan)?;
                 let referenced = referenced_pset_keys(&plan);
                 let mut named = Vec::with_capacity(referenced.len());
@@ -279,13 +294,16 @@ impl PyDaftServeClient {
                         partitions: blobs,
                     });
                 }
-                Ok(QueryRequest {
-                    query_id,
-                    payload: QueryPayload::Plan(plan_bytes),
-                    exec_config: exec_config_bytes,
-                    psets: named,
-                    results_buffer_size,
-                })
+                Ok((
+                    QueryRequest {
+                        query_id,
+                        payload: QueryPayload::Plan(plan_bytes),
+                        exec_config: exec_config_bytes,
+                        psets: named,
+                        results_buffer_size,
+                    },
+                    optimized_locally,
+                ))
             })
             .map_err(to_py_err)?;
         Ok(request)
@@ -333,7 +351,7 @@ impl PyDaftServeClient {
         exec_config: Option<PyDaftExecutionConfig>,
         results_buffer_size: Option<usize>,
     ) -> PyResult<PyServeQueryResult> {
-        let request = Self::build_plan_request(
+        let (request, optimized_locally) = Self::build_plan_request(
             py,
             builder,
             psets,
@@ -344,6 +362,7 @@ impl PyDaftServeClient {
         let stream = block_on(py, async { self.inner.lock().await.run(&request).await })?;
         Ok(PyServeQueryResult {
             stream: tokio::sync::Mutex::new(stream),
+            optimized_locally,
         })
     }
 
@@ -366,12 +385,13 @@ impl PyDaftServeClient {
         let stream = block_on(py, async { self.inner.lock().await.run(&request).await })?;
         Ok(PyServeQueryResult {
             stream: tokio::sync::Mutex::new(stream),
+            optimized_locally: false,
         })
     }
 
     /// Renders the server-side optimized plan without executing.
     pub fn explain_plan(&self, py: Python<'_>, builder: &PyLogicalPlanBuilder) -> PyResult<String> {
-        let request = Self::build_plan_request(
+        let (request, optimized_locally) = Self::build_plan_request(
             py,
             builder,
             HashMap::new(),
@@ -382,8 +402,27 @@ impl PyDaftServeClient {
         let explained = block_on(py, async {
             self.inner.lock().await.explain(&request).await
         })?;
-        Ok(explained.optimized_plan)
+        if optimized_locally {
+            Ok(format!(
+                "Note: a source in this plan cannot travel, so scan planning \
+                 ran on the client; the server received pre-materialized scan \
+                 tasks.\n{}",
+                explained.optimized_plan
+            ))
+        } else {
+            Ok(explained.optimized_plan)
+        }
     }
+}
+
+/// In-memory cache keys referenced by a plan's sources.
+///
+/// Lets a client materialize and ship only the cached partition sets a query
+/// actually reads instead of everything in its cache.
+#[pyfunction]
+#[must_use]
+pub fn serve_referenced_pset_keys(builder: &PyLogicalPlanBuilder) -> Vec<String> {
+    referenced_pset_keys(&builder.builder.plan)
 }
 
 /// Registers the serving classes on the extension module.
@@ -395,5 +434,6 @@ pub fn register_modules(parent: &Bound<PyModule>) -> PyResult<()> {
     parent.add_class::<PyDaftServeClient>()?;
     parent.add_class::<PyServeQueryResult>()?;
     parent.add_class::<PyServeServerInfo>()?;
+    parent.add_function(wrap_pyfunction!(serve_referenced_pset_keys, parent)?)?;
     Ok(())
 }

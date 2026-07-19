@@ -34,12 +34,53 @@ use crate::{
 
 type SkippedCorruptFilesCollector = Option<Arc<std::sync::Mutex<Vec<(String, String, bool)>>>>;
 
+/// Floor on the compressed bytes each row-group split targets, so tiny
+/// files are not shattered into per-row-group tasks whose scheduling
+/// overhead outweighs the parallelism gained.
+const MIN_ROW_GROUP_SPLIT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Splits materialized scan tasks by row group so one file's row groups can
+/// be read by several workers in parallel, targeting an even spread across
+/// the worker slots. Order is preserved: splits are emitted in file order,
+/// in each task's original position. A task whose footer metadata cannot be
+/// read is kept whole — the subsequent read of that task surfaces the real
+/// error with full context.
+async fn split_tasks_by_row_groups(
+    tasks: Vec<ScanTaskRef>,
+    num_parallel_tasks: usize,
+) -> Vec<ScanTaskRef> {
+    let mut out = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let file_bytes = task
+            .sources
+            .first()
+            .and_then(|source| source.size_bytes)
+            .unwrap_or(0) as usize;
+        let target_chunk_bytes =
+            (file_bytes / num_parallel_tasks.max(1)).max(MIN_ROW_GROUP_SPLIT_BYTES);
+        match daft_scan::scan_task_iters::split_scan_task_by_row_groups(
+            task.clone(),
+            target_chunk_bytes,
+        )
+        .await
+        {
+            Ok(splits) => out.extend(splits),
+            Err(e) => {
+                log::debug!("row-group split skipped for a scan task: {e}");
+                out.push(task);
+            }
+        }
+    }
+    out
+}
+
 pub struct ScanTaskSource {
     receiver: UnboundedReceiver<(InputId, Vec<ScanTaskRef>)>,
     source_config: Option<Arc<SourceConfig>>,
     pushdowns: Pushdowns,
     schema: SchemaRef,
     num_parallel_tasks: usize,
+    row_group_splitting_enabled: bool,
     skipped_corrupt_files: SkippedCorruptFilesCollector,
 }
 
@@ -64,6 +105,7 @@ impl ScanTaskSource {
             pushdowns,
             schema,
             num_parallel_tasks,
+            row_group_splitting_enabled: cfg.enable_scan_task_row_group_splitting,
             skipped_corrupt_files,
         }
     }
@@ -71,6 +113,7 @@ impl ScanTaskSource {
     #[allow(clippy::too_many_arguments)]
     fn spawn_scan_task_processor(
         num_parallel_tasks: usize,
+        row_group_splitting_enabled: bool,
         mut receiver: UnboundedReceiver<(InputId, Vec<ScanTaskRef>)>,
         output_sender: Sender<PipelineMessage>,
         stats_provider: StatsProvider,
@@ -159,10 +202,15 @@ impl ScanTaskSource {
                                 let delete_map =
                                     get_delete_map(&scan_tasks_batch).await?.map(Arc::new);
 
-                                let split_tasks: Vec<Arc<ScanTask>> = scan_tasks_batch
+                                let per_source_tasks: Vec<Arc<ScanTask>> = scan_tasks_batch
                                     .into_iter()
                                     .flat_map(|scan_task| scan_task.split())
                                     .collect();
+                                let split_tasks = if row_group_splitting_enabled {
+                                    split_tasks_by_row_groups(per_source_tasks, max_parallel).await
+                                } else {
+                                    per_source_tasks
+                                };
 
                                 let num_tasks = split_tasks.len();
                                 *input_id_pending_counts.entry(input_id).or_insert(0) += num_tasks;
@@ -237,6 +285,7 @@ impl Source for ScanTaskSource {
 
         let processor_task = Self::spawn_scan_task_processor(
             num_parallel_tasks,
+            self.row_group_splitting_enabled,
             input_receiver,
             output_sender,
             stats_provider,

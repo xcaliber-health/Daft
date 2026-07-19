@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 import daft
 from daft.context import get_context
-from daft.daft import DaftServeClient
+from daft.daft import DaftServeClient, serve_referenced_pset_keys
 from daft.execution.metadata import ExecutionMetadata
 from daft.naming import generate_query_name
 from daft.recordbatch import MicroPartition
@@ -133,9 +133,14 @@ class RemoteRunner(Runner[MicroPartition]):
         emit_query_id(query_id)
         ctx = get_context()
 
+        # Materialize only the cached partition sets the plan references;
+        # unrelated cached data would otherwise be converted (and potentially
+        # shipped) on every query.
+        referenced = set(serve_referenced_pset_keys(builder._builder))
         psets: dict[str, list[PyMicroPartition]] = {
             key: [entry.micropartition()._micropartition for entry in pset.values()]
             for key, pset in self._part_set_cache.get_all_partition_sets().items()
+            if key in referenced
         }
         result = self._client.run_plan(
             builder._builder,
@@ -144,14 +149,25 @@ class RemoteRunner(Runner[MicroPartition]):
             exec_config=ctx.daft_execution_config,
             results_buffer_size=results_buffer_size,
         )
+        if result.optimized_locally:
+            logger.info(
+                "plan contains a source that cannot travel; scan planning ran "
+                "on the client and the server executed pre-materialized scan tasks"
+            )
         for partition in result:
             yield LocalMaterializedResult(MicroPartition._from_pymicropartition(partition))
 
         stats = result.stats()
         if stats is None:
-            # The stream ended without a statistics trailer (e.g. an
-            # abandoned iterator); mirror the local runner's early-exit path.
-            return  # type: ignore[return-value]
+            # The result stream ended without its terminal statistics
+            # trailer: the server stopped mid-query (crash or forced
+            # shutdown). Results may be incomplete, so fail loudly instead
+            # of returning a silently truncated result.
+            raise RuntimeError(
+                f"query `{query_id}`: result stream from {self._address} ended "
+                "without an execution-statistics trailer; the server may have "
+                "died mid-query and the results may be incomplete"
+            )
         physical_plan_json, py_stats = stats
         return ExecutionMetadata._from_runner_output(py_stats, query_id, physical_plan_json or "")
 

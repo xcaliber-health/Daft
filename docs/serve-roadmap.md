@@ -128,8 +128,28 @@ Prerequisite for per-tenant memory caps and for large-query robustness.
   sorted result in memory; true end-to-end streaming needs a
   streaming-output sink API (future work).
 
+**Slice 3 landed: join-build memory accounting.**
+- The build side feeds each morsel incrementally into the growing probe
+  table, and that table must stay fully resident through the streaming
+  probe phase — so spilling raw build input buys nothing on its own. A
+  real join spill is a partitioned (Grace) hash join: partition both
+  sides to disk under pressure, then run per-partition build+probe
+  passes. That requires re-driving the streaming probe side and is
+  recorded below as its own future project, not a slice.
+- What landed instead: the build side charges its bytes to the shared
+  budget and holds them until its probe phase completes (the accounting
+  travels with the finalized build state). A build side that cannot be
+  funded records unfunded growth and logs one clear warning. Effect:
+  when a join coexists with shed-able operators, those operators spill
+  sooner and the process stays at the configured budget — verified with
+  a join feeding a high-cardinality aggregation at an 8MB budget
+  (aggregation spills continuously, results exact) and a build side
+  alone exceeding the budget (warns, completes, results exact).
+
 Remaining slices:
-1. Join-build spill.
+1. Partitioned (Grace) hash join — the true join spill; needs
+   probe-side partitioning, probe-input spill, and per-partition
+   replay. Substantial, design-first.
 2. Cross-query negotiation: a central coordinator re-distributes the global
    budget across concurrent queries' registered operators (grant increments
    where they help throughput most; force spilling elsewhere) — the model

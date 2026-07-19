@@ -24,7 +24,7 @@ use crate::{
 enum TaskOutput<Op: JoinOperator> {
     BuildStateReady {
         input_id: InputId,
-        finalized: Op::FinalizedBuildState,
+        finalized: crate::join::build::AccountedBuildState<Op>,
     },
     ProbeComplete {
         input_id: InputId,
@@ -43,6 +43,8 @@ struct PerProbeInput<Op: JoinOperator> {
     flushed: bool,
     runtime_stats: Arc<JoinStats>,
     max_concurrency: usize,
+    /// Keeps the build side's accounted bytes reserved while probing.
+    build_budget: Option<crate::resource_manager::SpillBudget>,
 }
 
 impl<Op: JoinOperator + 'static> PerProbeInput<Op> {
@@ -54,6 +56,7 @@ impl<Op: JoinOperator + 'static> PerProbeInput<Op> {
             flushed: false,
             runtime_stats,
             max_concurrency,
+            build_budget: None,
         }
     }
 
@@ -232,8 +235,11 @@ impl<Op: JoinOperator + 'static> ProbeExecutionContext<Op> {
                 }) => {
                     let per_input = inputs.get_mut(&input_id).unwrap();
                     per_input.states = (0..max_concurrency)
-                        .map(|_| self.op.make_probe_state(finalized.clone()))
+                        .map(|_| self.op.make_probe_state(finalized.state.clone()))
                         .collect();
+                    // Hold the build side's memory accounting for as long as
+                    // this input probes against it.
+                    per_input.build_budget = finalized.budget;
                     per_input.spawn_ready_batches(
                         &mut tasks,
                         &self.op,

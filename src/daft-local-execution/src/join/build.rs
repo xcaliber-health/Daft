@@ -14,6 +14,7 @@ use crate::{
     channel::Receiver,
     join::{join_operator::JoinOperator, stats::JoinStats},
     pipeline::{InputId, PipelineEvent, PipelineMessage, next_event},
+    resource_manager::SpillBudget,
     runtime_stats::{RuntimeStats, RuntimeStatsManagerHandle},
 };
 
@@ -22,13 +23,21 @@ enum BuildStateSlot<T> {
     Ready(T),
 }
 
+/// A finalized build result together with the memory accounting held on its
+/// behalf. The accounted bytes return to the shared budget when this is
+/// dropped, i.e. when the probe phase that owns the build result finishes.
+pub(crate) struct AccountedBuildState<Op: JoinOperator> {
+    pub(crate) state: Op::FinalizedBuildState,
+    pub(crate) budget: Option<SpillBudget>,
+}
+
 pub(crate) enum FinalizedBuildStateReceiver<Op: JoinOperator> {
-    Receiver(oneshot::Receiver<Op::FinalizedBuildState>),
-    Ready(Op::FinalizedBuildState),
+    Receiver(oneshot::Receiver<AccountedBuildState<Op>>),
+    Ready(AccountedBuildState<Op>),
 }
 
 pub(crate) struct BuildStateBridge<Op: JoinOperator> {
-    channels: Mutex<HashMap<InputId, BuildStateSlot<Op::FinalizedBuildState>>>,
+    channels: Mutex<HashMap<InputId, BuildStateSlot<AccountedBuildState<Op>>>>,
 }
 
 impl<Op: JoinOperator> BuildStateBridge<Op> {
@@ -41,7 +50,7 @@ impl<Op: JoinOperator> BuildStateBridge<Op> {
     pub(crate) fn send_finalized_build_state(
         &self,
         input_id: InputId,
-        finalized: Op::FinalizedBuildState,
+        finalized: AccountedBuildState<Op>,
     ) {
         let mut channels = self.channels.lock().unwrap();
         if let Some(slot) = channels.remove(&input_id) {
@@ -82,6 +91,12 @@ struct PerBuildInput<Op: JoinOperator> {
     pending: VecDeque<MicroPartition>,
     flushed: bool,
     runtime_stats: Arc<JoinStats>,
+    /// Accounted share of the memory budget for this input's build state.
+    /// The build result must stay resident through the probe phase and
+    /// cannot be shed, so overflow is recorded as unfunded growth — keeping
+    /// system-wide pressure honest so shed-able operators spill sooner.
+    budget: Option<SpillBudget>,
+    over_budget_logged: bool,
 }
 
 impl<Op: JoinOperator + 'static> PerBuildInput<Op> {
@@ -91,6 +106,24 @@ impl<Op: JoinOperator + 'static> PerBuildInput<Op> {
             pending: VecDeque::new(),
             flushed: false,
             runtime_stats,
+            budget: None,
+            over_budget_logged: false,
+        }
+    }
+
+    /// Charges `bytes` of incoming build data to the shared budget.
+    fn account(&mut self, bytes: u64, spawner: &ExecutionTaskSpawner) {
+        let budget = self
+            .budget
+            .get_or_insert_with(|| SpillBudget::new(spawner.memory_manager().clone()));
+        if !budget.try_grow(bytes) {
+            budget.grow_unchecked(bytes);
+            if !self.over_budget_logged {
+                self.over_budget_logged = true;
+                log::warn!(
+                    "join build side exceeds the available memory budget; the process may                      grow beyond the configured limit while this join runs"
+                );
+            }
         }
     }
 
@@ -165,8 +198,13 @@ impl<Op: JoinOperator + 'static> BuildExecutionContext<Op> {
     fn try_finalize(&self, per_input: PerBuildInput<Op>, input_id: InputId) {
         let state = per_input.state.expect("must be idle when finalizing");
         if let Ok(finalized) = self.op.finalize_build(state) {
-            self.build_state_bridge
-                .send_finalized_build_state(input_id, finalized);
+            self.build_state_bridge.send_finalized_build_state(
+                input_id,
+                AccountedBuildState {
+                    state: finalized,
+                    budget: per_input.budget,
+                },
+            );
         }
     }
 
@@ -227,6 +265,7 @@ impl<Op: JoinOperator + 'static> BuildExecutionContext<Op> {
                     per_input
                         .runtime_stats
                         .add_build_bytes_inserted(partition.size_bytes() as u64);
+                    per_input.account(partition.size_bytes() as u64, &self.task_spawner);
                     per_input.pending.push_back(partition);
                     per_input.flush_pending(&mut tasks, &self.op, &self.task_spawner, input_id)?;
                 }

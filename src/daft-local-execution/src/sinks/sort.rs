@@ -55,7 +55,10 @@ impl SortState {
             return Ok(());
         };
         let budget = budget.get_or_insert_with(|| SpillBudget::new(memory_manager.clone()));
-        if budget.try_grow(added) {
+        // Honor any request from concurrent holders to shed toward the
+        // fair share, then account this morsel's growth.
+        let requested_shed = budget.take_shed_request();
+        if requested_shed == 0 && budget.try_grow(added) {
             return Ok(());
         }
         // Pressure: sort everything buffered — including the morsel that

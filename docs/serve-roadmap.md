@@ -146,8 +146,30 @@ Prerequisite for per-tenant memory caps and for large-query robustness.
   (aggregation spills continuously, results exact) and a build side
   alone exceeding the budget (warns, completes, results exact).
 
+**Slice 4 landed: cross-holder budget negotiation.**
+- Every budget holder registers with the manager, declaring whether it
+  can shed state to disk. When any holder's growth is denied, the
+  manager computes the fair share of the shareable pool — the total
+  budget minus bytes held by non-shed-able holders, divided across
+  shed-able holders — and posts shed requests to holders above it.
+- Holders honor requests cooperatively at their next per-morsel
+  reconcile, spilling down toward the fair share; the denied holder
+  still spills its own growth immediately, so nothing ever waits and no
+  deadlock is possible. Sustained contention converges toward equal
+  shares instead of first-come-first-served hoarding; the worst case
+  (a holder that never reconciles again) degrades exactly to the
+  previous behavior.
+- Verified: two concurrent aggregations over one small budget through
+  the serving endpoint both produce results identical to unpressured
+  runs while spilling; unit tests cover fair-share math, the
+  non-shed-able exclusion, request consumption, single-holder
+  exemption, and registry cleanup on drop.
+
 Remaining slices:
-1. Partitioned (Grace) hash join — the true join spill; needs
+1. Per-tenant memory caps in the server, wired through this same
+   registration (tenant identity as the grouping key and per-tenant
+   ceilings ahead of the global pool).
+2. Partitioned (Grace) hash join — the true join spill; needs
    probe-side partitioning, probe-input spill, and per-partition
    replay. Substantial, design-first.
 2. Cross-query negotiation: a central coordinator re-distributes the global

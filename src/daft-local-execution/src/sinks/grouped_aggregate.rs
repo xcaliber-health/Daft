@@ -228,12 +228,51 @@ impl GroupedAggregateState {
     /// Invariant on return: `buffered_total` equals the bytes currently
     /// buffered across `inner_states` and mirrors the bytes held from the
     /// shared budget.
+    /// Sheds the largest buffered hash partition to disk. Returns the bytes
+    /// drained, or `None` when nothing is buffered.
+    async fn shed_largest(
+        inner_states: &mut [Option<SinglePartitionAggregateState>],
+        spill: &SpillContext,
+    ) -> DaftResult<Option<u64>> {
+        let largest = inner_states
+            .iter_mut()
+            .flatten()
+            .filter(|state| state.buffered_bytes > 0)
+            .max_by_key(|state| state.buffered_bytes);
+        let Some(state) = largest else {
+            return Ok(None);
+        };
+        let (partial, raw, drained) = state.drain_buffered();
+        if !partial.is_empty() {
+            let run = spill.scratch()?.spill(partial, spill.compression()).await?;
+            state.spilled_partial.push(run);
+        }
+        if !raw.is_empty() {
+            let run = spill.scratch()?.spill(raw, spill.compression()).await?;
+            state.spilled_raw.push(run);
+        }
+        Ok(Some(drained))
+    }
+
     async fn reconcile_and_maybe_spill(
         inner_states: &mut [Option<SinglePartitionAggregateState>],
         budget: &mut SpillBudget,
         buffered_total: &mut u64,
         spill: &SpillContext,
     ) -> DaftResult<()> {
+        // Concurrent holders may have asked this one to shed toward its
+        // fair share; honor that before growing further.
+        let mut requested_shed = budget.take_shed_request();
+        while requested_shed > 0 {
+            let Some(drained) = Self::shed_largest(inner_states, spill).await? else {
+                break;
+            };
+            let accounted = drained.min(*buffered_total);
+            budget.shrink(accounted);
+            *buffered_total -= accounted;
+            requested_shed = requested_shed.saturating_sub(drained);
+        }
+
         loop {
             let buffered: u64 = inner_states
                 .iter()

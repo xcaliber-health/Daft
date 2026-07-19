@@ -255,3 +255,89 @@ def test_join_build_over_budget_warns_and_completes(tmp_path: pathlib.Path) -> N
     pressured, log = _run_join_agg({"DAFT_MEMORY_LIMIT": str(2 * 1024 * 1024)}, spill_dir=str(tmp_path))
     assert pressured == unpressured
     assert "join build side exceeds" in log
+
+
+_CONCURRENT_SCRIPT = """
+import json
+import logging
+from concurrent.futures import ThreadPoolExecutor
+
+logging.basicConfig(level=logging.INFO, format="%(name)s:%(message)s")
+
+import numpy as np
+import pyarrow as pa
+
+import daft
+from daft import col
+from daft.runners.remote_runner import RemoteRunner
+from daft.serve import ServeSettings, start_server
+
+server = start_server(ServeSettings(host="127.0.0.1", port=0))
+
+rng = np.random.default_rng(31)
+n = 1_500_000
+tables = [
+    pa.table(
+        {
+            "k": pa.array(rng.integers(0, 400_000, n)),
+            "v": pa.array(rng.integers(0, 1_000, n)),
+        }
+    )
+    for _ in range(2)
+]
+
+
+def run_query(idx: int) -> dict[str, int]:
+    runner = RemoteRunner(server.address())
+    df = daft.from_arrow(tables[idx]).collect()
+    parts = list(runner.run_iter_tables(df.groupby("k").agg(col("v").sum().alias("s"))._builder))
+    groups = 0
+    total = 0
+    for part in parts:
+        d = part.to_pydict()
+        groups += len(d["k"])
+        total += sum(d["s"])
+    return {"groups": groups, "sum_s": int(total)}
+
+
+with ThreadPoolExecutor(max_workers=2) as pool:
+    results = list(pool.map(run_query, range(2)))
+server.shutdown(drain_timeout_secs=10)
+print("RESULT " + json.dumps(results))
+"""
+
+
+def _run_concurrent(env_overrides: dict[str, str], spill_dir: str | None = None) -> tuple[list[dict[str, int]], str]:
+    import json
+    import os
+
+    script = _CONCURRENT_SCRIPT
+    if spill_dir is not None:
+        script = script.replace(
+            "import daft\n",
+            f"import daft\ndaft.set_execution_config(spill_dirs=[{spill_dir!r}])\n",
+        )
+    out = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "DAFT_RUNNER": "native", **env_overrides},
+        timeout=900,
+        check=False,
+    )
+    combined = out.stdout + out.stderr
+    for line in out.stdout.splitlines():
+        if line.startswith("RESULT "):
+            return json.loads(line[len("RESULT ") :]), combined
+    raise AssertionError(f"no result line; stdout={out.stdout!r} stderr={out.stderr[-2000:]!r}")
+
+
+def test_concurrent_queries_negotiate_the_budget(tmp_path: pathlib.Path) -> None:
+    """Two concurrent aggregations share one small budget exactly.
+
+    Contention resolves through negotiated spilling, never failure.
+    """
+    unpressured, _ = _run_concurrent({})
+    pressured, log = _run_concurrent({"DAFT_MEMORY_LIMIT": str(24 * 1024 * 1024)}, spill_dir=str(tmp_path))
+    assert pressured == unpressured
+    assert "spilled" in log

@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 
 use common_error::{DaftError, DaftResult};
 use common_system_info::SystemInfo;
@@ -39,6 +42,22 @@ impl Drop for MemoryPermit<'_> {
 
 struct MemoryState {
     available_bytes: u64,
+    holders: Vec<Arc<HolderSlot>>,
+}
+
+/// Registry entry for one budget holder, used to negotiate shares between
+/// concurrent holders: when a grow is denied, holders above their fair
+/// share are asked to shed the excess.
+struct HolderSlot {
+    /// Bytes currently held, mirrored under the manager lock.
+    held: AtomicU64,
+    /// Bytes this holder has been asked to shed; consumed cooperatively at
+    /// the holder's next reconcile.
+    shed_requested: AtomicU64,
+    /// Whether the holder can shed state to disk. Holders that cannot
+    /// (resident build tables) are exempt from shed requests, and their
+    /// held bytes are excluded from the shareable pool.
+    can_shed: bool,
 }
 
 pub(crate) struct MemoryManager {
@@ -55,6 +74,7 @@ impl Default for MemoryManager {
             total_bytes: total_mem,
             state: Mutex::new(MemoryState {
                 available_bytes: total_mem,
+                holders: Vec::new(),
             }),
             notify: Notify::new(),
         }
@@ -68,6 +88,7 @@ impl MemoryManager {
                 total_bytes: custom_limit,
                 state: Mutex::new(MemoryState {
                     available_bytes: custom_limit,
+                    holders: Vec::new(),
                 }),
                 notify: Notify::new(),
             }
@@ -127,6 +148,37 @@ impl MemoryManager {
         }
     }
 
+    /// Posts shed requests to holders exceeding their fair share of the
+    /// shareable pool. Called when a grow is denied so concurrent holders
+    /// converge toward equal shares instead of first-come-first-served.
+    fn request_rebalance(&self) {
+        let state = self.state.lock().unwrap();
+        let shedable: Vec<&Arc<HolderSlot>> =
+            state.holders.iter().filter(|slot| slot.can_shed).collect();
+        if shedable.len() < 2 {
+            // A single shed-able holder is already spilling on its own
+            // denials; nothing to negotiate.
+            return;
+        }
+        let reserved: u64 = state
+            .holders
+            .iter()
+            .filter(|slot| !slot.can_shed)
+            .map(|slot| slot.held.load(Ordering::Relaxed))
+            .sum();
+        let pool = self.total_bytes.saturating_sub(reserved);
+        let fair_share = pool / shedable.len() as u64;
+        for slot in shedable {
+            let held = slot.held.load(Ordering::Relaxed);
+            if held > fair_share {
+                let excess = held - fair_share;
+                // Keep the largest outstanding request; requests are
+                // consumed (reset) by the holder when it sheds.
+                slot.shed_requested.fetch_max(excess, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Returns `bytes` to the budget and wakes any waiters.
     fn release(&self, bytes: u64) {
         if bytes > 0 {
@@ -148,25 +200,48 @@ impl MemoryManager {
 /// abandoned or failed query cannot leak accounting.
 pub(crate) struct SpillBudget {
     manager: Arc<MemoryManager>,
+    slot: Arc<HolderSlot>,
     held: u64,
 }
 
 impl SpillBudget {
-    /// Creates an empty budget share against the given manager.
+    /// Creates an empty, shed-capable budget share against the manager.
     pub(crate) fn new(manager: Arc<MemoryManager>) -> Self {
-        Self { manager, held: 0 }
+        Self::with_shed_capability(manager, true)
+    }
+
+    /// Creates an empty budget share, declaring whether the holder can shed
+    /// its state to disk when asked. Holders that cannot shed are exempt
+    /// from rebalancing requests, and their held bytes shrink the pool the
+    /// remaining holders divide.
+    pub(crate) fn with_shed_capability(manager: Arc<MemoryManager>, can_shed: bool) -> Self {
+        let slot = Arc::new(HolderSlot {
+            held: AtomicU64::new(0),
+            shed_requested: AtomicU64::new(0),
+            can_shed,
+        });
+        manager.state.lock().unwrap().holders.push(slot.clone());
+        Self {
+            manager,
+            slot,
+            held: 0,
+        }
     }
 
     /// Attempts to grow the held share by `bytes`; returns whether it fit.
     ///
-    /// A denial means the global budget is exhausted — the owner should
+    /// A denial means the global budget is exhausted: the owner should
     /// spill buffered state (and `shrink`) before retrying or proceeding.
+    /// The denial also asks concurrent holders above their fair share to
+    /// shed, so sustained contention converges toward equal shares.
     #[must_use]
     pub(crate) fn try_grow(&mut self, bytes: u64) -> bool {
         if self.manager.try_reserve(bytes) {
             self.held += bytes;
+            self.slot.held.store(self.held, Ordering::Relaxed);
             true
         } else {
+            self.manager.request_rebalance();
             false
         }
     }
@@ -181,18 +256,31 @@ impl SpillBudget {
         state.available_bytes = state.available_bytes.saturating_sub(bytes);
         drop(state);
         self.held += bytes;
+        self.slot.held.store(self.held, Ordering::Relaxed);
     }
 
     /// Returns `bytes` of the held share to the budget.
     pub(crate) fn shrink(&mut self, bytes: u64) {
         let returned = bytes.min(self.held);
         self.held -= returned;
+        self.slot.held.store(self.held, Ordering::Relaxed);
         self.manager.release(returned);
+    }
+
+    /// Takes and clears any outstanding request for this holder to shed
+    /// bytes, posted by concurrent holders that were denied growth.
+    #[must_use]
+    pub(crate) fn take_shed_request(&self) -> u64 {
+        self.slot.shed_requested.swap(0, Ordering::Relaxed)
     }
 }
 
 impl Drop for SpillBudget {
     fn drop(&mut self) {
+        {
+            let mut state = self.manager.state.lock().unwrap();
+            state.holders.retain(|slot| !Arc::ptr_eq(slot, &self.slot));
+        }
         self.manager.release(self.held);
     }
 }
@@ -252,6 +340,65 @@ mod tests {
         budget.shrink(1000);
         let state = manager.state.lock().unwrap();
         assert_eq!(state.available_bytes, total);
+    }
+
+    #[test]
+    fn denial_posts_shed_requests_toward_fair_share() {
+        let manager = Arc::new(MemoryManager::new());
+        let total = manager.total_bytes;
+
+        let mut hog = SpillBudget::new(manager.clone());
+        assert!(hog.try_grow(total * 8 / 10));
+
+        let mut late = SpillBudget::new(manager.clone());
+        assert!(!late.try_grow(total / 2)); // denied → rebalance posted
+
+        // The hog is asked to shed down to the fair share (half the pool).
+        let requested = hog.take_shed_request();
+        assert_eq!(requested, total * 8 / 10 - total / 2);
+        // Requests are consumed once taken.
+        assert_eq!(hog.take_shed_request(), 0);
+        // The denied holder, at zero held, is not asked to shed.
+        assert_eq!(late.take_shed_request(), 0);
+    }
+
+    #[test]
+    fn non_shedable_holders_shrink_the_shareable_pool() {
+        let manager = Arc::new(MemoryManager::new());
+        let total = manager.total_bytes;
+
+        let mut resident = SpillBudget::with_shed_capability(manager.clone(), false);
+        resident.grow_unchecked(total / 2);
+
+        let mut a = SpillBudget::new(manager.clone());
+        assert!(a.try_grow(total * 4 / 10));
+        let mut b = SpillBudget::new(manager.clone());
+        assert!(!b.try_grow(total / 4)); // only ~10% left → denied
+
+        // Fair share = (total - resident) / 2 = total/4; a holds 40%.
+        assert_eq!(a.take_shed_request(), total * 4 / 10 - total / 4);
+        // Non-shed-able holders are never asked to shed.
+        assert_eq!(resident.take_shed_request(), 0);
+    }
+
+    #[test]
+    fn single_holder_gets_no_shed_requests() {
+        let manager = Arc::new(MemoryManager::new());
+        let total = manager.total_bytes;
+        let mut only = SpillBudget::new(manager.clone());
+        assert!(only.try_grow(total));
+        assert!(!only.try_grow(1));
+        assert_eq!(only.take_shed_request(), 0);
+    }
+
+    #[test]
+    fn dropped_holders_leave_the_registry() {
+        let manager = Arc::new(MemoryManager::new());
+        {
+            let _budget = SpillBudget::new(manager.clone());
+            assert_eq!(manager.state.lock().unwrap().holders.len(), 1);
+        }
+        assert_eq!(manager.state.lock().unwrap().holders.len(), 0);
     }
 
     #[test]

@@ -36,6 +36,21 @@ wheel. Measured again on `make build-release`:
   `src/daft-recordbatch/src/ops/bench_agg.rs`
   (`cargo test -p daft-recordbatch --release -- bench_agg --nocapture --ignored`).
 
+**Negative result (measured, July 2026): persistent per-worker streaming
+aggregation state does not help.** A prototype that kept one group map and
+one set of accumulators alive across a worker's morsels (avoiding
+per-morsel table rebuild, group-key gather, and intermediate batches) was
+implemented, verified correct, and benchmarked: −10% on random
+high-cardinality keys (bigger table, worse probe locality, no dedup
+available when groups ≈ rows), neutral on the clustered TPC-H shapes. The
+per-morsel aggregation in those queries already runs at kernel speed — the
+regime is *insert-heavy* (~4 rows/group; ~26ns/row, matching the
+5M-distinct kernel bench). Beating it requires a faster **insert path**
+(salted-tag arena table) combined with **radix-partitioned thread-local
+shards** so the merge parallelizes without hash-repartitioning
+materialization — a coherent redesign, not an incremental patch. Until
+then the current strategies stand.
+
 The real, measured targets:
 
 1. **Single-chunk partitions aggregate single-threaded.** A large

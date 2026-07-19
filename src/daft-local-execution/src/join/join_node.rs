@@ -19,6 +19,7 @@ use crate::{
         probe::ProbeExecutionContext,
     },
     pipeline::{BuilderContext, MorselSizeRequirement, PipelineMessage, PipelineNode},
+    spill::SpillContext,
 };
 
 pub struct JoinNode<Op: JoinOperator> {
@@ -29,6 +30,9 @@ pub struct JoinNode<Op: JoinOperator> {
     plan_stats: StatsState,
     morsel_size_requirement: MorselSizeRequirement,
     node_info: Arc<NodeInfo>,
+    /// Scratch configuration for partitioned execution under memory
+    /// pressure; absent when spilling is disabled.
+    spill: Option<Arc<SpillContext>>,
 }
 
 impl<Op: JoinOperator + 'static> JoinNode<Op> {
@@ -37,6 +41,7 @@ impl<Op: JoinOperator + 'static> JoinNode<Op> {
         left: Box<dyn PipelineNode>,
         right: Box<dyn PipelineNode>,
         plan_stats: StatsState,
+        cfg: &common_daft_config::DaftExecutionConfig,
         ctx: &BuilderContext,
         context: &LocalNodeContext,
     ) -> Self {
@@ -51,6 +56,7 @@ impl<Op: JoinOperator + 'static> JoinNode<Op> {
             plan_stats,
             morsel_size_requirement,
             node_info: Arc::new(node_info),
+            spill: SpillContext::from_config(cfg).map(Arc::new),
         }
     }
 
@@ -193,6 +199,11 @@ impl<Op: JoinOperator + 'static> PipelineNode for JoinNode<Op> {
             node_id,
             self.meter.clone(),
             self.node_info.clone(),
+            self.spill.clone(),
+            // Replaying partitions reorders output, so partitioned
+            // execution is only allowed when downstream does not require
+            // the probe input's order.
+            !maintain_order,
         );
 
         // Initialize probe side

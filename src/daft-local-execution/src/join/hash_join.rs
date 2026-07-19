@@ -174,6 +174,20 @@ impl JoinOperator for HashJoinOperator {
         )
     }
 
+    fn grace_partition_exprs(&self) -> Option<(&[BoundExpr], &[BoundExpr])> {
+        Some((&self.params.build_on, &self.params.probe_on))
+    }
+
+    fn take_raw_build_input(
+        &self,
+        state: Self::BuildState,
+    ) -> Result<Vec<RecordBatch>, Self::BuildState> {
+        // The raw batches are retained alongside the lookup structure, so
+        // the build side can always be re-partitioned; the partially built
+        // lookup structure is discarded.
+        Ok(state.tables)
+    }
+
     fn make_probe_state(
         &self,
         finalized_build_state: Self::FinalizedBuildState,

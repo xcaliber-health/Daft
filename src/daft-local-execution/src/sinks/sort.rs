@@ -13,9 +13,10 @@ use super::blocking_sink::{
 };
 use crate::{
     ExecutionTaskSpawner,
+    channel::create_channel,
     pipeline::{InputId, NodeName},
     resource_manager::{QueryMemoryScope, SpillBudget},
-    sorted_merge::{MergeOrdering, MergeSource, merge_sorted_runs},
+    sorted_merge::{MergeOrdering, MergeSource, merge_sorted_runs_streaming},
     spill::{SpillContext, SpilledRun},
 };
 
@@ -160,6 +161,7 @@ impl BlockingSink for SortSink {
         spawner: &ExecutionTaskSpawner,
     ) -> BlockingSinkFinalizeResult {
         let params = self.params.clone();
+        let merge_spawner = spawner.clone();
         spawner
             .spawn(
                 async move {
@@ -182,35 +184,46 @@ impl BlockingSink for SortSink {
                     }
 
                     // External path: the still-buffered remainder becomes one
-                    // final in-memory sorted run, then every run merges
-                    // streaming, bounded by one batch per active run.
-                    let Some(spill) = params.spill.as_ref() else {
-                        return Err(common_error::DaftError::InternalError(
-                            "sorted spill runs exist but spilling is not configured".to_string(),
-                        ));
-                    };
-                    let mut sources: Vec<MergeSource> = spilled_runs
-                        .into_iter()
-                        .map(|run| MergeSource::Spilled(run.cursor()))
-                        .collect();
-                    let total_buffered: usize = parts.iter().map(MicroPartition::len).sum();
-                    if total_buffered > 0 {
-                        let sorted = MicroPartition::concat(parts)?.sort(
-                            &params.sort_by,
-                            &params.descending,
-                            &params.nulls_first,
-                        )?;
-                        sources.push(MergeSource::Memory(VecDeque::from(
-                            sorted.record_batches().to_vec(),
-                        )));
-                    }
-                    let ordering = MergeOrdering {
-                        sort_by: params.sort_by.clone(),
-                        descending: params.descending.clone(),
-                        nulls_first: params.nulls_first.clone(),
-                    };
-                    let merged = merge_sorted_runs(sources, &ordering, spill).await?;
-                    Ok(BlockingSinkOutput::Partitions(merged))
+                    // final in-memory sorted run, then every run merges in a
+                    // dedicated task that streams sorted chunks downstream as
+                    // they are produced — the full result never materializes.
+                    let (tx, rx) = create_channel::<MicroPartition>(2);
+                    let producer = merge_spawner.spawn(
+                        async move {
+                            let Some(spill) = params.spill.as_ref() else {
+                                return Err(common_error::DaftError::InternalError(
+                                    "sorted spill runs exist but spilling is not configured"
+                                        .to_string(),
+                                ));
+                            };
+                            let mut sources: Vec<MergeSource> = spilled_runs
+                                .into_iter()
+                                .map(|run| MergeSource::Spilled(run.cursor()))
+                                .collect();
+                            let total_buffered: usize = parts.iter().map(MicroPartition::len).sum();
+                            if total_buffered > 0 {
+                                let sorted = MicroPartition::concat(parts)?.sort(
+                                    &params.sort_by,
+                                    &params.descending,
+                                    &params.nulls_first,
+                                )?;
+                                sources.push(MergeSource::Memory(VecDeque::from(
+                                    sorted.record_batches().to_vec(),
+                                )));
+                            }
+                            let ordering = MergeOrdering {
+                                sort_by: params.sort_by.clone(),
+                                descending: params.descending.clone(),
+                                nulls_first: params.nulls_first.clone(),
+                            };
+                            merge_sorted_runs_streaming(sources, &ordering, spill, &tx).await
+                        },
+                        Span::current(),
+                    );
+                    Ok(BlockingSinkOutput::PartitionStream {
+                        partitions: rx,
+                        producer,
+                    })
                 },
                 Span::current(),
             )

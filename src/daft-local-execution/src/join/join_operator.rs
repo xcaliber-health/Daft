@@ -1,7 +1,9 @@
 use common_error::DaftResult;
 use common_metrics::ops::NodeType;
 use common_runtime::get_compute_pool_num_threads;
+use daft_dsl::expr::bound_expr::BoundExpr;
 use daft_micropartition::MicroPartition;
+use daft_recordbatch::RecordBatch;
 
 use crate::{
     ExecutionTaskSpawner, OperatorOutput,
@@ -95,4 +97,25 @@ pub(crate) trait JoinOperator: Send + Sync {
 
     /// Whether this join needs finalization after probe phase
     fn needs_probe_finalization(&self) -> bool;
+
+    /// Hash-partitionable equality keys for the build and probe sides,
+    /// `(build_keys, probe_keys)`, when this operator supports partitioned
+    /// execution under memory pressure. Rows whose keys hash to the same
+    /// partition on both sides can be joined partition-by-partition.
+    /// `None` (the default) means the operator's semantics do not permit
+    /// hash partitioning.
+    fn grace_partition_exprs(&self) -> Option<(&[BoundExpr], &[BoundExpr])> {
+        None
+    }
+
+    /// Releases the raw input batches retained by an in-progress build
+    /// state so the build side can be re-partitioned to disk. Returns the
+    /// state unchanged in `Err` when raw input cannot be recovered; the
+    /// default keeps the state resident.
+    fn take_raw_build_input(
+        &self,
+        state: Self::BuildState,
+    ) -> Result<Vec<RecordBatch>, Self::BuildState> {
+        Err(state)
+    }
 }

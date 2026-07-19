@@ -11,7 +11,9 @@ use common_metrics::{
     Meter,
     ops::{NodeCategory, NodeInfo, NodeType},
 };
-use common_runtime::{OrderingAwareJoinSet, get_compute_pool_num_threads, get_compute_runtime};
+use common_runtime::{
+    OrderingAwareJoinSet, RuntimeTask, get_compute_pool_num_threads, get_compute_runtime,
+};
 use daft_checkpoint::CheckpointStoreRef;
 use daft_local_plan::LocalNodeContext;
 use daft_logical_plan::stats::StatsState;
@@ -34,6 +36,15 @@ pub(crate) type BlockingSinkSinkResult<Op> =
     OperatorOutput<DaftResult<<Op as BlockingSink>::State>>;
 pub(crate) enum BlockingSinkOutput {
     Partitions(Vec<MicroPartition>),
+    /// Result partitions produced incrementally by a finalize-owned task
+    /// and forwarded downstream as they arrive, so the full result never
+    /// materializes in memory. The producing task's handle is held so its
+    /// errors surface once the stream drains; streamed output does not
+    /// participate in write checkpointing.
+    PartitionStream {
+        partitions: Receiver<MicroPartition>,
+        producer: RuntimeTask<DaftResult<()>>,
+    },
     FlightPartitionRefs(Vec<FlightPartitionRef>),
 }
 pub(crate) type BlockingSinkFinalizeResult = OperatorOutput<DaftResult<BlockingSinkOutput>>;
@@ -275,6 +286,26 @@ impl<Op: BlockingSink + 'static> BlockingSinkNode<Op> {
                             })
                             .await;
                     }
+                }
+                BlockingSinkOutput::PartitionStream {
+                    mut partitions,
+                    producer,
+                } => {
+                    while let Some(partition) = partitions.recv().await {
+                        per_input.runtime_stats.add_rows_out(partition.len() as u64);
+                        per_input
+                            .runtime_stats
+                            .add_bytes_out(partition.size_bytes() as u64);
+                        let _ = output_tx
+                            .send(PipelineMessage::Morsel {
+                                input_id,
+                                partition,
+                            })
+                            .await;
+                    }
+                    // The stream ends either on completion or on producer
+                    // failure; awaiting the handle surfaces the error.
+                    producer.await??;
                 }
                 BlockingSinkOutput::FlightPartitionRefs(partition_refs) => {
                     for partition_ref in partition_refs {

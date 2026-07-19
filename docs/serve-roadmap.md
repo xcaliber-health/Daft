@@ -124,19 +124,16 @@ Prerequisite for per-tenant memory caps and for large-query robustness.
   the unpressured run (fully sorted, spill events observed, scratch
   cleaned); merge unit tests cover three-way merges with an intermediate
   disk pass, descending + nulls-first, and empty/single-run edges.
-- Known bound: the sink's output contract still materializes the final
-  sorted result in memory; true end-to-end streaming needs a
-  streaming-output sink API (future work).
+- ~~Known bound: the sink's output contract still materializes the final
+  sorted result in memory~~ — resolved by slice 6 (streaming sink
+  output).
 
 **Slice 3 landed: join-build memory accounting.**
 - The build side feeds each morsel incrementally into the growing probe
   table, and that table must stay fully resident through the streaming
-  probe phase — so spilling raw build input buys nothing on its own. A
-  real join spill is a partitioned (Grace) hash join: partition both
-  sides to disk under pressure, then run per-partition build+probe
-  passes. That requires re-driving the streaming probe side and is
-  recorded below as its own future project, not a slice.
-- What landed instead: the build side charges its bytes to the shared
+  probe phase — so spilling raw build input buys nothing on its own; the
+  real join spill is the partitioned join of slice 7.
+- What landed here: the build side charges its bytes to the shared
   budget and holds them until its probe phase completes (the accounting
   travels with the finalized build state). A build side that cannot be
   funded records unfunded growth and logs one clear warning. Effect:
@@ -182,16 +179,50 @@ Prerequisite for per-tenant memory caps and for large-query robustness.
   global headroom, shared ceilings across holders in one scope, denial
   leaving global accounting untouched, and release on drop.
 
-Phase C follow-on projects (design-first, parked):
-1. Partitioned (Grace) hash join — the true join spill; needs
-   probe-side partitioning, probe-input spill, and per-partition
-   replay.
-2. Cross-query negotiation: a central coordinator re-distributes the global
-   budget across concurrent queries' registered operators (grant increments
-   where they help throughput most; force spilling elsewhere) — the model
-   proven by embedded analytical databases for multi-tenant fairness.
-3. Only then: per-tenant memory caps in the server, wired through the same
-   registration.
+**Slice 6 landed: streaming sort output.**
+- Blocking sinks can now return their result as a stream: a
+  finalize-owned producer task emits partitions through a bounded
+  channel and the sink forwards each downstream as it arrives, so the
+  full result never materializes; producer errors surface once the
+  stream drains.
+- The sort sink's external path uses it: the final merge of spilled
+  runs streams sorted chunks directly downstream. An external sort's
+  peak memory is now one batch per active run plus the in-flight chunk,
+  end to end. The no-pressure path is unchanged.
+- Verified: unit tests prove the streamed merge is identical to the
+  collected merge and that a dropped consumer surfaces an error; the
+  2M-row under-budget sort integration test passes through the new
+  path with output identical to the unpressured run.
+
+**Slice 7 landed: partitioned (Grace) hash join — Phase C closed.**
+- When the budget denies build-side growth, the build switches to
+  partitioned execution: the raw batches retained by the in-progress
+  build state are re-partitioned by join-key hash into 16 spilled runs,
+  and every later build morsel streams straight to its partition. The
+  probe side then partitions its input symmetrically and, when its
+  stream ends, replays partition by partition — rebuild one partition's
+  table, probe it with that partition's spilled input, emit, release —
+  so peak memory is one partition's build side, not the whole table.
+- The per-partition replay drives the operator's existing
+  build/probe/finalize methods unchanged; matched-row tracking for
+  outer/anti/semi variants is per-partition and therefore exact.
+- Scope: hash equi-joins only (cross, as-of, and sort-merge joins keep
+  the accounting-plus-warning path), and only where downstream does not
+  require probe-input order — blocking sinks start their children
+  unordered, so joins under aggregations, sorts, and writes all
+  qualify; a bare ordered join keeps the resident path. Partitions that
+  still exceed the budget replay with unfunded growth and one warning
+  (recursive re-partitioning is future work).
+- Verified: at a 2MB budget over a ~60MB working set, an inner
+  join+aggregation and a full outer join (with unmatched rows on both
+  sides) both produce results identical to unpressured runs while both
+  sides spill; the full local and serving suites pass; TPC-H
+  minimum times stay at baseline (join queries within noise, mixed
+  signs; no-join queries at baseline after thermal cooldown).
+
+Phase C follow-on (parked): recursive re-partitioning for skewed
+partitions that exceed the budget on replay; partitioned execution
+under ordered output.
 
 ## Phase D — Filter execution improvements (scoped)
 

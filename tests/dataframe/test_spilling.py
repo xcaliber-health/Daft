@@ -245,16 +245,89 @@ def test_join_feeding_aggregation_under_pressure(tmp_path: pathlib.Path) -> None
     assert "spilled" in log
 
 
-def test_join_build_over_budget_warns_and_completes(tmp_path: pathlib.Path) -> None:
-    """A build side that alone exceeds the budget warns and proceeds.
+def test_join_build_over_budget_partitions_and_matches(tmp_path: pathlib.Path) -> None:
+    """A build side that alone exceeds the budget switches to a partitioned join.
 
-    The build state cannot shed, so overflowing the budget must never
-    fail the query.
+    Both sides re-partition to disk and replay partition by partition, so
+    the query completes within the budget with exact results instead of
+    overflowing memory.
     """
     unpressured, _ = _run_join_agg({})
     pressured, log = _run_join_agg({"DAFT_MEMORY_LIMIT": str(2 * 1024 * 1024)}, spill_dir=str(tmp_path))
     assert pressured == unpressured
-    assert "join build side exceeds" in log
+    assert "switching to a partitioned join" in log
+    assert "spilling its input across" in log
+    assert "join build side exceeds" not in log
+
+
+_GRACE_OUTER_SCRIPT = """
+import json
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(name)s:%(message)s")
+
+import numpy as np
+import pyarrow as pa
+
+import daft
+from daft import col
+
+rng = np.random.default_rng(11)
+n = 2_000_000
+dim = daft.from_arrow(
+    pa.table({"k": pa.array(np.arange(500_000)), "p": pa.array(rng.integers(0, 10, 500_000))})
+).collect()
+fact = daft.from_arrow(
+    pa.table({"k": pa.array(rng.integers(0, 600_000, n)), "v": pa.array(rng.integers(0, 1_000, n))})
+).collect()
+
+out = (
+    fact.join(dim, on="k", how="outer")
+    .agg(
+        col("k").count().alias("rows"),
+        col("v").sum().alias("sv"),
+        col("p").sum().alias("sp"),
+        col("p").count().alias("matched"),
+    )
+    .to_pydict()
+)
+checksum = {key: int(value[0]) for key, value in out.items()}
+print("RESULT " + json.dumps(checksum))
+"""
+
+
+def test_outer_join_partitions_with_exact_null_semantics(tmp_path: pathlib.Path) -> None:
+    """A partitioned outer join reproduces matched and unmatched rows exactly.
+
+    Unmatched rows from both sides must survive the per-partition replay,
+    proving the matched-row tracking works partition by partition.
+    """
+    import json
+    import os
+
+    def run(env_overrides: dict[str, str]) -> tuple[dict[str, int], str]:
+        script = _GRACE_OUTER_SCRIPT.replace(
+            "import daft\n",
+            f"import daft\ndaft.set_execution_config(spill_dirs=[{str(tmp_path)!r}])\n",
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "DAFT_RUNNER": "native", **env_overrides},
+            timeout=600,
+            check=False,
+        )
+        for line in out.stdout.splitlines():
+            if line.startswith("RESULT "):
+                return json.loads(line[len("RESULT ") :]), out.stdout + out.stderr
+        raise AssertionError(f"no result line; stdout={out.stdout!r} stderr={out.stderr[-2000:]!r}")
+
+    unpressured, _ = run({})
+    pressured, log = run({"DAFT_MEMORY_LIMIT": str(2 * 1024 * 1024)})
+    assert pressured == unpressured
+    assert pressured["rows"] > pressured["matched"]
+    assert "switching to a partitioned join" in log
 
 
 _CONCURRENT_SCRIPT = """

@@ -1277,6 +1277,7 @@ fn physical_plan_to_pipeline(
                     build_child_node,
                     probe_child_node,
                     stats_state.clone(),
+                    cfg,
                     ctx,
                     context,
                 )
@@ -1332,6 +1333,7 @@ fn physical_plan_to_pipeline(
                 build_child_node,
                 probe_child_node,
                 stats_state.clone(),
+                cfg,
                 ctx,
                 context,
             )
@@ -1363,6 +1365,7 @@ fn physical_plan_to_pipeline(
                 left_node,
                 right_node,
                 stats_state.clone(),
+                cfg,
                 ctx,
                 context,
             )
@@ -1401,6 +1404,7 @@ fn physical_plan_to_pipeline(
                 left_node,
                 right_node,
                 stats_state.clone(),
+                cfg,
                 ctx,
                 context,
             )

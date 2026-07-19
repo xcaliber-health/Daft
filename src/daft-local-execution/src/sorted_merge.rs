@@ -107,10 +107,12 @@ impl Side {
     }
 }
 
-/// Where merged batches go: an intermediate spill run or final collection.
+/// Where merged batches go: an intermediate spill run, a final
+/// collection, or a bounded channel consumed while the merge runs.
 pub(crate) enum MergeOutput<'a> {
     Run(&'a mut crate::spill::RunWriter),
     Collect(&'a mut Vec<MicroPartition>),
+    Channel(&'a crate::channel::Sender<MicroPartition>),
 }
 
 impl MergeOutput<'_> {
@@ -125,6 +127,11 @@ impl MergeOutput<'_> {
                 out.push(part);
                 Ok(())
             }
+            Self::Channel(tx) => tx.send(part).await.map_err(|_| {
+                common_error::DaftError::InternalError(
+                    "merged output receiver dropped before the merge completed".to_string(),
+                )
+            }),
         }
     }
 }
@@ -201,19 +208,13 @@ async fn merge_two(
     }
 }
 
-/// Merges any number of sorted runs into fully sorted output partitions.
-///
-/// Pairs of runs merge into intermediate on-disk runs until two or fewer
-/// remain; the final merge collects output in memory. Peak working memory
-/// is bounded by one batch per active side plus the emitted chunk.
-///
-/// # Errors
-/// Returns an error if reading, writing, or comparison fails.
-pub(crate) async fn merge_sorted_runs(
+/// Reduces sorted runs pairwise through intermediate on-disk runs until
+/// at most two remain, ready for one final streaming merge.
+async fn reduce_to_two(
     mut runs: Vec<MergeSource>,
     ordering: &MergeOrdering,
     spill: &SpillContext,
-) -> DaftResult<Vec<MicroPartition>> {
+) -> DaftResult<Vec<MergeSource>> {
     while runs.len() > 2 {
         let mut next_round: Vec<MergeSource> = Vec::with_capacity(runs.len().div_ceil(2));
         let mut iter = runs.into_iter();
@@ -233,28 +234,67 @@ pub(crate) async fn merge_sorted_runs(
         }
         runs = next_round;
     }
+    Ok(runs)
+}
 
-    let mut out_parts: Vec<MicroPartition> = Vec::new();
+/// Emits the final merge of at most two sorted sources into `out`.
+async fn emit_final(
+    mut runs: Vec<MergeSource>,
+    ordering: &MergeOrdering,
+    out: &mut MergeOutput<'_>,
+) -> DaftResult<()> {
     match (runs.pop(), runs.pop()) {
         (Some(only), None) => {
             let mut side = Side::new(only);
             while side.ensure_batch(ordering).await? {
                 if let Some(rest) = side.take_rest()? {
-                    out_parts.push(MicroPartition::new_loaded(
-                        rest.schema.clone(),
-                        Arc::new(vec![rest]),
-                        None,
-                    ));
+                    out.emit(rest).await?;
                 }
             }
+            Ok(())
         }
-        (Some(second), Some(first)) => {
-            let mut out = MergeOutput::Collect(&mut out_parts);
-            merge_two(first, second, ordering, &mut out).await?;
-        }
-        (None, _) => {}
+        (Some(second), Some(first)) => merge_two(first, second, ordering, out).await,
+        (None, _) => Ok(()),
     }
+}
+
+/// Merges any number of sorted runs into fully sorted output partitions.
+///
+/// Pairs of runs merge into intermediate on-disk runs until two or fewer
+/// remain; the final merge collects output in memory. Peak working memory
+/// is bounded by one batch per active side plus the emitted chunk.
+///
+/// # Errors
+/// Returns an error if reading, writing, or comparison fails.
+pub(crate) async fn merge_sorted_runs(
+    runs: Vec<MergeSource>,
+    ordering: &MergeOrdering,
+    spill: &SpillContext,
+) -> DaftResult<Vec<MicroPartition>> {
+    let runs = reduce_to_two(runs, ordering, spill).await?;
+    let mut out_parts: Vec<MicroPartition> = Vec::new();
+    let mut out = MergeOutput::Collect(&mut out_parts);
+    emit_final(runs, ordering, &mut out).await?;
     Ok(out_parts)
+}
+
+/// Merges any number of sorted runs, sending each fully sorted output
+/// partition to `output` as it is produced instead of collecting the
+/// result in memory. Peak working memory is bounded by one batch per
+/// active side plus the in-flight chunk held by the channel.
+///
+/// # Errors
+/// Returns an error if reading, writing, or comparison fails, or if the
+/// receiving side of `output` is dropped before the merge completes.
+pub(crate) async fn merge_sorted_runs_streaming(
+    runs: Vec<MergeSource>,
+    ordering: &MergeOrdering,
+    spill: &SpillContext,
+    output: &crate::channel::Sender<MicroPartition>,
+) -> DaftResult<()> {
+    let runs = reduce_to_two(runs, ordering, spill).await?;
+    let mut out = MergeOutput::Channel(output);
+    emit_final(runs, ordering, &mut out).await
 }
 
 #[cfg(test)]
@@ -358,5 +398,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(collect_values(&merged), vec![Some(1), Some(2)]);
+    }
+
+    #[tokio::test]
+    async fn streaming_merge_matches_collected_merge() {
+        let make_runs = || {
+            vec![
+                MergeSource::Memory(VecDeque::from(vec![batch(vec![Some(1), Some(4), Some(7)])])),
+                MergeSource::Memory(VecDeque::from(vec![batch(vec![Some(2), Some(5), Some(8)])])),
+                MergeSource::Memory(VecDeque::from(vec![batch(vec![Some(3), Some(6), Some(9)])])),
+            ]
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let spill = spill_ctx(&dir);
+        let collected = merge_sorted_runs(make_runs(), &ordering(false, false), &spill)
+            .await
+            .unwrap();
+
+        let (tx, mut rx) = crate::channel::create_channel::<MicroPartition>(1);
+        let ord = ordering(false, false);
+        let producer = tokio::spawn(async move {
+            merge_sorted_runs_streaming(make_runs(), &ord, &spill_ctx(&dir), &tx).await
+        });
+        let mut streamed = Vec::new();
+        while let Some(part) = rx.recv().await {
+            streamed.push(part);
+        }
+        producer.await.unwrap().unwrap();
+        assert_eq!(collect_values(&streamed), collect_values(&collected));
+    }
+
+    #[tokio::test]
+    async fn streaming_merge_errors_when_receiver_drops() {
+        let runs = vec![
+            MergeSource::Memory(VecDeque::from(vec![batch(vec![Some(1), Some(2)])])),
+            MergeSource::Memory(VecDeque::from(vec![batch(vec![Some(3), Some(4)])])),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = crate::channel::create_channel::<MicroPartition>(1);
+        drop(rx);
+        let err = merge_sorted_runs_streaming(runs, &ordering(false, false), &spill_ctx(&dir), &tx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("receiver dropped"));
     }
 }

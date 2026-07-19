@@ -265,9 +265,13 @@ pub(crate) struct SpilledRun {
 
 impl SpilledRun {
     /// Rows contained in this run.
-    #[cfg(test)]
     pub(crate) fn num_rows(&self) -> usize {
         self.num_rows
+    }
+
+    /// Compressed on-disk size of this run.
+    pub(crate) fn size_bytes(&self) -> usize {
+        self.size_bytes
     }
 
     /// Reads the run back into memory, one partition per file, in write

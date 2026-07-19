@@ -39,7 +39,7 @@
 - Every function production-grade. No duplicate logic.
 - **No stale functions, unused imports, or unused variables.** Removed, not commented.
 
-### Docstrings
+### Docstrings & Comments
 - NumPy/sklearn style. Required for all public classes, methods, functions.
 - Purely functional. **No framework names** (PyIceberg, DAFT, gRPC, Glue, Gateway).
 - Concise. Examples only where they aid understanding.

@@ -18,43 +18,41 @@ discipline used for row-group scan splitting.
   TPC-H: grouped aggregation (~10x), filter/decode interplay (~14x on
   filter-heavy microbenches), fixed per-query pipeline setup (~75ms vs ~4ms).
 
-## Phase B — Grouped-aggregation hash table (design + gated prototype)
+## Phase B — Grouped aggregation (REVISED after release-build measurement)
 
-The single biggest gap. Important context: the engine **already has** a
-single-pass scatter aggregation (`src/daft-recordbatch/src/ops/inline_agg.rs`)
-with typed accumulators and specialized single-column key paths — but it is
-limited to numeric/bool Count/Sum/Product/Min/Max/AnyValue/BoolAnd/BoolOr;
-everything else (multi-column keys, other aggregates) falls back to
-"build per-group index lists, then gather each group and run a kernel"
-(`ops/agg.rs`, `dispatch_per_group`), which is the slow path.
+**The premise changed.** The "~10x aggregation gap" (and the 14x filter
+gap) were measured through a debug-built extension: `make build` compiles
+the engine at opt-level 0, while the comparison engine came from a release
+wheel. Measured again on `make build-release`:
 
-Prototype design (extend the existing inline pattern, do not replace the
-sink or public types):
+- The single-threaded aggregation kernel (`inline_agg.rs` — typed key
+  paths, string symbolization, packed two-string keys) is roughly **at
+  parity with the reference engine per core** (e.g. 2-string-key groupby
+  over 10M rows: ~187ms vs ~190ms single-core-equivalent).
+- End-to-end parquet scan + groupby at 10M rows: **~3x gap**
+  (79ms vs 26.5ms), not 10-20x.
+- A DuckDB-style hash-table rewrite is therefore **not** the next win and
+  is dropped from the roadmap. The bench harness that proves this lives at
+  `src/daft-recordbatch/src/ops/bench_agg.rs`
+  (`cargo test -p daft-recordbatch --release -- bench_agg --nocapture --ignored`).
 
-1. **Row arena**: per-group state stored as one contiguous row
-   `[key values | 64-bit hash | aggregate states]` in a growable arena.
-   Updating a group = compute its row address once, mutate states in place.
-   No group→row index vectors, no gathers.
-2. **Salted pointer table**: table entries pack a 16-bit hash tag with the
-   row reference; probing compares tags first (one cache line) and touches
-   key bytes only on tag match. Probe stride derived from the salt to
-   avoid clustering. (Safe-Rust variant: `(u16 tag, u32 arena index)`.)
-3. **Dictionary fast path**: when a group column arrives dictionary-encoded,
-   probe the unique dictionary values once and cache their row addresses
-   per dictionary — subsequent morsels reuse the cache.
-4. **Radix-partitioned merge**: thread-local tables partitioned by hash so
-   the final merge is one independent task per partition (the sink's
-   existing partition-parallel finalize already has this shape).
-5. **Direct-address fast path** for small bounded integer keys (no probing).
+The real, measured targets:
 
-Rollout: new accumulator behind `enable_experimental_agg_hash_table`;
-micro-benchmark vs both existing paths; TPC-H A/B (q1 is the canary);
-retire fallback coverage aggregate-by-aggregate, never wholesale.
+1. **Single-chunk partitions aggregate single-threaded.** A large
+   in-memory partition (cached DataFrame, shipped partition set) reaches
+   the grouped-aggregate sink as ONE work unit — one worker aggregates 10M
+   rows while other cores idle (observed: pipeline SLOWER than one thread
+   running the kernel directly). Fix: split oversized morsels from
+   in-memory sources (or in the blocking-sink dispatcher) so the existing
+   per-worker partial-agg parallelism engages. Contained change; big win
+   for the serving path where shipped psets are single-chunk.
+2. **Residual ~3x on scan+agg**: profile the composition (decode, morsel
+   handoff, partial→final merge) on the release build before choosing the
+   next kernel-level move. Note: row-group splitting was *slower* than
+   unsplit on a 10-row-group file (97ms vs 79ms) — the flag's benefit is
+   file-count dependent; keep it opt-in.
 
-Isolation note: the hot kernel lives at crate boundaries
-(`daft-recordbatch`, `daft-groupby`, `daft-core` series aggs) shared with
-the distributed path — changes must be additive dispatch arms, not type
-rewrites.
+Any future kernel work must A/B on `make build-release` only.
 
 ## Phase C — Memory substrate: accounting, spilling, negotiation
 

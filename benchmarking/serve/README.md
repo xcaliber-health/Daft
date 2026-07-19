@@ -50,6 +50,11 @@ python -m benchmarking.serve.bench --warehouse /tmp/tpch-sf1 \
 
 ## Methodology
 
+> **Build the optimized engine first: `make build-release`.**
+> `make build` produces a debug (opt-level 0) extension whose engine-side
+> timings are 3-30x slower than release; benchmarks taken with it are
+> meaningless as absolutes and unfair against release-built engines.
+
 - Iteration order is query-major (`for query: for lane:`) so every lane sees
   the same page-cache and module-import state for a given query; no lane
   systematically pays all cold-start costs.

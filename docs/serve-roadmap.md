@@ -67,6 +67,22 @@ The real, measured targets:
    unsplit on a 10-row-group file (97ms vs 79ms) — the flag's benefit is
    file-count dependent; keep it opt-in.
 
+### Tail attribution (measured, complete)
+
+- **Hash join** (q12, q21, and part of q19): decomposed by varying probe
+  size at a fixed 1.5M-row build side. Build ≈ 1.7x the reference engine
+  (47ms vs 28.5ms); **probe ≈ 6.3x (22.1 vs 3.5 ms per 1M rows)** with a
+  large build table (cache-resident small tables probe much faster). The
+  probe-side output construction (gather/materialize of matched rows) is
+  the join target, not the build.
+- **q19** (152ms total): 76ms column decode (only ~1.4x the reference
+  engine's 54ms — the scan itself is fine), ~30ms join, **~46ms compound
+  OR-predicate evaluation over strings** — the direct payoff case for the
+  Phase D items (dictionary filter pushdown + adaptive predicate
+  ordering).
+- **q18/q15/q21 aggregation**: insert-heavy regime; see the negative
+  result above — waits on the arena + radix-shards redesign.
+
 Any future kernel work must A/B on `make build-release` only.
 
 ## Phase C — Memory substrate: accounting, spilling, negotiation

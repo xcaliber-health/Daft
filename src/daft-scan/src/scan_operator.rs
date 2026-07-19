@@ -67,6 +67,15 @@ pub trait ScanOperator: Send + Sync + Debug {
     fn as_pushdown_filter(&self) -> Option<&dyn SupportsPushdownFilters> {
         None
     }
+
+    /// An interpreter object from which this operator can be reconstructed in
+    /// another process, when supported. Returning `None` (the default) means
+    /// the operator cannot travel; plans containing it must materialize its
+    /// scan tasks before serialization.
+    #[cfg(feature = "python")]
+    fn shippable_py_object(&self) -> Option<pyo3::Py<pyo3::PyAny>> {
+        None
+    }
 }
 
 impl Display for dyn ScanOperator {

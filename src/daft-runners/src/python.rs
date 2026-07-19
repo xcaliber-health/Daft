@@ -3,7 +3,9 @@ use std::sync::Arc;
 use common_error::DaftError;
 use pyo3::{IntoPyObjectExt, PyResult, Python, pyfunction};
 
-use crate::runners::{self, DAFT_RUNNER, NativeRunner, RayRunner, Runner, RunnerConfig};
+use crate::runners::{
+    self, DAFT_RUNNER, NativeRunner, RayRunner, RemoteRunner, Runner, RunnerConfig,
+};
 
 #[pyfunction]
 pub fn get_runner(py: Python) -> PyResult<Option<pyo3::Py<pyo3::PyAny>>> {
@@ -23,6 +25,7 @@ pub fn get_or_infer_runner_type(py: Python) -> PyResult<pyo3::Py<pyo3::PyAny>> {
         Some(runner) => match runner.as_ref() {
             Runner::Ray(_) => RayRunner::NAME,
             Runner::Native(_) => NativeRunner::NAME,
+            Runner::Remote(_) => RemoteRunner::NAME,
         },
         None => {
             if let (true, _) = runners::detect_ray_state() {
@@ -31,6 +34,7 @@ pub fn get_or_infer_runner_type(py: Python) -> PyResult<pyo3::Py<pyo3::PyAny>> {
                 match runners::get_runner_config_from_env()? {
                     RunnerConfig::Ray { .. } => RayRunner::NAME,
                     RunnerConfig::Native { .. } => NativeRunner::NAME,
+                    RunnerConfig::Remote { .. } => RemoteRunner::NAME,
                 }
             }
         }
@@ -72,6 +76,29 @@ pub fn set_runner_ray(
         Err(_) if noop_if_initialized => {
             Ok(runners::DAFT_RUNNER.get().unwrap().clone().to_pyobj(py))
         }
+        Err(_) => {
+            Err(DaftError::InternalError("Cannot set runner more than once".to_string()).into())
+        }
+    }
+}
+
+#[pyfunction(signature = (address, token = None))]
+pub fn set_runner_remote(
+    py: Python,
+    address: String,
+    token: Option<String>,
+) -> PyResult<pyo3::Py<pyo3::PyAny>> {
+    let runner_type = runners::get_runner_type_from_env();
+    if !runner_type.is_empty() && runner_type != RemoteRunner::NAME {
+        log::warn!(
+            "Ignore inconsistent $DAFT_RUNNER='{}' env when setting runner as remote",
+            runner_type
+        );
+    }
+
+    let runner = Arc::new(Runner::Remote(RemoteRunner::try_new(address, token)?));
+    match runners::DAFT_RUNNER.set(runner.clone()) {
+        Ok(()) => Ok(runner.to_pyobj(py)),
         Err(_) => {
             Err(DaftError::InternalError("Cannot set runner more than once".to_string()).into())
         }

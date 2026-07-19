@@ -24,7 +24,7 @@ LOCAL_PARTITION_SET_CACHE = PartitionSetCache()
 
 
 class Runner(Generic[PartitionT]):
-    name: ClassVar[Literal["ray", "native"]]
+    name: ClassVar[Literal["ray", "native", "remote"]]
 
     def __init__(self) -> None:
         self._part_set_cache = self.initialize_partition_set_cache()

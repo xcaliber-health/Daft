@@ -8,6 +8,7 @@ from daft.daft import get_or_create_runner as _get_or_create_runner
 from daft.daft import get_or_infer_runner_type as _get_or_infer_runner_type
 from daft.daft import set_runner_native as _set_runner_native
 from daft.daft import set_runner_ray as _set_runner_ray
+from daft.daft import set_runner_remote as _set_runner_remote
 
 if TYPE_CHECKING:
     from daft.runners.runner import Runner
@@ -62,6 +63,26 @@ def set_runner_native(num_threads: int | None = None) -> Runner[PartitionT]:
         Can also be configured via environment variable: DAFT_RUNNER=native
     """
     return _set_runner_native(num_threads)
+
+
+def set_runner_remote(address: str, token: str | None = None) -> Runner[PartitionT]:
+    """Configure Daft to execute dataframes on a remote query server.
+
+    Plans are shipped to the server, optimized and executed next to the
+    data, and results stream back to this process.
+
+    Args:
+        address: Server address, e.g. ``daft://host:9494`` or ``host:9494``.
+        token: Bearer token, required when the server enforces authentication.
+
+    Returns:
+        Runner[PartitionT]: A runner object connected to the remote server.
+
+    Note:
+        Can also be configured via environment variables: DAFT_RUNNER=remote,
+        DAFT_REMOTE_ADDRESS, and DAFT_REMOTE_TOKEN.
+    """
+    return _set_runner_remote(address, token)
 
 
 def set_runner_ray(

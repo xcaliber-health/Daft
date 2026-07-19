@@ -2487,6 +2487,7 @@ dependencies = [
  "daft-recordbatch",
  "daft-runners",
  "daft-scan",
+ "daft-serve",
  "daft-session",
  "daft-shuffles",
  "daft-sql",
@@ -3515,6 +3516,42 @@ dependencies = [
  "rstest",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "daft-serve"
+version = "0.3.0-dev0"
+dependencies = [
+ "arrow-array 59.0.0",
+ "arrow-flight",
+ "arrow-ipc",
+ "arrow-schema 59.0.0",
+ "async-channel 2.5.0",
+ "async-stream",
+ "common-daft-config",
+ "common-error",
+ "common-py-serde",
+ "common-runtime",
+ "common-treenode",
+ "common-version",
+ "daft-context",
+ "daft-core",
+ "daft-local-execution",
+ "daft-local-plan",
+ "daft-logical-plan",
+ "daft-micropartition",
+ "daft-recordbatch",
+ "daft-scan",
+ "daft-schema",
+ "futures",
+ "log",
+ "pyo3",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tonic",
+ "tonic-health",
 ]
 
 [[package]]
@@ -8674,6 +8711,19 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+]
+
+[[package]]
+name = "tonic-health"
+version = "0.14.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4ff0636fef47afb3ec02818f5bceb4377b8abb9d6a386aeade18bd6212f8eb7"
+dependencies = [
+ "prost",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
 ]
 
 [[package]]

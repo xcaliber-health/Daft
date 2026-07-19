@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "daft-serve.fullname" . }}-config
+  labels:
+    {{- include "daft-serve.labels" . | nindent 4 }}
+data:
+  serve.yaml: |
+    host: 0.0.0.0
+    port: {{ .Values.service.port }}
+    max_concurrent_queries: {{ .Values.server.maxConcurrentQueries }}
+    queue_timeout_secs: {{ .Values.server.queueTimeoutSecs }}
+    max_pset_bytes: {{ .Values.server.maxPsetBytes }}
+    disable_plan_payload: {{ .Values.server.disablePlanPayload }}
+    {{- if and (not .Values.auth.existingSecret) (not .Values.auth.value) }}
+    allow_insecure_remote: true
+    {{- end }}
+    catalogs:
+      {{- toYaml .Values.config.catalogs | nindent 6 }}

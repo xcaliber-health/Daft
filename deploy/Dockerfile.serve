@@ -1,0 +1,45 @@
+# Server image: builds the engine wheel from source, then assembles a slim
+# runtime with the serving entrypoint.
+#
+# Build (from the repository root):
+#   docker build -f deploy/Dockerfile.serve -t daft-serve:dev .
+# Run:
+#   docker run -p 9494:9494 -e DAFT_SERVE_TOKEN=secret daft-serve:dev \
+#     --host 0.0.0.0 --port 9494
+
+# ---------------------------------------------------------------- builder ---
+FROM python:3.11-slim-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl build-essential pkg-config libssl-dev cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+# Toolchain pinned by rust-toolchain.toml; rustup resolves it at build time.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain none
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+RUN pip install --no-cache-dir "maturin==1.13.3"
+
+WORKDIR /build
+COPY . .
+RUN rustup show \
+    && maturin build --release --features python --out /build/wheels
+
+# ---------------------------------------------------------------- runtime ---
+FROM python:3.11-slim-bookworm
+
+# The serving process needs table-format and object-store client libraries
+# for server-side catalog attachment; keep the list minimal.
+COPY --from=builder /build/wheels/*.whl /tmp/wheels/
+RUN pip install --no-cache-dir /tmp/wheels/*.whl \
+        "pyiceberg[s3fs,sql-sqlite]>=0.9" pyyaml \
+    && rm -rf /tmp/wheels
+
+RUN useradd --create-home --uid 10001 daft
+USER daft
+WORKDIR /home/daft
+
+EXPOSE 9494
+ENTRYPOINT ["python", "-m", "daft.serve"]
+CMD ["--host", "0.0.0.0", "--port", "9494"]

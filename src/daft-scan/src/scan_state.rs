@@ -13,9 +13,19 @@ use crate::{ClusteringKeys, PartitionField, Pushdowns, ScanOperatorRef, ScanTask
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ScanState {
     Tasks(Arc<Vec<ScanTaskRef>>),
-    #[serde(
-        serialize_with = "serialize_invalid",
-        deserialize_with = "deserialize_invalid"
+    #[cfg_attr(
+        feature = "python",
+        serde(
+            serialize_with = "serialize_operator",
+            deserialize_with = "deserialize_operator"
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "python"),
+        serde(
+            serialize_with = "serialize_invalid",
+            deserialize_with = "deserialize_invalid"
+        )
     )]
     Operator(ScanOperatorRef),
 }
@@ -44,6 +54,7 @@ impl Hash for ScanState {
     }
 }
 
+#[cfg(not(feature = "python"))]
 fn serialize_invalid<S>(_: &ScanOperatorRef, _: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
@@ -53,6 +64,7 @@ where
     ))
 }
 
+#[cfg(not(feature = "python"))]
 fn deserialize_invalid<'de, D>(_: D) -> Result<ScanOperatorRef, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -60,6 +72,40 @@ where
     Err(serde::de::Error::custom(
         "ScanOperatorRef cannot be deserialized",
     ))
+}
+
+/// Serializes a scan operator by shipping the interpreter object it can be
+/// reconstructed from. Operators without such an object (native file scans)
+/// must have their scan tasks materialized before the plan is serialized.
+#[cfg(feature = "python")]
+fn serialize_operator<S>(op: &ScanOperatorRef, s: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match op.0.shippable_py_object() {
+        Some(obj) => common_py_serde::serialize_py_object(&obj, s),
+        None => Err(serde::ser::Error::custom(format!(
+            "scan source `{}` cannot be serialized; materialize its scan \
+             tasks before shipping the plan",
+            op.0.name()
+        ))),
+    }
+}
+
+/// Reconstructs a scan operator from its shipped interpreter object.
+#[cfg(feature = "python")]
+fn deserialize_operator<'de, D>(d: D) -> Result<ScanOperatorRef, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let obj: Arc<pyo3::Py<pyo3::PyAny>> = common_py_serde::deserialize_py_object(d)?;
+    pyo3::Python::attach(|py| {
+        let obj = Arc::try_unwrap(obj).unwrap_or_else(|shared| shared.clone_ref(py));
+        crate::python::pylib::PythonScanOperatorBridge::from_python_abc(obj, py)
+            .map(|bridge| ScanOperatorRef(Arc::new(bridge)))
+    })
+    .map_err(|e| D::Error::custom(format!("failed to rebuild scan operator: {e}")))
 }
 
 impl ScanState {

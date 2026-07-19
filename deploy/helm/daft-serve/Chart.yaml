@@ -1,0 +1,8 @@
+apiVersion: v2
+name: daft-serve
+description: >-
+  Single-node query server: hosts the streaming engine behind a network
+  endpoint; clients ship plans or SQL and stream columnar results back.
+type: application
+version: 0.1.0
+appVersion: "0.3.0-dev0"

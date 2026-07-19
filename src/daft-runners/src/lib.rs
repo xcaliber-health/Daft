@@ -24,5 +24,6 @@ pub fn register_modules(parent: &Bound<PyModule>) -> PyResult<()> {
     parent.add_function(wrap_pyfunction!(python::get_or_infer_runner_type, parent)?)?;
     parent.add_function(wrap_pyfunction!(python::set_runner_ray, parent)?)?;
     parent.add_function(wrap_pyfunction!(python::set_runner_native, parent)?)?;
+    parent.add_function(wrap_pyfunction!(python::set_runner_remote, parent)?)?;
     Ok(())
 }

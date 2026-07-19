@@ -157,7 +157,14 @@ from daft.io import (
     read_huggingface,
     read_mcap,
 )
-from daft.runners import get_or_create_runner, get_or_infer_runner_type, set_runner_native, set_runner_ray
+from daft.connect import connect
+from daft.runners import (
+    get_or_create_runner,
+    get_or_infer_runner_type,
+    set_runner_native,
+    set_runner_ray,
+    set_runner_remote,
+)
 from daft.sql import sql, sql_expr
 from daft.viz import register_viz_hook
 from daft.window import Window
@@ -221,6 +228,7 @@ __all__ = [
     "cls",
     "col",
     "concat",
+    "connect",
     "context",
     "create_namespace",
     "create_namespace_if_not_exists",
@@ -305,6 +313,7 @@ __all__ = [
     "set_provider",
     "set_runner_native",
     "set_runner_ray",
+    "set_runner_remote",
     "set_session",
     "sql",
     "sql_expr",

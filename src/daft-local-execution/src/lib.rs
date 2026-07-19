@@ -28,7 +28,7 @@ use common_error::{DaftError, DaftResult};
 use common_runtime::{JoinSet, RuntimeRef, RuntimeTask};
 use console::style;
 use resource_manager::MemoryManager;
-pub use run::ExecutionEngineResult;
+pub use run::{ExecutionEngineResult, NativeExecutor};
 
 /// Helpers for distributed execution tests.
 ///

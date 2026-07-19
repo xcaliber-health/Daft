@@ -685,6 +685,19 @@ impl ExecutionEngineResult {
         self.receiver.recv().await
     }
 
+    /// Receives the next completed output partition, or `None` at end of
+    /// stream. Shuffle partition references are skipped; they are only
+    /// produced when running as a distributed worker. Failures are surfaced
+    /// by `try_finish` after the stream ends.
+    pub async fn next_partition(&mut self) -> Option<MicroPartition> {
+        while let Some(item) = self.receiver.recv().await {
+            if let ExecutionEngineResultItem::Partition(p) = item {
+                return Some(p);
+            }
+        }
+        None
+    }
+
     /// Consume all pipeline output for this input_id until EOF, returning any
     /// emitted `MicroPartition`s. `FlightPartitionRef` items are skipped (they
     /// are only relevant when shuffles are enabled). Intended for tests that

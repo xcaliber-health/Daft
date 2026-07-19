@@ -588,6 +588,9 @@ pub mod pylib {
         fn name(&self) -> &str {
             &self.name
         }
+        fn shippable_py_object(&self) -> Option<pyo3::Py<pyo3::PyAny>> {
+            Some(Python::attach(|py| self.operator.clone_ref(py)))
+        }
         fn partitioning_keys(&self) -> &[PartitionField] {
             &self.partitioning_keys
         }

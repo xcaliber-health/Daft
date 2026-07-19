@@ -52,6 +52,7 @@ daft-parquet = {path = "src/daft-parquet", default-features = false}
 daft-partition-refs = {path = "src/daft-partition-refs", default-features = false}
 daft-runners = {path = "src/daft-runners", default-features = false}
 daft-recordbatch = {path = "src/daft-recordbatch", default-features = false}
+daft-serve = {path = "src/daft-serve", default-features = false}
 daft-scan = {path = "src/daft-scan", default-features = false}
 daft-session = {path = "src/daft-session", default-features = false}
 daft-shuffles = {path = "src/daft-shuffles", default-features = false}
@@ -106,6 +107,7 @@ python = [
   "daft-parquet/python",
   "daft-partition-refs/python",
   "daft-scan/python",
+  "daft-serve/python",
   "daft-sql/python",
   "daft-session/python",
   "daft-stats/python",
@@ -232,6 +234,7 @@ members = [
   "src/daft-partition-refs",
   "src/daft-runners",
   "src/daft-scan",
+  "src/daft-serve",
   "src/daft-session",
   "src/daft-shuffles",
   "src/daft-sketch",
@@ -377,6 +380,7 @@ tokio-stream = {version = "0.1.14", features = ["fs", "io-util", "time"]}
 tokio-util = "0.7.17"
 tonic = "0.14.2"
 tonic-build = "0.14.2"
+tonic-health = "0.14.2"
 tracing = {version = "0.1", features = ["log"]}
 tracing-subscriber = {version = "0.3.22", default-features = false, features = ["std", "fmt", "ansi", "env-filter", "json"]}
 typetag = "0.2.21"

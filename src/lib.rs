@@ -138,6 +138,7 @@ pub mod pylib {
         daft_micropartition::register_modules(m)?;
         daft_recordbatch::register_modules(m)?;
         daft_scan::register_modules(m)?;
+        daft_serve::register_modules(m)?;
         daft_session::register_modules(m)?;
         daft_sql::register_modules(m)?;
         daft_file::python::register_modules(m)?;

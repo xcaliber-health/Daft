@@ -72,9 +72,36 @@ impl NativeRunner {
 }
 
 #[derive(Debug)]
+pub struct RemoteRunner {
+    pub pyobj: Arc<pyo3::Py<pyo3::PyAny>>,
+}
+
+impl RemoteRunner {
+    pub const NAME: &'static str = "remote";
+
+    pub fn try_new(address: String, token: Option<String>) -> DaftResult<Self> {
+        Python::attach(|py| {
+            let remote_runner_module = py.import(intern!(py, "daft.runners.remote_runner"))?;
+            let remote_runner = remote_runner_module.getattr(intern!(py, "RemoteRunner"))?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item(intern!(py, "address"), address)?;
+            kwargs.set_item(intern!(py, "token"), token)?;
+
+            let instance = remote_runner.call((), Some(&kwargs))?;
+            let instance = instance.unbind();
+
+            Ok(Self {
+                pyobj: Arc::new(instance),
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
 pub enum Runner {
     Ray(RayRunner),
     Native(NativeRunner),
+    Remote(RemoteRunner),
 }
 
 impl Runner {
@@ -94,6 +121,12 @@ impl Runner {
                     };
                     Ok(Self::Native(native_runner))
                 }
+                RemoteRunner::NAME => {
+                    let remote_runner = RemoteRunner {
+                        pyobj: Arc::new(obj),
+                    };
+                    Ok(Self::Remote(remote_runner))
+                }
                 _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "Unknown runner type: {name}"
                 ))),
@@ -103,8 +136,9 @@ impl Runner {
 
     fn get_runner_ref(&self) -> &pyo3::Py<pyo3::PyAny> {
         match self {
-            Self::Ray(RayRunner { pyobj }) => pyobj.as_ref(),
-            Self::Native(NativeRunner { pyobj }) => pyobj.as_ref(),
+            Self::Ray(RayRunner { pyobj })
+            | Self::Native(NativeRunner { pyobj })
+            | Self::Remote(RemoteRunner { pyobj }) => pyobj.as_ref(),
         }
     }
     pub fn run_iter_tables<'py>(
@@ -151,6 +185,10 @@ impl Runner {
     pub fn is_ray(&self) -> bool {
         matches!(self, Self::Ray(_))
     }
+
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Self::Remote(_))
+    }
 }
 
 #[derive(Debug)]
@@ -163,6 +201,10 @@ pub enum RunnerConfig {
         address: Option<String>,
         force_client_mode: Option<bool>,
         worker_startup_timeout: Option<usize>,
+    },
+    Remote {
+        address: String,
+        token: Option<String>,
     },
 }
 
@@ -179,6 +221,9 @@ impl RunnerConfig {
                 force_client_mode,
                 worker_startup_timeout,
             )?)),
+            Self::Remote { address, token } => {
+                Ok(Runner::Remote(RemoteRunner::try_new(address, token)?))
+            }
         }
     }
 }
@@ -252,10 +297,26 @@ pub(crate) fn get_runner_type_from_env() -> String {
         .to_lowercase()
 }
 
+/// Reads the remote runner configuration from the environment.
+fn get_remote_runner_config_from_env() -> PyResult<RunnerConfig> {
+    const DAFT_REMOTE_ADDRESS: &str = "DAFT_REMOTE_ADDRESS";
+    const DAFT_REMOTE_TOKEN: &str = "DAFT_REMOTE_TOKEN";
+
+    let address = std::env::var(DAFT_REMOTE_ADDRESS).map_err(|_| {
+        PyValueError::new_err(format!(
+            "DAFT_RUNNER=remote requires ${DAFT_REMOTE_ADDRESS} to be set, \
+            e.g. `grpc://host:9494`."
+        ))
+    })?;
+    let token = std::env::var(DAFT_REMOTE_TOKEN).ok();
+    Ok(RunnerConfig::Remote { address, token })
+}
+
 pub(crate) fn get_runner_config_from_env() -> PyResult<RunnerConfig> {
     match get_runner_type_from_env().as_str() {
         NativeRunner::NAME => Ok(RunnerConfig::Native { num_threads: None }),
         RayRunner::NAME => Ok(get_ray_runner_config_from_env()),
+        RemoteRunner::NAME => get_remote_runner_config_from_env(),
         "py" => Err(PyValueError::new_err(
             "The PyRunner was removed from Daft from v0.5.0 onwards. \
             Please set the env to `DAFT_RUNNER=native`."
@@ -273,7 +334,7 @@ pub(crate) fn get_runner_config_from_env() -> PyResult<RunnerConfig> {
         }
         other => Err(PyValueError::new_err(format!(
             "Invalid runner type `DAFT_RUNNER={other}` specified through the env. \
-            Please use either `native` or `ray`."
+            Please use `native`, `ray`, or `remote`."
         ))),
     }
 }

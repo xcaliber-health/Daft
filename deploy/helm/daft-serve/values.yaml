@@ -1,0 +1,82 @@
+# Default values for the daft-serve chart.
+
+image:
+  repository: daft-serve
+  tag: dev
+  pullPolicy: IfNotPresent
+
+# Number of server replicas. The server is stateless per query, so replicas
+# scale read throughput behind the Service.
+replicas: 1
+
+service:
+  type: ClusterIP
+  port: 9494
+
+# Bearer token every client must present. Set `existingSecret` to use a
+# pre-created Secret with key `token`, or `value` to have the chart create
+# one. Leaving both empty runs the server tokenless with the explicit
+# insecure opt-out (NOT recommended outside development).
+auth:
+  existingSecret: ""
+  value: ""
+
+server:
+  maxConcurrentQueries: 4
+  queueTimeoutSecs: 60
+  maxPsetBytes: 268435456
+  disablePlanPayload: false
+  # Seconds to drain in-flight queries on SIGTERM before cancelling.
+  drainTimeoutSecs: 120
+
+# Serving configuration mounted as /etc/daft/serve.yaml — catalogs to attach
+# at startup, e.g.:
+#   catalogs:
+#     - name: lake
+#       properties:
+#         type: rest
+#         uri: http://iceberg-rest:8181
+#         warehouse: s3://warehouse/
+#         s3.endpoint: http://minio:9000
+config:
+  catalogs: []
+
+# Environment for object-store credentials, e.g. AWS_ACCESS_KEY_ID from a
+# Secret. Entries are standard container env var specs.
+extraEnv: []
+
+resources:
+  requests:
+    cpu: "2"
+    memory: 4Gi
+  limits:
+    cpu: "8"
+    memory: 16Gi
+
+probes:
+  # gRPC health probes hit the standard health service on the serving port.
+  liveness:
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    failureThreshold: 3
+  readiness:
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    failureThreshold: 3
+
+ingress:
+  enabled: false
+  className: ""
+  host: ""
+  annotations: {}
+  tls: []
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 75
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

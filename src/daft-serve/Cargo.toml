@@ -1,0 +1,57 @@
+[dependencies]
+arrow-array = {workspace = true}
+arrow-flight = {workspace = true}
+arrow-ipc = {workspace = true}
+arrow-schema = {workspace = true}
+async-channel = "2.5.0"
+async-stream = {workspace = true}
+common-daft-config = {path = "../common/daft-config", default-features = false}
+common-error = {path = "../common/error", default-features = false}
+common-py-serde = {path = "../common/py-serde", default-features = false}
+common-runtime = {path = "../common/runtime", default-features = false}
+common-treenode = {path = "../common/treenode", default-features = false}
+common-version = {path = "../common/version", default-features = false}
+daft-context = {path = "../daft-context", default-features = false}
+daft-core = {path = "../daft-core", default-features = false}
+daft-local-execution = {path = "../daft-local-execution", default-features = false}
+daft-local-plan = {path = "../daft-local-plan", default-features = false}
+daft-logical-plan = {path = "../daft-logical-plan", default-features = false}
+daft-micropartition = {path = "../daft-micropartition", default-features = false}
+daft-recordbatch = {path = "../daft-recordbatch", default-features = false}
+daft-scan = {path = "../daft-scan", default-features = false}
+daft-schema = {path = "../daft-schema", default-features = false}
+futures = {workspace = true}
+log = {workspace = true}
+pyo3 = {workspace = true, optional = true}
+serde = {workspace = true, features = ["rc"]}
+thiserror = {workspace = true}
+tokio = {workspace = true}
+tokio-util = {workspace = true}
+tonic = {workspace = true}
+tonic-health = {workspace = true}
+
+[features]
+python = [
+  "dep:pyo3",
+  "common-daft-config/python",
+  "common-error/python",
+  "common-py-serde/python",
+  "common-runtime/python",
+  "daft-context/python",
+  "daft-core/python",
+  "daft-local-execution/python",
+  "daft-local-plan/python",
+  "daft-logical-plan/python",
+  "daft-micropartition/python",
+  "daft-recordbatch/python",
+  "daft-scan/python",
+  "daft-schema/python"
+]
+
+[lints]
+workspace = true
+
+[package]
+edition = {workspace = true}
+name = "daft-serve"
+version = {workspace = true}

@@ -41,6 +41,7 @@ impl InMemorySource {
         output_sender: Sender<PipelineMessage>,
         schema: SchemaRef,
         stats_provider: StatsProvider,
+        chunk_size: usize,
     ) -> common_runtime::RuntimeTask<DaftResult<()>> {
         let io_runtime = get_io_runtime(true);
 
@@ -60,6 +61,7 @@ impl InMemorySource {
                                     output_sender.clone(),
                                     input_id,
                                     io_stats,
+                                    chunk_size,
                                 ));
                             }
                             None => {
@@ -86,12 +88,20 @@ impl InMemorySource {
     }
 }
 
+/// Forwards a batch of in-memory partitions as pipeline morsels.
+///
+/// Partitions larger than `chunk_size` rows are re-emitted as zero-copy
+/// row-range slices of at most `chunk_size` rows, in row order. Without
+/// this, a large single-chunk partition (a cached result or a shipped
+/// partition set) reaches downstream operators as one work unit and is
+/// processed by a single worker while the rest of the pool idles.
 async fn forward_partition_batch(
     partitions: Vec<MicroPartitionRef>,
     schema: SchemaRef,
     sender: Sender<PipelineMessage>,
     input_id: InputId,
     io_stats: IOStatsRef,
+    chunk_size: usize,
 ) -> DaftResult<()> {
     if partitions.is_empty() {
         let empty = MicroPartition::empty(Some(schema));
@@ -102,18 +112,38 @@ async fn forward_partition_batch(
             })
             .await;
     } else {
-        for partition in partitions {
+        'outer: for partition in partitions {
             let owned = Arc::try_unwrap(partition).unwrap_or_else(|a| (*a).clone());
             io_stats.mark_bytes_read(owned.size_bytes());
-            if sender
-                .send(PipelineMessage::Morsel {
-                    input_id,
-                    partition: owned,
-                })
-                .await
-                .is_err()
-            {
-                break;
+            if chunk_size == 0 || owned.len() <= chunk_size {
+                if sender
+                    .send(PipelineMessage::Morsel {
+                        input_id,
+                        partition: owned,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            } else {
+                let len = owned.len();
+                let mut start = 0;
+                while start < len {
+                    let end = (start + chunk_size).min(len);
+                    let slice = owned.slice(start, end)?;
+                    if sender
+                        .send(PipelineMessage::Morsel {
+                            input_id,
+                            partition: slice,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break 'outer;
+                    }
+                    start = end;
+                }
             }
         }
     }
@@ -128,7 +158,7 @@ impl Source for InMemorySource {
         self: Box<Self>,
         _maintain_order: bool,
         stats_provider: StatsProvider,
-        _chunk_size: usize,
+        chunk_size: usize,
     ) -> DaftResult<SourceStream<'static>> {
         let (output_sender, output_receiver) = create_channel::<PipelineMessage>(1);
         let input_receiver = self.receiver;
@@ -138,6 +168,7 @@ impl Source for InMemorySource {
             output_sender,
             self.schema.clone(),
             stats_provider,
+            chunk_size,
         );
 
         let result_stream = output_receiver.into_stream().map(Ok);

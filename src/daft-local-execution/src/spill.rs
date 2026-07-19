@@ -19,6 +19,46 @@ use daft_writers::make_ipc_writer;
 /// Target on-disk size of one spill file before rotating to the next.
 const SPILL_TARGET_FILE_SIZE: usize = 64 * 1024 * 1024;
 
+/// Spill configuration and lazily created scratch space shared by every
+/// worker of one operator.
+pub(crate) struct SpillContext {
+    spill_dirs: Vec<String>,
+    compression: Option<String>,
+    scratch: std::sync::Mutex<Option<std::sync::Arc<SpillScratch>>>,
+}
+
+impl SpillContext {
+    /// Builds a context from the execution configuration; `None` when
+    /// spilling is disabled.
+    pub(crate) fn from_config(cfg: &common_daft_config::DaftExecutionConfig) -> Option<Self> {
+        cfg.enable_spilling.then(|| Self {
+            spill_dirs: cfg.spill_dirs.clone(),
+            compression: cfg.flight_shuffle_compression.clone(),
+            scratch: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Compression applied to spill files.
+    pub(crate) fn compression(&self) -> Option<String> {
+        self.compression.clone()
+    }
+
+    /// Returns the shared scratch directory, creating it on first use so
+    /// queries that never spill touch no disk.
+    pub(crate) fn scratch(&self) -> DaftResult<std::sync::Arc<SpillScratch>> {
+        let mut guard = self
+            .scratch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(scratch) = guard.as_ref() {
+            return Ok(scratch.clone());
+        }
+        let scratch = std::sync::Arc::new(SpillScratch::try_new(&self.spill_dirs)?);
+        *guard = Some(scratch.clone());
+        Ok(scratch)
+    }
+}
+
 /// A scratch directory owning every spill file written under it.
 ///
 /// The directory is created eagerly and removed (best effort) on drop, so
@@ -118,11 +158,99 @@ impl SpillScratch {
     }
 }
 
+impl SpillScratch {
+    /// Opens a streaming writer for one spill run, so a run larger than
+    /// memory can be produced incrementally.
+    ///
+    /// # Errors
+    /// Returns an error if the run directory cannot be created.
+    pub(crate) fn start_run(&self, compression: Option<String>) -> DaftResult<RunWriter> {
+        let dir = self.next_run_dir()?;
+        let dir_str = dir
+            .to_str()
+            .ok_or_else(|| {
+                DaftError::ValueError(format!(
+                    "spill directory path is not valid UTF-8: {}",
+                    dir.display()
+                ))
+            })?
+            .to_string();
+        let (tx, mut rx) = crate::channel::create_channel::<MicroPartition>(2);
+        let task = get_io_runtime(true).spawn(async move {
+            let mut writer =
+                make_ipc_writer(&dir_str, SPILL_TARGET_FILE_SIZE, compression.as_deref())?;
+            let mut num_rows = 0usize;
+            let mut size_bytes = 0usize;
+            while let Some(part) = rx.recv().await {
+                num_rows += part.len();
+                size_bytes += part.size_bytes();
+                writer.write(part).await?;
+            }
+            let path_batches = writer.close().await?;
+            let mut file_paths = Vec::with_capacity(path_batches.len());
+            for batch in path_batches {
+                let path = batch.get_column(0).utf8()?.get(0).ok_or_else(|| {
+                    DaftError::InternalError(
+                        "spill writer reported a file without a path".to_string(),
+                    )
+                })?;
+                file_paths.push(path.to_string());
+            }
+            Ok(SpilledRun {
+                file_paths,
+                num_rows,
+                size_bytes,
+            })
+        });
+        Ok(RunWriter {
+            tx: Some(tx),
+            task: Some(task),
+        })
+    }
+}
+
 impl Drop for SpillScratch {
     fn drop(&mut self) {
         if let Err(e) = std::fs::remove_dir_all(&self.root) {
-            log::warn!("failed to remove spill scratch {}: {e}", self.root.display());
+            log::warn!(
+                "failed to remove spill scratch {}: {e}",
+                self.root.display()
+            );
         }
+    }
+}
+
+/// Incremental writer for one spill run; partitions stream to disk with
+/// bounded buffering between the producer and the file writer.
+pub(crate) struct RunWriter {
+    tx: Option<crate::channel::Sender<MicroPartition>>,
+    task: Option<common_runtime::RuntimeTask<DaftResult<SpilledRun>>>,
+}
+
+impl RunWriter {
+    /// Appends one partition to the run.
+    ///
+    /// # Errors
+    /// Returns an error if the writer task has already failed.
+    pub(crate) async fn push(&self, part: MicroPartition) -> DaftResult<()> {
+        let tx = self.tx.as_ref().ok_or_else(|| {
+            DaftError::InternalError("spill run writer used after finish".to_string())
+        })?;
+        tx.send(part)
+            .await
+            .map_err(|_| DaftError::InternalError("spill run writer terminated early".to_string()))
+    }
+
+    /// Completes the run and returns its handle.
+    ///
+    /// # Errors
+    /// Returns an error if any write failed.
+    pub(crate) async fn finish(mut self) -> DaftResult<SpilledRun> {
+        drop(self.tx.take());
+        let task = self.task.take().ok_or_else(|| {
+            DaftError::InternalError("spill run writer finished twice".to_string())
+        })?;
+        task.await?
     }
 }
 
@@ -160,6 +288,50 @@ impl SpilledRun {
             })
             .await?
     }
+
+    /// Opens a streaming cursor over the run, yielding record batches in
+    /// write order one file at a time, so a run never needs to be resident
+    /// in memory all at once.
+    pub(crate) fn cursor(self) -> RunCursor {
+        RunCursor {
+            file_paths: self.file_paths.into_iter().collect(),
+            pending: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+/// Streaming reader over one spill run: batches come back in write order,
+/// loading one file at a time on the IO pool.
+pub(crate) struct RunCursor {
+    file_paths: std::collections::VecDeque<String>,
+    pending: std::collections::VecDeque<daft_recordbatch::RecordBatch>,
+}
+
+impl RunCursor {
+    /// Returns the next batch of the run, or `None` when exhausted.
+    ///
+    /// # Errors
+    /// Returns an error if a file cannot be read or decoded.
+    pub(crate) async fn next_batch(&mut self) -> DaftResult<Option<daft_recordbatch::RecordBatch>> {
+        loop {
+            if let Some(batch) = self.pending.pop_front() {
+                if batch.is_empty() {
+                    continue;
+                }
+                return Ok(Some(batch));
+            }
+            let Some(path) = self.file_paths.pop_front() else {
+                return Ok(None);
+            };
+            let part = get_io_runtime(true)
+                .spawn(async move {
+                    let bytes = std::fs::read(&path)?;
+                    MicroPartition::read_from_ipc_stream(&bytes)
+                })
+                .await??;
+            self.pending.extend(part.record_batches().iter().cloned());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -175,8 +347,7 @@ mod tests {
     use super::*;
 
     fn part(values: Vec<i64>) -> MicroPartition {
-        let series =
-            Int64Array::from_vec("v", values).into_series();
+        let series = Int64Array::from_vec("v", values).into_series();
         let batch = RecordBatch::from_nonempty_columns(vec![series]).unwrap();
         MicroPartition::new_loaded(batch.schema.clone(), Arc::new(vec![batch]), None)
     }
@@ -184,14 +355,10 @@ mod tests {
     #[tokio::test]
     async fn spill_and_read_back_round_trips() {
         let tmp = tempfile::tempdir().unwrap();
-        let scratch =
-            SpillScratch::try_new(&[tmp.path().to_str().unwrap().to_string()]).unwrap();
+        let scratch = SpillScratch::try_new(&[tmp.path().to_str().unwrap().to_string()]).unwrap();
 
         let parts = vec![part(vec![1, 2, 3]), part(vec![4, 5])];
-        let run = scratch
-            .spill(parts, Some("lz4".to_string()))
-            .await
-            .unwrap();
+        let run = scratch.spill(parts, Some("lz4".to_string())).await.unwrap();
         assert_eq!(run.num_rows(), 5);
 
         let back = run.read_back().await.unwrap();
@@ -212,10 +379,7 @@ mod tests {
         let root = {
             let scratch =
                 SpillScratch::try_new(&[tmp.path().to_str().unwrap().to_string()]).unwrap();
-            let run = scratch
-                .spill(vec![part(vec![7])], None)
-                .await
-                .unwrap();
+            let run = scratch.spill(vec![part(vec![7])], None).await.unwrap();
             assert_eq!(run.num_rows(), 1);
             scratch.root.clone()
         };

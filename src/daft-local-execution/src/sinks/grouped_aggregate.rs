@@ -22,7 +22,7 @@ use crate::{
     ExecutionTaskSpawner,
     pipeline::{InputId, NodeName},
     resource_manager::{MemoryManager, SpillBudget},
-    spill::{SpillScratch, SpilledRun},
+    spill::{SpillContext, SpilledRun},
 };
 
 #[derive(Clone, Debug)]
@@ -79,8 +79,9 @@ impl AggStrategy {
             if state.unaggregated_size + p.len() >= partial_agg_threshold {
                 let mut unaggregated = std::mem::take(&mut state.unaggregated);
                 for drained in &unaggregated {
-                    state.buffered_bytes =
-                        state.buffered_bytes.saturating_sub(drained.size_bytes() as u64);
+                    state.buffered_bytes = state
+                        .buffered_bytes
+                        .saturating_sub(drained.size_bytes() as u64);
                 }
                 state.unaggregated_size = 0;
                 unaggregated.push(p);
@@ -266,17 +267,11 @@ impl GroupedAggregateState {
             };
             let (partial, raw, drained) = state.drain_buffered();
             if !partial.is_empty() {
-                let run = spill
-                    .scratch()?
-                    .spill(partial, spill.compression.clone())
-                    .await?;
+                let run = spill.scratch()?.spill(partial, spill.compression()).await?;
                 state.spilled_partial.push(run);
             }
             if !raw.is_empty() {
-                let run = spill
-                    .scratch()?
-                    .spill(raw, spill.compression.clone())
-                    .await?;
+                let run = spill.scratch()?.spill(raw, spill.compression()).await?;
                 state.spilled_raw.push(run);
             }
             // Release only the shed bytes that were previously accounted;
@@ -337,31 +332,6 @@ impl GroupedAggregateState {
         };
         *self = Self::Done;
         res
-    }
-}
-
-/// Spill configuration and lazily created scratch space shared by every
-/// worker of one aggregation.
-struct SpillContext {
-    spill_dirs: Vec<String>,
-    compression: Option<String>,
-    scratch: Mutex<Option<Arc<SpillScratch>>>,
-}
-
-impl SpillContext {
-    /// Returns the shared scratch directory, creating it on first use so
-    /// queries that never spill touch no disk.
-    fn scratch(&self) -> DaftResult<Arc<SpillScratch>> {
-        let mut guard = self
-            .scratch
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(scratch) = guard.as_ref() {
-            return Ok(scratch.clone());
-        }
-        let scratch = Arc::new(SpillScratch::try_new(&self.spill_dirs)?);
-        *guard = Some(scratch.clone());
-        Ok(scratch)
     }
 }
 
@@ -449,11 +419,7 @@ impl GroupedAggregateSink {
                 final_agg_exprs,
                 final_group_by,
                 final_projections,
-                spill: cfg.enable_spilling.then(|| SpillContext {
-                    spill_dirs: cfg.spill_dirs.clone(),
-                    compression: cfg.flight_shuffle_compression.clone(),
-                    scratch: Mutex::new(None),
-                }),
+                spill: SpillContext::from_config(cfg),
             }),
             partial_agg_threshold: cfg.partial_aggregation_threshold,
             high_cardinality_threshold_ratio: cfg.high_cardinality_aggregation_threshold,

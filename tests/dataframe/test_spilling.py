@@ -113,3 +113,70 @@ def test_varied_budgets_produce_identical_results(tmp_path: pathlib.Path, mem_li
         spill_dir=str(tmp_path),
     )
     assert pressured == unpressured
+
+
+_SORT_SCRIPT = """
+import json
+
+import numpy as np
+import pyarrow as pa
+
+import daft
+from daft import col
+
+rng = np.random.default_rng(23)
+n = 2_000_000
+df = daft.from_arrow(
+    pa.table(
+        {
+            "k": pa.array(rng.integers(0, 10_000_000, n)),
+            "v": pa.array(rng.integers(0, 1_000, n)),
+        }
+    )
+).collect()
+
+out = df.sort("k").to_pydict()
+ks = out["k"]
+checksum = {
+    "rows": len(ks),
+    "is_sorted": all(a <= b for a, b in zip(ks, ks[1:])),
+    "head": ks[:3],
+    "tail": ks[-3:],
+    "sum_v": int(sum(out["v"])),
+}
+print("RESULT " + json.dumps(checksum))
+"""
+
+
+def _run_sort(env_overrides: dict[str, str], spill_dir: str | None = None) -> dict[str, object]:
+    import json
+    import os
+
+    script = _SORT_SCRIPT
+    if spill_dir is not None:
+        script = script.replace(
+            "import daft\n",
+            f"import daft\ndaft.set_execution_config(spill_dirs=[{spill_dir!r}])\n",
+        )
+    out = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "DAFT_RUNNER": "native", **env_overrides},
+        timeout=600,
+        check=False,
+    )
+    for line in out.stdout.splitlines():
+        if line.startswith("RESULT "):
+            return json.loads(line[len("RESULT ") :])
+    raise AssertionError(f"no result line; stdout={out.stdout!r} stderr={out.stderr[-2000:]!r}")
+
+
+def test_sort_under_tiny_memory_budget_matches_unpressured(tmp_path: pathlib.Path) -> None:
+    unpressured = _run_sort({})
+    pressured = _run_sort({"DAFT_MEMORY_LIMIT": str(30 * 1024 * 1024)}, spill_dir=str(tmp_path))
+
+    assert pressured == unpressured
+    assert pressured["is_sorted"] is True
+    leftovers = list((tmp_path / "daft-spill").glob("*")) if (tmp_path / "daft-spill").exists() else []
+    assert leftovers == []

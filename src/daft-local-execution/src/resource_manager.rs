@@ -132,8 +132,7 @@ impl MemoryManager {
         if bytes > 0 {
             {
                 let mut state = self.state.lock().unwrap();
-                state.available_bytes =
-                    (state.available_bytes + bytes).min(self.total_bytes);
+                state.available_bytes = (state.available_bytes + bytes).min(self.total_bytes);
             }
             self.notify.notify_waiters();
         }

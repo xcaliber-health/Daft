@@ -109,9 +109,27 @@ Prerequisite for per-tenant memory caps and for large-query robustness.
   at normal budgets — flagged deltas on the two shortest queries were
   noise with mixed signs under attribution).
 
+**Slice 2 landed: external sort.**
+- Streaming run writer and streaming run cursor on the spill scratch
+  (bounded channel to the IO pool; batches read back one file at a time).
+- Sorted-run merge (`sorted_merge`): pairwise two-cursor streaming merges
+  using the engine's cross-batch row comparator; ties prefer the earlier
+  run (stable); intermediate merged runs stream back to disk; peak memory
+  is one batch per active side plus the emitted chunk.
+- Sort sink: buffered morsels are accounted; on budget denial the entire
+  buffer (including the triggering morsel) is sorted and shed as one
+  sorted run; finalize merges spilled runs with the sorted in-memory
+  remainder. The no-pressure path is byte-identical to before.
+- Verified: 2M-row sort under a 30MB budget produces output identical to
+  the unpressured run (fully sorted, spill events observed, scratch
+  cleaned); merge unit tests cover three-way merges with an intermediate
+  disk pass, descending + nulls-first, and empty/single-run edges.
+- Known bound: the sink's output contract still materializes the final
+  sorted result in memory; true end-to-end streaming needs a
+  streaming-output sink API (future work).
+
 Remaining slices:
-1. Sort spill (external merge — requires sorted-run merge at finalize)
-   and join-build spill.
+1. Join-build spill.
 2. Cross-query negotiation: a central coordinator re-distributes the global
    budget across concurrent queries' registered operators (grant increments
    where they help throughput most; force spilling elsewhere) — the model

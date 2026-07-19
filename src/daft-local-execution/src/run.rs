@@ -296,7 +296,9 @@ fn next_auto_fingerprint() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-fn parse_context(ctx: Option<&HashMap<String, String>>) -> (QueryID, u64, Option<u32>) {
+fn parse_context(
+    ctx: Option<&HashMap<String, String>>,
+) -> (QueryID, u64, Option<u32>, Option<u64>) {
     let query_id = ctx
         .as_ref()
         .and_then(|c| c.get("query_id"))
@@ -311,8 +313,14 @@ fn parse_context(ctx: Option<&HashMap<String, String>>) -> (QueryID, u64, Option
         .as_ref()
         .and_then(|c| c.get("task_id"))
         .and_then(|s| s.parse::<u32>().ok());
+    // Ceiling on this query's combined buffered bytes; set by an embedding
+    // server, never by the client-shipped configuration.
+    let memory_cap = ctx
+        .as_ref()
+        .and_then(|c| c.get("memory_cap_bytes"))
+        .and_then(|s| s.parse::<u64>().ok());
 
-    (query_id, fingerprint, task_id)
+    (query_id, fingerprint, task_id, memory_cap)
 }
 
 // TODO: fix configuration for events
@@ -336,11 +344,13 @@ async fn run_execution_loop(
     input_senders: Arc<HashMap<SourceId, crate::input_sender::InputSender>>,
     pipeline: Box<dyn crate::pipeline::PipelineNode>,
     maintain_order: bool,
+    memory_cap: Option<u64>,
 ) -> DaftResult<()> {
     let stats_manager_handle = stats_manager.handle();
     let memory_manager = get_or_init_memory_manager();
-    let mut runtime_handle =
-        ExecutionRuntimeContext::new(memory_manager.clone(), stats_manager_handle);
+    let memory_scope =
+        crate::resource_manager::QueryMemoryScope::new(memory_manager.clone(), memory_cap);
+    let mut runtime_handle = ExecutionRuntimeContext::new(memory_scope, stats_manager_handle);
     let mut output_receiver = pipeline.start(maintain_order, &mut runtime_handle)?;
 
     let mut message_router = MessageRouter::new();
@@ -455,7 +465,8 @@ impl NativeExecutor {
         input_id: InputId,
         maintain_order: bool,
     ) -> DaftResult<(u64, BoxFuture<'static, DaftResult<ExecutionEngineResult>>)> {
-        let (query_id, fingerprint, task_id) = parse_context(additional_context.as_ref());
+        let (query_id, fingerprint, task_id, memory_cap) =
+            parse_context(additional_context.as_ref());
 
         if self.is_flotilla_worker {
             debug_assert_eq!(
@@ -521,6 +532,7 @@ impl NativeExecutor {
                 input_senders,
                 pipeline,
                 maintain_order,
+                memory_cap,
             );
 
             let task_handle = RuntimeTask::new(handle, task);

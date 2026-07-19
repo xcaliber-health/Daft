@@ -29,7 +29,7 @@ use arc_swap::ArcSwap;
 use common_error::{DaftError, DaftResult};
 use common_runtime::{JoinSet, RuntimeRef, RuntimeTask};
 use console::style;
-use resource_manager::MemoryManager;
+use resource_manager::QueryMemoryScope;
 pub use run::{ExecutionEngineResult, NativeExecutor};
 
 /// Helpers for distributed execution tests.
@@ -91,19 +91,16 @@ impl<T> Future for SpawnedTask<T> {
 
 pub(crate) struct ExecutionRuntimeContext {
     worker_set: JoinSet<Result<()>>,
-    memory_manager: Arc<MemoryManager>,
+    memory_scope: QueryMemoryScope,
     stats_manager: RuntimeStatsManagerHandle,
 }
 
 impl ExecutionRuntimeContext {
     #[must_use]
-    pub fn new(
-        memory_manager: Arc<MemoryManager>,
-        stats_manager: RuntimeStatsManagerHandle,
-    ) -> Self {
+    pub fn new(memory_scope: QueryMemoryScope, stats_manager: RuntimeStatsManagerHandle) -> Self {
         Self {
             worker_set: JoinSet::new(),
-            memory_manager,
+            memory_scope,
             stats_manager,
         }
     }
@@ -149,8 +146,8 @@ impl ExecutionRuntimeContext {
     }
 
     #[must_use]
-    pub(crate) fn memory_manager(&self) -> Arc<MemoryManager> {
-        self.memory_manager.clone()
+    pub(crate) fn memory_manager(&self) -> QueryMemoryScope {
+        self.memory_scope.clone()
     }
 
     #[must_use]
@@ -162,27 +159,27 @@ impl ExecutionRuntimeContext {
 #[derive(Clone)]
 pub(crate) struct ExecutionTaskSpawner {
     runtime_ref: RuntimeRef,
-    memory_manager: Arc<MemoryManager>,
+    memory_scope: QueryMemoryScope,
     outer_span: tracing::Span,
 }
 
 impl ExecutionTaskSpawner {
     pub fn new(
         runtime_ref: RuntimeRef,
-        memory_manager: Arc<MemoryManager>,
+        memory_scope: QueryMemoryScope,
         span: tracing::Span,
     ) -> Self {
         Self {
             runtime_ref,
-            memory_manager,
+            memory_scope,
             outer_span: span,
         }
     }
 
-    /// Shared memory budget, for operators that account and spill their
-    /// buffered state.
-    pub(crate) fn memory_manager(&self) -> &Arc<MemoryManager> {
-        &self.memory_manager
+    /// This query's view of the memory budget, for operators that account
+    /// and spill their buffered state.
+    pub(crate) fn memory_scope(&self) -> &QueryMemoryScope {
+        &self.memory_scope
     }
 
     pub fn spawn_with_memory_request<F, O>(
@@ -196,9 +193,9 @@ impl ExecutionTaskSpawner {
         O: Send + 'static,
     {
         let outer_span = self.outer_span.clone();
-        let memory_manager = self.memory_manager.clone();
+        let memory_scope = self.memory_scope.clone();
         self.runtime_ref.spawn(async move {
-            let _permit = memory_manager.request_bytes(memory_request).await?;
+            let _permit = memory_scope.manager().request_bytes(memory_request).await?;
             future.instrument(span).instrument(outer_span).await
         })
     }

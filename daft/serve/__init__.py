@@ -100,6 +100,9 @@ class TenantSpec:
         disables the limit.
     max_pset_bytes:
         Cap on in-memory data shipped with one of this tenant's queries.
+    memory_cap_bytes:
+        Ceiling on buffered execution memory per query for this tenant;
+        queries over it spill to disk rather than grow.
     """
 
     name: str
@@ -108,6 +111,7 @@ class TenantSpec:
     queue_timeout_secs: int | None = None
     query_timeout_secs: int | None = None
     max_pset_bytes: int | None = None
+    memory_cap_bytes: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -136,6 +140,9 @@ class ServeSettings:
     query_timeout_secs:
         Wall-clock seconds one query may execute before being cancelled;
         ``0`` disables the limit.
+    query_memory_cap_bytes:
+        Ceiling on buffered execution memory per query; ``0`` disables it.
+        Queries over the ceiling spill to disk rather than grow.
     tenants:
         Named tenants sharing this server. When non-empty, every request
         must present one of the tenant tokens and ``token`` is ignored.
@@ -152,6 +159,7 @@ class ServeSettings:
     max_pset_bytes: int = DEFAULT_MAX_PSET_BYTES
     disable_plan_payload: bool = False
     query_timeout_secs: int = DEFAULT_QUERY_TIMEOUT_SECS
+    query_memory_cap_bytes: int = 0
     tenants: tuple[TenantSpec, ...] = ()
     catalogs: tuple[CatalogSpec, ...] = ()
 
@@ -192,6 +200,7 @@ def _parse_tenants(raw: dict[str, object]) -> tuple[TenantSpec, ...]:
                 queue_timeout_secs=_opt_int("queue_timeout_secs"),
                 query_timeout_secs=_opt_int("query_timeout_secs"),
                 max_pset_bytes=_opt_int("max_pset_bytes"),
+                memory_cap_bytes=_opt_int("memory_cap_bytes"),
             )
         )
     return tuple(tenants)
@@ -236,6 +245,7 @@ def _parse_settings(raw: dict[str, object], token: str | None) -> ServeSettings:
         max_pset_bytes=_int("max_pset_bytes", DEFAULT_MAX_PSET_BYTES),
         disable_plan_payload=bool(raw.get("disable_plan_payload", False)),
         query_timeout_secs=_int("query_timeout_secs", DEFAULT_QUERY_TIMEOUT_SECS),
+        query_memory_cap_bytes=_int("query_memory_cap_bytes", 0),
         tenants=_parse_tenants(raw),
         catalogs=tuple(catalogs),
     )
@@ -319,6 +329,7 @@ def start_server(settings: ServeSettings) -> DaftServeServer:
         max_pset_bytes=settings.max_pset_bytes,
         disable_plan_payload=settings.disable_plan_payload,
         query_timeout_secs=settings.query_timeout_secs,
+        query_memory_cap_bytes=settings.query_memory_cap_bytes,
         tenants=[
             (
                 tenant.name,
@@ -327,6 +338,7 @@ def start_server(settings: ServeSettings) -> DaftServeServer:
                 tenant.queue_timeout_secs,
                 tenant.query_timeout_secs,
                 tenant.max_pset_bytes,
+                tenant.memory_cap_bytes,
             )
             for tenant in settings.tenants
         ],

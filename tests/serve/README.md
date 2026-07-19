@@ -49,7 +49,7 @@ means the remote result is asserted equal to the in-process result.
 | per-tenant payload cap | typed size error; other tenants unaffected | `test_tenancy.py::test_tenant_payload_cap_*` |
 | cancel scoped to owning tenant | cross-tenant cancel sees "not found" | `test_tenancy.py::test_cancel_is_scoped_*`, `registry.rs` unit tests |
 | legacy single-token / insecure modes | unchanged | `test_auth_limits.py` |
-| per-tenant memory caps | not yet — requires engine memory accounting + spilling (roadmap Phase C); use dedicated pods for hard memory isolation | `docs/serve-roadmap.md` |
+| per-tenant memory caps (`memory_cap_bytes`) | enforced per query ahead of the global budget; over-cap queries spill to disk with exact results | `test_tenancy.py::test_tenant_memory_cap_*` |
 
 ## Known limitations (by design)
 

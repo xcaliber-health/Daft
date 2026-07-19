@@ -172,9 +172,10 @@ pub async fn run_query(
     guard: QueryGuard,
     tx: async_channel::Sender<Result<FlightData, Status>>,
     query_timeout_secs: u64,
+    memory_cap_bytes: Option<u64>,
 ) {
     let query_id = request.query_id.clone();
-    let inner = run_query_inner(request, sql_session, &cancel, &tx);
+    let inner = run_query_inner(request, sql_session, &cancel, &tx, memory_cap_bytes);
     let result = if query_timeout_secs > 0 {
         match tokio::time::timeout(std::time::Duration::from_secs(query_timeout_secs), inner).await
         {
@@ -205,6 +206,7 @@ async fn run_query_inner(
     sql_session: Option<Arc<Py<PyAny>>>,
     cancel: &CancellationToken,
     tx: &async_channel::Sender<Result<FlightData, Status>>,
+    memory_cap_bytes: Option<u64>,
 ) -> ServeResult<()> {
     let exec_config = resolve_exec_config(&request)?;
     let maintain_order = exec_config.maintain_order;
@@ -270,7 +272,13 @@ async fn run_query_inner(
     let ctx = daft_context::get_context();
     let subscribers = ctx.subscribers();
     let mut executor = NativeExecutor::new(false, "");
-    let context = HashMap::from([("query_id".to_string(), query_id.clone())]);
+    let mut context = HashMap::from([("query_id".to_string(), query_id.clone())]);
+    if let Some(cap) = memory_cap_bytes {
+        // Server-resolved ceiling; deliberately not part of the
+        // client-shipped configuration so callers cannot lift their own
+        // limits.
+        context.insert("memory_cap_bytes".to_string(), cap.to_string());
+    }
     let input_id = 0;
     let (fingerprint, enqueue_future) = executor.run(
         &local_plan,

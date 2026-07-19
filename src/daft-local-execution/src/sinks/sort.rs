@@ -14,7 +14,7 @@ use super::blocking_sink::{
 use crate::{
     ExecutionTaskSpawner,
     pipeline::{InputId, NodeName},
-    resource_manager::{MemoryManager, SpillBudget},
+    resource_manager::{QueryMemoryScope, SpillBudget},
     sorted_merge::{MergeOrdering, MergeSource, merge_sorted_runs},
     spill::{SpillContext, SpilledRun},
 };
@@ -36,7 +36,7 @@ impl SortState {
         &mut self,
         part: MicroPartition,
         params: &SortParams,
-        memory_manager: &Arc<MemoryManager>,
+        memory_scope: &QueryMemoryScope,
     ) -> DaftResult<()> {
         let Self::Building {
             parts,
@@ -54,7 +54,7 @@ impl SortState {
         let Some(spill) = &params.spill else {
             return Ok(());
         };
-        let budget = budget.get_or_insert_with(|| SpillBudget::new(memory_manager.clone()));
+        let budget = budget.get_or_insert_with(|| SpillBudget::new(memory_scope.clone()));
         // Honor any request from concurrent holders to shed toward the
         // fair share, then account this morsel's growth.
         let requested_shed = budget.take_shed_request();
@@ -141,11 +141,11 @@ impl BlockingSink for SortSink {
         spawner: &ExecutionTaskSpawner,
     ) -> BlockingSinkSinkResult<Self> {
         let params = self.params.clone();
-        let memory_manager = spawner.memory_manager().clone();
+        let memory_scope = spawner.memory_scope().clone();
         spawner
             .spawn(
                 async move {
-                    state.push(input, &params, &memory_manager).await?;
+                    state.push(input, &params, &memory_scope).await?;
                     Ok(state)
                 },
                 Span::current(),

@@ -21,7 +21,7 @@ use super::blocking_sink::{
 use crate::{
     ExecutionTaskSpawner,
     pipeline::{InputId, NodeName},
-    resource_manager::{MemoryManager, SpillBudget},
+    resource_manager::{QueryMemoryScope, SpillBudget},
     spill::{SpillContext, SpilledRun},
 };
 
@@ -184,7 +184,7 @@ impl GroupedAggregateState {
         input: MicroPartition,
         params: &GroupedAggregateParams,
         global_strategy_lock: &Arc<Mutex<Option<AggStrategy>>>,
-        memory_manager: &Arc<MemoryManager>,
+        memory_scope: &QueryMemoryScope,
     ) -> DaftResult<()> {
         let Self::Accumulating {
             inner_states,
@@ -215,7 +215,7 @@ impl GroupedAggregateState {
         }
 
         if let Some(spill) = &params.spill {
-            let budget = budget.get_or_insert_with(|| SpillBudget::new(memory_manager.clone()));
+            let budget = budget.get_or_insert_with(|| SpillBudget::new(memory_scope.clone()));
             Self::reconcile_and_maybe_spill(inner_states, budget, buffered_total, spill).await?;
         }
         Ok(())
@@ -483,12 +483,12 @@ impl BlockingSink for GroupedAggregateSink {
     ) -> BlockingSinkSinkResult<Self> {
         let params = self.grouped_aggregate_params.clone();
         let strategy_lock = self.global_strategy_lock.clone();
-        let memory_manager = spawner.memory_manager().clone();
+        let memory_scope = spawner.memory_scope().clone();
         spawner
             .spawn(
                 async move {
                     state
-                        .push(input, &params, &strategy_lock, &memory_manager)
+                        .push(input, &params, &strategy_lock, &memory_scope)
                         .await?;
                     Ok(state)
                 },

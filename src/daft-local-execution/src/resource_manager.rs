@@ -191,6 +191,75 @@ impl MemoryManager {
     }
 }
 
+/// Per-query view of the memory budget: the shared global manager plus an
+/// optional ceiling on this query's combined holdings.
+///
+/// The ceiling is enforced before the global pool, so one query (or the
+/// tenant it belongs to) cannot monopolize a shared process even when the
+/// process-wide budget has room.
+#[derive(Clone)]
+pub(crate) struct QueryMemoryScope {
+    manager: Arc<MemoryManager>,
+    group: Option<Arc<QueryGroup>>,
+}
+
+/// Combined holdings of one query's budget holders against its ceiling.
+struct QueryGroup {
+    cap: u64,
+    held: AtomicU64,
+}
+
+impl QueryMemoryScope {
+    /// Creates a scope over the shared manager with an optional per-query
+    /// ceiling; `None` (or zero) means only the global budget applies.
+    pub(crate) fn new(manager: Arc<MemoryManager>, cap: Option<u64>) -> Self {
+        Self {
+            manager,
+            group: cap.filter(|cap| *cap > 0).map(|cap| {
+                Arc::new(QueryGroup {
+                    cap,
+                    held: AtomicU64::new(0),
+                })
+            }),
+        }
+    }
+
+    /// The shared process-wide manager.
+    pub(crate) fn manager(&self) -> &Arc<MemoryManager> {
+        &self.manager
+    }
+
+    /// Attempts to charge `bytes` against the per-query ceiling.
+    /// Returns whether it fit (always true without a ceiling).
+    fn try_charge_group(&self, bytes: u64) -> bool {
+        let Some(group) = &self.group else {
+            return true;
+        };
+        group
+            .held
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                held.checked_add(bytes).filter(|new| *new <= group.cap)
+            })
+            .is_ok()
+    }
+
+    fn charge_group_unchecked(&self, bytes: u64) {
+        if let Some(group) = &self.group {
+            group.held.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    fn uncharge_group(&self, bytes: u64) {
+        if let Some(group) = &self.group {
+            let _ = group
+                .held
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                    Some(held.saturating_sub(bytes))
+                });
+        }
+    }
+}
+
 /// Owned, growable share of the memory budget held by an operator that can
 /// spill its buffered state to disk.
 ///
@@ -199,30 +268,36 @@ impl MemoryManager {
 /// [`Self::shrink`]. All held bytes return to the budget on drop, so an
 /// abandoned or failed query cannot leak accounting.
 pub(crate) struct SpillBudget {
-    manager: Arc<MemoryManager>,
+    scope: QueryMemoryScope,
     slot: Arc<HolderSlot>,
     held: u64,
 }
 
 impl SpillBudget {
-    /// Creates an empty, shed-capable budget share against the manager.
-    pub(crate) fn new(manager: Arc<MemoryManager>) -> Self {
-        Self::with_shed_capability(manager, true)
+    /// Creates an empty, shed-capable budget share within the scope.
+    pub(crate) fn new(scope: QueryMemoryScope) -> Self {
+        Self::with_shed_capability(scope, true)
     }
 
     /// Creates an empty budget share, declaring whether the holder can shed
     /// its state to disk when asked. Holders that cannot shed are exempt
     /// from rebalancing requests, and their held bytes shrink the pool the
     /// remaining holders divide.
-    pub(crate) fn with_shed_capability(manager: Arc<MemoryManager>, can_shed: bool) -> Self {
+    pub(crate) fn with_shed_capability(scope: QueryMemoryScope, can_shed: bool) -> Self {
         let slot = Arc::new(HolderSlot {
             held: AtomicU64::new(0),
             shed_requested: AtomicU64::new(0),
             can_shed,
         });
-        manager.state.lock().unwrap().holders.push(slot.clone());
+        scope
+            .manager
+            .state
+            .lock()
+            .unwrap()
+            .holders
+            .push(slot.clone());
         Self {
-            manager,
+            scope,
             slot,
             held: 0,
         }
@@ -236,12 +311,19 @@ impl SpillBudget {
     /// shed, so sustained contention converges toward equal shares.
     #[must_use]
     pub(crate) fn try_grow(&mut self, bytes: u64) -> bool {
-        if self.manager.try_reserve(bytes) {
+        // The per-query ceiling comes first: exceeding it must trigger this
+        // query's own shedding regardless of global headroom, and asking
+        // other queries to rebalance would not help.
+        if !self.scope.try_charge_group(bytes) {
+            return false;
+        }
+        if self.scope.manager.try_reserve(bytes) {
             self.held += bytes;
             self.slot.held.store(self.held, Ordering::Relaxed);
             true
         } else {
-            self.manager.request_rebalance();
+            self.scope.uncharge_group(bytes);
+            self.scope.manager.request_rebalance();
             false
         }
     }
@@ -252,7 +334,8 @@ impl SpillBudget {
     /// unfunded: execution must proceed, so the share is recorded anyway to
     /// keep pressure on other operators.
     pub(crate) fn grow_unchecked(&mut self, bytes: u64) {
-        let mut state = self.manager.state.lock().unwrap();
+        self.scope.charge_group_unchecked(bytes);
+        let mut state = self.scope.manager.state.lock().unwrap();
         state.available_bytes = state.available_bytes.saturating_sub(bytes);
         drop(state);
         self.held += bytes;
@@ -264,7 +347,8 @@ impl SpillBudget {
         let returned = bytes.min(self.held);
         self.held -= returned;
         self.slot.held.store(self.held, Ordering::Relaxed);
-        self.manager.release(returned);
+        self.scope.uncharge_group(returned);
+        self.scope.manager.release(returned);
     }
 
     /// Takes and clears any outstanding request for this holder to shed
@@ -278,10 +362,11 @@ impl SpillBudget {
 impl Drop for SpillBudget {
     fn drop(&mut self) {
         {
-            let mut state = self.manager.state.lock().unwrap();
+            let mut state = self.scope.manager.state.lock().unwrap();
             state.holders.retain(|slot| !Arc::ptr_eq(slot, &self.slot));
         }
-        self.manager.release(self.held);
+        self.scope.uncharge_group(self.held);
+        self.scope.manager.release(self.held);
     }
 }
 
@@ -293,12 +378,56 @@ mod tests {
 
     use super::*;
 
+    fn scope(manager: &Arc<MemoryManager>) -> QueryMemoryScope {
+        QueryMemoryScope::new(manager.clone(), None)
+    }
+
+    #[test]
+    fn per_query_cap_denies_before_the_global_pool() {
+        let manager = Arc::new(MemoryManager::new());
+        let capped = QueryMemoryScope::new(manager.clone(), Some(100));
+
+        let mut budget = SpillBudget::new(capped.clone());
+        assert!(budget.try_grow(80));
+        // Global pool has room, but the query ceiling does not.
+        assert!(!budget.try_grow(30));
+        budget.shrink(50);
+        assert!(budget.try_grow(30));
+
+        // A second holder in the same scope shares the ceiling.
+        let mut sibling = SpillBudget::new(capped);
+        assert!(!sibling.try_grow(50));
+        assert!(sibling.try_grow(40));
+    }
+
+    #[test]
+    fn cap_denial_leaves_global_accounting_untouched() {
+        let manager = Arc::new(MemoryManager::new());
+        let total = manager.total_bytes;
+        let capped = QueryMemoryScope::new(manager.clone(), Some(10));
+        let mut budget = SpillBudget::new(capped);
+        assert!(!budget.try_grow(100));
+        assert_eq!(manager.state.lock().unwrap().available_bytes, total);
+    }
+
+    #[test]
+    fn dropped_budget_releases_its_group_charge() {
+        let manager = Arc::new(MemoryManager::new());
+        let capped = QueryMemoryScope::new(manager.clone(), Some(100));
+        {
+            let mut budget = SpillBudget::new(capped.clone());
+            assert!(budget.try_grow(90));
+        }
+        let mut fresh = SpillBudget::new(capped);
+        assert!(fresh.try_grow(90));
+    }
+
     #[test]
     fn spill_budget_grow_shrink_and_drop_release() {
         let manager = Arc::new(MemoryManager::new());
         let total = manager.total_bytes;
 
-        let mut budget = SpillBudget::new(manager.clone());
+        let mut budget = SpillBudget::new(scope(&manager));
         assert!(budget.try_grow(total / 2));
         assert!(!budget.try_grow(total)); // over budget → pressure signal
         budget.shrink(total / 4);
@@ -317,7 +446,7 @@ mod tests {
     fn spill_budget_unchecked_growth_saturates() {
         let manager = Arc::new(MemoryManager::new());
         let total = manager.total_bytes;
-        let mut budget = SpillBudget::new(manager.clone());
+        let mut budget = SpillBudget::new(scope(&manager));
         budget.grow_unchecked(total + 100);
         {
             let state = manager.state.lock().unwrap();
@@ -335,7 +464,7 @@ mod tests {
     fn shrink_beyond_held_is_clamped() {
         let manager = Arc::new(MemoryManager::new());
         let total = manager.total_bytes;
-        let mut budget = SpillBudget::new(manager.clone());
+        let mut budget = SpillBudget::new(scope(&manager));
         assert!(budget.try_grow(100));
         budget.shrink(1000);
         let state = manager.state.lock().unwrap();
@@ -347,10 +476,10 @@ mod tests {
         let manager = Arc::new(MemoryManager::new());
         let total = manager.total_bytes;
 
-        let mut hog = SpillBudget::new(manager.clone());
+        let mut hog = SpillBudget::new(scope(&manager));
         assert!(hog.try_grow(total * 8 / 10));
 
-        let mut late = SpillBudget::new(manager.clone());
+        let mut late = SpillBudget::new(scope(&manager));
         assert!(!late.try_grow(total / 2)); // denied → rebalance posted
 
         // The hog is asked to shed down to the fair share (half the pool).
@@ -367,12 +496,12 @@ mod tests {
         let manager = Arc::new(MemoryManager::new());
         let total = manager.total_bytes;
 
-        let mut resident = SpillBudget::with_shed_capability(manager.clone(), false);
+        let mut resident = SpillBudget::with_shed_capability(scope(&manager), false);
         resident.grow_unchecked(total / 2);
 
-        let mut a = SpillBudget::new(manager.clone());
+        let mut a = SpillBudget::new(scope(&manager));
         assert!(a.try_grow(total * 4 / 10));
-        let mut b = SpillBudget::new(manager.clone());
+        let mut b = SpillBudget::new(scope(&manager));
         assert!(!b.try_grow(total / 4)); // only ~10% left → denied
 
         // Fair share = (total - resident) / 2 = total/4; a holds 40%.
@@ -385,7 +514,7 @@ mod tests {
     fn single_holder_gets_no_shed_requests() {
         let manager = Arc::new(MemoryManager::new());
         let total = manager.total_bytes;
-        let mut only = SpillBudget::new(manager.clone());
+        let mut only = SpillBudget::new(scope(&manager));
         assert!(only.try_grow(total));
         assert!(!only.try_grow(1));
         assert_eq!(only.take_shed_request(), 0);
@@ -395,7 +524,7 @@ mod tests {
     fn dropped_holders_leave_the_registry() {
         let manager = Arc::new(MemoryManager::new());
         {
-            let _budget = SpillBudget::new(manager.clone());
+            let _budget = SpillBudget::new(scope(&manager));
             assert_eq!(manager.state.lock().unwrap().holders.len(), 1);
         }
         assert_eq!(manager.state.lock().unwrap().holders.len(), 0);

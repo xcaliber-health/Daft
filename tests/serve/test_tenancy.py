@@ -153,3 +153,93 @@ def test_cancel_is_scoped_to_the_owning_tenant(tenant_server: DaftServeServer, t
     assert beta.client.cancel_query(query_id) is False
     assert alpha.client.cancel_query(query_id) is True
     del held
+
+
+def test_tenant_memory_cap_forces_spilling_with_exact_results() -> None:
+    """A memory-capped tenant's query spills to disk yet stays exact.
+
+    An uncapped tenant on the same server does not spill. Runs in a
+    subprocess because engine log forwarding fixes its level at
+    interpreter startup, before test-time capture can raise it.
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        import json
+        import logging
+
+        logging.basicConfig(level=logging.INFO, format="%(name)s:%(message)s")
+
+        import numpy as np
+        import pyarrow as pa
+
+        import daft
+        from daft import col
+        from daft.runners.remote_runner import RemoteRunner
+        from daft.serve import ServeSettings, TenantSpec, start_server
+
+        server = start_server(
+            ServeSettings(
+                host="127.0.0.1",
+                port=0,
+                tenants=(
+                    TenantSpec(name="capped", token="tok-capped", memory_cap_bytes=8 * 1024 * 1024),
+                    TenantSpec(name="free", token="tok-free"),
+                ),
+            )
+        )
+        rng = np.random.default_rng(41)
+        n = 1_500_000
+        df = daft.from_arrow(
+            pa.table(
+                {
+                    "k": pa.array(rng.integers(0, 400_000, n)),
+                    "v": pa.array(rng.integers(0, 1_000, n)),
+                }
+            )
+        ).collect()
+        plan = df.groupby("k").agg(col("v").sum().alias("s"))
+
+        def run(token: str) -> tuple[int, int]:
+            runner = RemoteRunner(server.address(), token=token)
+            groups = 0
+            total = 0
+            for part in runner.run_iter_tables(plan._builder):
+                d = part.to_pydict()
+                groups += len(d["k"])
+                total += sum(d["s"])
+            return groups, int(total)
+
+        print("MARK capped-start", flush=True)
+        capped = run("tok-capped")
+        print("MARK capped-end", flush=True)
+        free = run("tok-free")
+        server.shutdown(drain_timeout_secs=5)
+        print("RESULT " + json.dumps({"capped": capped, "free": free}))
+        """
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env={**os.environ, "DAFT_RUNNER": "native"},
+        timeout=600,
+        check=False,
+    )
+    combined = out.stdout
+    result_line = next((line for line in out.stdout.splitlines() if line.startswith("RESULT ")), None)
+    assert result_line is not None, combined[-2000:]
+    result = json.loads(result_line[len("RESULT ") :])
+    assert result["capped"] == result["free"]
+
+    # Spill events must fall inside the capped tenant's query window only.
+    capped_window = combined.split("MARK capped-start")[1].split("MARK capped-end")[0]
+    after_capped = combined.split("MARK capped-end")[1]
+    assert "spilled" in capped_window, "the capped tenant's query should shed state to disk"
+    assert "spilled" not in after_capped, "the uncapped tenant should not spill"

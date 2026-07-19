@@ -26,7 +26,7 @@ use crate::{
         BuilderContext, InputId, MorselSizeRequirement, NodeName, PipelineEvent, PipelineMessage,
         PipelineNode, next_event,
     },
-    resource_manager::MemoryManager,
+    resource_manager::QueryMemoryScope,
     runtime_stats::{DefaultRuntimeStats, RuntimeStats, RuntimeStatsManagerHandle},
 };
 
@@ -301,7 +301,7 @@ impl<Op: BlockingSink + 'static> BlockingSinkNode<Op> {
         op: Arc<Op>,
         mut child_rx: Receiver<PipelineMessage>,
         output_tx: Sender<PipelineMessage>,
-        memory_manager: Arc<MemoryManager>,
+        memory_manager: QueryMemoryScope,
         stats_manager: RuntimeStatsManagerHandle,
         meter: Meter,
         node_info: Arc<NodeInfo>,

@@ -165,13 +165,27 @@ Prerequisite for per-tenant memory caps and for large-query robustness.
   non-shed-able exclusion, request consumption, single-holder
   exemption, and registry cleanup on drop.
 
-Remaining slices:
-1. Per-tenant memory caps in the server, wired through this same
-   registration (tenant identity as the grouping key and per-tenant
-   ceilings ahead of the global pool).
-2. Partitioned (Grace) hash join — the true join spill; needs
+**Slice 5 landed: per-tenant memory caps — Phase C complete.**
+- The engine gained a per-query memory scope: an optional ceiling on a
+  query's combined buffered bytes, checked before the global pool.
+  Exceeding the ceiling triggers the query's own spilling regardless of
+  global headroom. The ceiling arrives through the server-controlled
+  execution context, never the client-shipped configuration, so callers
+  cannot lift their own limits.
+- The server resolves the ceiling per tenant (`memory_cap_bytes` on the
+  tenant, or the server-wide `query_memory_cap_bytes` default) and
+  injects it per query; combined with per-tenant admission slots, a
+  tenant's total footprint is bounded by slots × cap.
+- Verified: a tenant capped at 8MB runs a large aggregation with spill
+  events and results identical to an uncapped tenant's run on the same
+  server, which does not spill; unit tests cover ceiling denial with
+  global headroom, shared ceilings across holders in one scope, denial
+  leaving global accounting untouched, and release on drop.
+
+Phase C follow-on projects (design-first, parked):
+1. Partitioned (Grace) hash join — the true join spill; needs
    probe-side partitioning, probe-input spill, and per-partition
-   replay. Substantial, design-first.
+   replay.
 2. Cross-query negotiation: a central coordinator re-distributes the global
    budget across concurrent queries' registered operators (grant increments
    where they help throughput most; force spilling elsewhere) — the model

@@ -114,7 +114,7 @@ impl<Op: JoinOperator + 'static> PerBuildInput<Op> {
     /// Charges `bytes` of incoming build data to the shared budget.
     fn account(&mut self, bytes: u64, spawner: &ExecutionTaskSpawner) {
         let budget = self.budget.get_or_insert_with(|| {
-            SpillBudget::with_shed_capability(spawner.memory_manager().clone(), false)
+            SpillBudget::with_shed_capability(spawner.memory_scope().clone(), false)
         });
         if !budget.try_grow(bytes) {
             budget.grow_unchecked(bytes);

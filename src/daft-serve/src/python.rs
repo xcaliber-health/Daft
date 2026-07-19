@@ -64,6 +64,7 @@ impl PyDaftServer {
         max_pset_bytes=256 * 1024 * 1024,
         disable_plan_payload=false,
         query_timeout_secs=0,
+        query_memory_cap_bytes=0,
         tenants=Vec::new(),
         session=None,
         catalogs=Vec::new(),
@@ -80,12 +81,14 @@ impl PyDaftServer {
         max_pset_bytes: usize,
         disable_plan_payload: bool,
         query_timeout_secs: u64,
+        query_memory_cap_bytes: usize,
         tenants: Vec<(
             String,
             String,
             Option<usize>,
             Option<u64>,
             Option<u64>,
+            Option<usize>,
             Option<usize>,
         )>,
         session: Option<Py<PyAny>>,
@@ -94,7 +97,15 @@ impl PyDaftServer {
         let tenants: Vec<TenantConfig> = tenants
             .into_iter()
             .map(
-                |(name, tenant_token, max_concurrent, queue_timeout, query_timeout, pset_cap)| {
+                |(
+                    name,
+                    tenant_token,
+                    max_concurrent,
+                    queue_timeout,
+                    query_timeout,
+                    pset_cap,
+                    memory_cap,
+                )| {
                     TenantConfig {
                         name,
                         token: tenant_token,
@@ -102,6 +113,7 @@ impl PyDaftServer {
                         queue_timeout_secs: queue_timeout,
                         query_timeout_secs: query_timeout,
                         max_pset_bytes: pset_cap,
+                        memory_cap_bytes: memory_cap,
                     }
                 },
             )
@@ -131,6 +143,7 @@ impl PyDaftServer {
             max_pset_bytes,
             disable_plan_payload,
             query_timeout_secs,
+            query_memory_cap_bytes,
             tenants,
         };
         let service = DaftServeService::new(

@@ -51,6 +51,9 @@ pub struct TenantConfig {
     /// Cap on in-memory partition bytes shipped with one of this tenant's
     /// queries.
     pub max_pset_bytes: Option<usize>,
+    /// Ceiling on buffered execution memory per query for this tenant;
+    /// queries over it spill to disk rather than grow.
+    pub memory_cap_bytes: Option<usize>,
 }
 
 /// Runtime configuration of one serving process.
@@ -76,6 +79,9 @@ pub struct ServeConfig {
     /// Wall-clock seconds one query may execute before being cancelled;
     /// `0` disables the limit.
     pub query_timeout_secs: u64,
+    /// Ceiling on buffered execution memory per query; `0` disables it.
+    /// Queries over the ceiling spill to disk rather than grow.
+    pub query_memory_cap_bytes: usize,
     /// Named tenants with per-tenant limits; empty for single-credential
     /// or unauthenticated servers.
     pub tenants: Vec<TenantConfig>,
@@ -142,6 +148,7 @@ impl ServeConfig {
 struct EffectiveLimits {
     query_timeout_secs: u64,
     max_pset_bytes: usize,
+    memory_cap_bytes: Option<u64>,
 }
 
 /// Shared state of the serving process.
@@ -202,6 +209,9 @@ impl DaftServeService {
                 .iter()
                 .find(|candidate| candidate.name == name)
         });
+        let memory_cap = overrides
+            .and_then(|t| t.memory_cap_bytes)
+            .unwrap_or(self.config.query_memory_cap_bytes);
         EffectiveLimits {
             query_timeout_secs: overrides
                 .and_then(|t| t.query_timeout_secs)
@@ -209,6 +219,7 @@ impl DaftServeService {
             max_pset_bytes: overrides
                 .and_then(|t| t.max_pset_bytes)
                 .unwrap_or(self.config.max_pset_bytes),
+            memory_cap_bytes: (memory_cap > 0).then_some(memory_cap as u64),
         }
     }
 
@@ -382,6 +393,7 @@ impl FlightService for DaftServeService {
         let (tx, rx) = async_channel::bounded(buffer);
         let sql_session = self.sql_session.clone();
         let query_timeout_secs = limits.query_timeout_secs;
+        let memory_cap_bytes = limits.memory_cap_bytes;
         let task = common_runtime::get_io_runtime(true).spawn(async move {
             execute::run_query(
                 query,
@@ -391,6 +403,7 @@ impl FlightService for DaftServeService {
                 guard,
                 tx,
                 query_timeout_secs,
+                memory_cap_bytes,
             )
             .await;
         });
@@ -663,6 +676,7 @@ mod tests {
             max_pset_bytes: 64 * 1024 * 1024,
             disable_plan_payload: false,
             query_timeout_secs: 0,
+            query_memory_cap_bytes: 0,
             tenants: vec![],
         }
     }

@@ -107,11 +107,10 @@ impl Side {
     }
 }
 
-/// Where merged batches go: an intermediate spill run, a final
-/// collection, or a bounded channel consumed while the merge runs.
+/// Where merged batches go: an intermediate spill run, or a bounded
+/// channel consumed while the merge runs.
 pub(crate) enum MergeOutput<'a> {
     Run(&'a mut crate::spill::RunWriter),
-    Collect(&'a mut Vec<MicroPartition>),
     Channel(&'a crate::channel::Sender<MicroPartition>),
 }
 
@@ -123,10 +122,6 @@ impl MergeOutput<'_> {
         let part = MicroPartition::new_loaded(batch.schema.clone(), Arc::new(vec![batch]), None);
         match self {
             Self::Run(writer) => writer.push(part).await,
-            Self::Collect(out) => {
-                out.push(part);
-                Ok(())
-            }
             Self::Channel(tx) => tx.send(part).await.map_err(|_| {
                 common_error::DaftError::InternalError(
                     "merged output receiver dropped before the merge completed".to_string(),
@@ -258,26 +253,6 @@ async fn emit_final(
     }
 }
 
-/// Merges any number of sorted runs into fully sorted output partitions.
-///
-/// Pairs of runs merge into intermediate on-disk runs until two or fewer
-/// remain; the final merge collects output in memory. Peak working memory
-/// is bounded by one batch per active side plus the emitted chunk.
-///
-/// # Errors
-/// Returns an error if reading, writing, or comparison fails.
-pub(crate) async fn merge_sorted_runs(
-    runs: Vec<MergeSource>,
-    ordering: &MergeOrdering,
-    spill: &SpillContext,
-) -> DaftResult<Vec<MicroPartition>> {
-    let runs = reduce_to_two(runs, ordering, spill).await?;
-    let mut out_parts: Vec<MicroPartition> = Vec::new();
-    let mut out = MergeOutput::Collect(&mut out_parts);
-    emit_final(runs, ordering, &mut out).await?;
-    Ok(out_parts)
-}
-
 /// Merges any number of sorted runs, sending each fully sorted output
 /// partition to `output` as it is produced instead of collecting the
 /// result in memory. Peak working memory is bounded by one batch per
@@ -341,6 +316,31 @@ mod tests {
         out
     }
 
+    /// Runs the streaming merge and gathers its output, draining the
+    /// channel concurrently so the bounded capacity never stalls it.
+    async fn merge_and_collect(
+        runs: Vec<MergeSource>,
+        ordering: &MergeOrdering,
+        spill: &SpillContext,
+    ) -> Vec<MicroPartition> {
+        let (tx, mut rx) = crate::channel::create_channel::<MicroPartition>(1);
+        let producer = async {
+            let result = merge_sorted_runs_streaming(runs, ordering, spill, &tx).await;
+            drop(tx);
+            result
+        };
+        let consumer = async {
+            let mut parts = Vec::new();
+            while let Some(part) = rx.recv().await {
+                parts.push(part);
+            }
+            parts
+        };
+        let (result, parts) = tokio::join!(producer, consumer);
+        result.unwrap();
+        parts
+    }
+
     #[tokio::test]
     async fn three_way_merge_matches_full_sort() {
         // Three sorted runs with interleaved ranges and multiple batches;
@@ -357,9 +357,7 @@ mod tests {
             ])),
         ];
         let dir = tempfile::tempdir().unwrap();
-        let merged = merge_sorted_runs(runs, &ordering(false, false), &spill_ctx(&dir))
-            .await
-            .unwrap();
+        let merged = merge_and_collect(runs, &ordering(false, false), &spill_ctx(&dir)).await;
         assert_eq!(
             collect_values(&merged),
             (1..=10).map(Some).collect::<Vec<_>>()
@@ -373,9 +371,7 @@ mod tests {
             MergeSource::Memory(VecDeque::from(vec![batch(vec![None, Some(6), Some(1)])])),
         ];
         let dir = tempfile::tempdir().unwrap();
-        let merged = merge_sorted_runs(runs, &ordering(true, true), &spill_ctx(&dir))
-            .await
-            .unwrap();
+        let merged = merge_and_collect(runs, &ordering(true, true), &spill_ctx(&dir)).await;
         assert_eq!(
             collect_values(&merged),
             vec![None, None, Some(9), Some(6), Some(3), Some(1)]
@@ -385,47 +381,15 @@ mod tests {
     #[tokio::test]
     async fn single_and_empty_run_edge_cases() {
         let dir = tempfile::tempdir().unwrap();
-        let merged = merge_sorted_runs(vec![], &ordering(false, false), &spill_ctx(&dir))
-            .await
-            .unwrap();
+        let merged = merge_and_collect(vec![], &ordering(false, false), &spill_ctx(&dir)).await;
         assert!(merged.is_empty());
 
         let one = vec![MergeSource::Memory(VecDeque::from(vec![batch(vec![
             Some(1),
             Some(2),
         ])]))];
-        let merged = merge_sorted_runs(one, &ordering(false, false), &spill_ctx(&dir))
-            .await
-            .unwrap();
+        let merged = merge_and_collect(one, &ordering(false, false), &spill_ctx(&dir)).await;
         assert_eq!(collect_values(&merged), vec![Some(1), Some(2)]);
-    }
-
-    #[tokio::test]
-    async fn streaming_merge_matches_collected_merge() {
-        let make_runs = || {
-            vec![
-                MergeSource::Memory(VecDeque::from(vec![batch(vec![Some(1), Some(4), Some(7)])])),
-                MergeSource::Memory(VecDeque::from(vec![batch(vec![Some(2), Some(5), Some(8)])])),
-                MergeSource::Memory(VecDeque::from(vec![batch(vec![Some(3), Some(6), Some(9)])])),
-            ]
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let spill = spill_ctx(&dir);
-        let collected = merge_sorted_runs(make_runs(), &ordering(false, false), &spill)
-            .await
-            .unwrap();
-
-        let (tx, mut rx) = crate::channel::create_channel::<MicroPartition>(1);
-        let ord = ordering(false, false);
-        let producer = tokio::spawn(async move {
-            merge_sorted_runs_streaming(make_runs(), &ord, &spill_ctx(&dir), &tx).await
-        });
-        let mut streamed = Vec::new();
-        while let Some(part) = rx.recv().await {
-            streamed.push(part);
-        }
-        producer.await.unwrap().unwrap();
-        assert_eq!(collect_values(&streamed), collect_values(&collected));
     }
 
     #[tokio::test]

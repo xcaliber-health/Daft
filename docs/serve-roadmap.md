@@ -88,19 +88,35 @@ Any future kernel work must A/B on `make build-release` only.
 ## Phase C — Memory substrate: accounting, spilling, negotiation
 
 Prerequisite for per-tenant memory caps and for large-query robustness.
-Today the engine's memory manager is an advisory byte-semaphore and **no
-operator spills** — sort, aggregation, and join builds grow unboundedly.
 
-1. Convert the resource manager to accounted budgets (per-query
-   registration of blocking-operator reservations).
-2. Spill for grouped aggregation first: radix-partitioned state makes
-   external processing natural (process partitions one at a time under a
-   memory reservation), then sort (external merge) and join build.
-3. Cross-query negotiation: a central coordinator re-distributes the global
+**Slice 1 landed: accounting + grouped-aggregation spilling.**
+- `SpillBudget` (resource_manager): a non-blocking, growable share of the
+  existing global budget (`DAFT_MEMORY_LIMIT` or system memory). Growth
+  denial is the spill signal; all held bytes release on drop.
+- `spill` module: scratch directories with drop-based cleanup; runs written
+  through the existing size-rotated, compressed columnar stream writer and
+  read back whole-file on the IO pool. No new serialization invented.
+- Grouped-aggregate sink: every worker accounts its buffered partition
+  bytes after each morsel; on budget denial it sheds its largest buffered
+  hash partition to disk (partial and raw buckets kept separate) and
+  finalize restores shed runs into the same buckets before the existing
+  per-partition merge. Config: `enable_spilling` (default on),
+  `spill_dirs` (default `/tmp`); compression follows the shuffle setting.
+- Verified: identical results at 30/60MB budgets vs unpressured on a
+  working set several times larger; spill events observed at 30MB; scratch
+  removed on completion; escape hatch produces no disk activity; full
+  local + serving suites green; TPC-H unchanged (spilling never triggers
+  at normal budgets — flagged deltas on the two shortest queries were
+  noise with mixed signs under attribution).
+
+Remaining slices:
+1. Sort spill (external merge — requires sorted-run merge at finalize)
+   and join-build spill.
+2. Cross-query negotiation: a central coordinator re-distributes the global
    budget across concurrent queries' registered operators (grant increments
    where they help throughput most; force spilling elsewhere) — the model
    proven by embedded analytical databases for multi-tenant fairness.
-4. Only then: per-tenant memory caps in the server, wired through the same
+3. Only then: per-tenant memory caps in the server, wired through the same
    registration.
 
 ## Phase D — Filter execution improvements (scoped)

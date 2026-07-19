@@ -111,6 +111,91 @@ impl MemoryManager {
             None
         }
     }
+
+    /// Attempts to take `bytes` from the budget without waiting.
+    ///
+    /// Returns whether the reservation fit. Callers that buffer data and can
+    /// shed it to disk use this to detect memory pressure: a denial is the
+    /// signal to spill rather than grow.
+    fn try_reserve(&self, bytes: u64) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.available_bytes >= bytes {
+            state.available_bytes -= bytes;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns `bytes` to the budget and wakes any waiters.
+    fn release(&self, bytes: u64) {
+        if bytes > 0 {
+            {
+                let mut state = self.state.lock().unwrap();
+                state.available_bytes =
+                    (state.available_bytes + bytes).min(self.total_bytes);
+            }
+            self.notify.notify_waiters();
+        }
+    }
+}
+
+/// Owned, growable share of the memory budget held by an operator that can
+/// spill its buffered state to disk.
+///
+/// Growth is non-blocking: [`Self::try_grow`] either fits within the global
+/// budget or reports pressure so the owner sheds buffered bytes and calls
+/// [`Self::shrink`]. All held bytes return to the budget on drop, so an
+/// abandoned or failed query cannot leak accounting.
+pub(crate) struct SpillBudget {
+    manager: Arc<MemoryManager>,
+    held: u64,
+}
+
+impl SpillBudget {
+    /// Creates an empty budget share against the given manager.
+    pub(crate) fn new(manager: Arc<MemoryManager>) -> Self {
+        Self { manager, held: 0 }
+    }
+
+    /// Attempts to grow the held share by `bytes`; returns whether it fit.
+    ///
+    /// A denial means the global budget is exhausted — the owner should
+    /// spill buffered state (and `shrink`) before retrying or proceeding.
+    #[must_use]
+    pub(crate) fn try_grow(&mut self, bytes: u64) -> bool {
+        if self.manager.try_reserve(bytes) {
+            self.held += bytes;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Grows the held share by `bytes` without checking the budget.
+    ///
+    /// Used after spilling everything shed-able still leaves the growth
+    /// unfunded: execution must proceed, so the share is recorded anyway to
+    /// keep pressure on other operators.
+    pub(crate) fn grow_unchecked(&mut self, bytes: u64) {
+        let mut state = self.manager.state.lock().unwrap();
+        state.available_bytes = state.available_bytes.saturating_sub(bytes);
+        drop(state);
+        self.held += bytes;
+    }
+
+    /// Returns `bytes` of the held share to the budget.
+    pub(crate) fn shrink(&mut self, bytes: u64) {
+        let returned = bytes.min(self.held);
+        self.held -= returned;
+        self.manager.release(returned);
+    }
+}
+
+impl Drop for SpillBudget {
+    fn drop(&mut self) {
+        self.manager.release(self.held);
+    }
 }
 
 #[cfg(test)]
@@ -120,6 +205,55 @@ mod tests {
     use tokio::time;
 
     use super::*;
+
+    #[test]
+    fn spill_budget_grow_shrink_and_drop_release() {
+        let manager = Arc::new(MemoryManager::new());
+        let total = manager.total_bytes;
+
+        let mut budget = SpillBudget::new(manager.clone());
+        assert!(budget.try_grow(total / 2));
+        assert!(!budget.try_grow(total)); // over budget → pressure signal
+        budget.shrink(total / 4);
+        {
+            let state = manager.state.lock().unwrap();
+            assert_eq!(state.available_bytes, total - total / 2 + total / 4);
+        }
+        drop(budget);
+        {
+            let state = manager.state.lock().unwrap();
+            assert_eq!(state.available_bytes, total);
+        }
+    }
+
+    #[test]
+    fn spill_budget_unchecked_growth_saturates() {
+        let manager = Arc::new(MemoryManager::new());
+        let total = manager.total_bytes;
+        let mut budget = SpillBudget::new(manager.clone());
+        budget.grow_unchecked(total + 100);
+        {
+            let state = manager.state.lock().unwrap();
+            assert_eq!(state.available_bytes, 0);
+        }
+        drop(budget);
+        // Release is clamped to the configured total.
+        {
+            let state = manager.state.lock().unwrap();
+            assert_eq!(state.available_bytes, total);
+        }
+    }
+
+    #[test]
+    fn shrink_beyond_held_is_clamped() {
+        let manager = Arc::new(MemoryManager::new());
+        let total = manager.total_bytes;
+        let mut budget = SpillBudget::new(manager.clone());
+        assert!(budget.try_grow(100));
+        budget.shrink(1000);
+        let state = manager.state.lock().unwrap();
+        assert_eq!(state.available_bytes, total);
+    }
 
     #[test]
     fn test_get_or_init_memory_manager() {

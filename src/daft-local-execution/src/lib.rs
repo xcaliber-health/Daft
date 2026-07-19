@@ -14,6 +14,7 @@ mod resource_manager;
 mod run;
 mod runtime_stats;
 mod sinks;
+mod spill;
 mod sources;
 mod streaming_sink;
 use std::{
@@ -175,6 +176,12 @@ impl ExecutionTaskSpawner {
             memory_manager,
             outer_span: span,
         }
+    }
+
+    /// Shared memory budget, for operators that account and spill their
+    /// buffered state.
+    pub(crate) fn memory_manager(&self) -> &Arc<MemoryManager> {
+        &self.memory_manager
     }
 
     pub fn spawn_with_memory_request<F, O>(

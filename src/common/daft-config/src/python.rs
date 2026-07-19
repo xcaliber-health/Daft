@@ -123,6 +123,8 @@ impl PyDaftExecutionConfig {
         enable_dynamic_batching=None,
         dynamic_batching_strategy=None,
         flight_shuffle_dirs=None,
+        enable_spilling=None,
+        spill_dirs=None,
         flight_shuffle_compression=None,
         enable_multi_glob_path_tasks=None,
     ))]
@@ -162,6 +164,8 @@ impl PyDaftExecutionConfig {
         enable_dynamic_batching: Option<bool>,
         dynamic_batching_strategy: Option<&str>,
         flight_shuffle_dirs: Option<Vec<String>>,
+        enable_spilling: Option<bool>,
+        spill_dirs: Option<Vec<String>>,
         flight_shuffle_compression: Option<&str>,
         enable_multi_glob_path_tasks: Option<bool>,
     ) -> PyResult<Self> {
@@ -296,6 +300,17 @@ impl PyDaftExecutionConfig {
             config.dynamic_batching_strategy = dynamic_batching_strategy.to_string();
         }
 
+        if let Some(enable_spilling) = enable_spilling {
+            config.enable_spilling = enable_spilling;
+        }
+        if let Some(spill_dirs) = spill_dirs {
+            if spill_dirs.is_empty() {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "spill_dirs must contain at least one directory".to_string(),
+                ));
+            }
+            config.spill_dirs = spill_dirs;
+        }
         if let Some(flight_shuffle_dirs) = flight_shuffle_dirs {
             if flight_shuffle_dirs.is_empty() {
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
@@ -493,6 +508,16 @@ impl PyDaftExecutionConfig {
     #[getter]
     fn flight_shuffle_compression(&self) -> PyResult<Option<&str>> {
         Ok(self.config.flight_shuffle_compression.as_deref())
+    }
+
+    #[getter]
+    fn enable_spilling(&self) -> PyResult<bool> {
+        Ok(self.config.enable_spilling)
+    }
+
+    #[getter]
+    fn spill_dirs(&self) -> PyResult<Vec<String>> {
+        Ok(self.config.spill_dirs.clone())
     }
 }
 

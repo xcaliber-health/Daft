@@ -220,6 +220,8 @@ def set_execution_config(
     config: PyDaftExecutionConfig | None = None,
     enable_scan_task_split_and_merge: bool | None = None,
     enable_scan_task_row_group_splitting: bool | None = None,
+    enable_spilling: bool | None = None,
+    spill_dirs: list[str] | None = None,
     scan_tasks_min_size_bytes: int | None = None,
     scan_tasks_max_size_bytes: int | None = None,
     max_sources_per_scan_task: int | None = None,
@@ -266,6 +268,9 @@ def set_execution_config(
         enable_scan_task_split_and_merge: Whether to enable scan task split and merge. Defaults to False.
         enable_scan_task_row_group_splitting: Whether the local executor further splits file scan tasks by
             row group at execution time, so one file can be read by several workers in parallel. Defaults to False.
+        enable_spilling: Whether operators that buffer state (grouped aggregations) shed buffered
+            partitions to disk under memory pressure instead of growing without bound. Defaults to True.
+        spill_dirs: Directories for spill files. Defaults to ["/tmp"].
         scan_tasks_min_size_bytes: Minimum size of scan tasks in bytes. Defaults to 96MB.
         scan_tasks_max_size_bytes: Maximum size of scan tasks in bytes. Defaults to 384MB.
         max_sources_per_scan_task: Maximum number of sources per scan task. Defaults to 10.
@@ -323,6 +328,8 @@ def set_execution_config(
         new_daft_execution_config = old_daft_execution_config.with_config_values(
             enable_scan_task_split_and_merge=enable_scan_task_split_and_merge,
             enable_scan_task_row_group_splitting=enable_scan_task_row_group_splitting,
+            enable_spilling=enable_spilling,
+            spill_dirs=spill_dirs,
             scan_tasks_min_size_bytes=scan_tasks_min_size_bytes,
             scan_tasks_max_size_bytes=scan_tasks_max_size_bytes,
             max_sources_per_scan_task=max_sources_per_scan_task,

@@ -21,6 +21,8 @@ use super::blocking_sink::{
 use crate::{
     ExecutionTaskSpawner,
     pipeline::{InputId, NodeName},
+    resource_manager::{MemoryManager, SpillBudget},
+    spill::{SpillScratch, SpilledRun},
 };
 
 #[derive(Clone, Debug)]
@@ -59,8 +61,7 @@ impl AggStrategy {
         let partitioned =
             agged.partition_by_hash(params.final_group_by.as_slice(), inner_states.len())?;
         for (p, state) in partitioned.into_iter().zip(inner_states.iter_mut()) {
-            let state = state.get_or_insert_default();
-            state.partially_aggregated.push(p);
+            state.get_or_insert_default().push_partial(p);
         }
         Ok(())
     }
@@ -77,16 +78,19 @@ impl AggStrategy {
             let state = state.get_or_insert_default();
             if state.unaggregated_size + p.len() >= partial_agg_threshold {
                 let mut unaggregated = std::mem::take(&mut state.unaggregated);
+                for drained in &unaggregated {
+                    state.buffered_bytes =
+                        state.buffered_bytes.saturating_sub(drained.size_bytes() as u64);
+                }
+                state.unaggregated_size = 0;
                 unaggregated.push(p);
                 let aggregated = MicroPartition::concat(unaggregated)?.agg(
                     params.partial_agg_exprs.as_slice(),
                     params.group_by.as_slice(),
                 )?;
-                state.partially_aggregated.push(aggregated);
-                state.unaggregated_size = 0;
+                state.push_partial(aggregated);
             } else {
-                state.unaggregated_size += p.len();
-                state.unaggregated.push(p);
+                state.push_raw(p);
             }
         }
         Ok(())
@@ -100,9 +104,7 @@ impl AggStrategy {
         let partitioned =
             input.partition_by_hash(params.group_by.as_slice(), inner_states.len())?;
         for (p, state) in partitioned.into_iter().zip(inner_states.iter_mut()) {
-            let state = state.get_or_insert_default();
-            state.unaggregated_size += p.len();
-            state.unaggregated.push(p);
+            state.get_or_insert_default().push_raw(p);
         }
         Ok(())
     }
@@ -113,6 +115,38 @@ pub(crate) struct SinglePartitionAggregateState {
     partially_aggregated: Vec<MicroPartition>,
     unaggregated: Vec<MicroPartition>,
     unaggregated_size: usize,
+    /// In-memory bytes currently buffered in the two vectors above.
+    buffered_bytes: u64,
+    /// Runs of partially aggregated state shed to disk under pressure.
+    spilled_partial: Vec<SpilledRun>,
+    /// Runs of raw input shed to disk under pressure.
+    spilled_raw: Vec<SpilledRun>,
+}
+
+impl SinglePartitionAggregateState {
+    fn push_partial(&mut self, part: MicroPartition) {
+        self.buffered_bytes += part.size_bytes() as u64;
+        self.partially_aggregated.push(part);
+    }
+
+    fn push_raw(&mut self, part: MicroPartition) {
+        self.buffered_bytes += part.size_bytes() as u64;
+        self.unaggregated_size += part.len();
+        self.unaggregated.push(part);
+    }
+
+    /// Drains all buffered partitions, returning them split by kind along
+    /// with the bytes they occupied.
+    fn drain_buffered(&mut self) -> (Vec<MicroPartition>, Vec<MicroPartition>, u64) {
+        let drained = self.buffered_bytes;
+        self.buffered_bytes = 0;
+        self.unaggregated_size = 0;
+        (
+            std::mem::take(&mut self.partially_aggregated),
+            std::mem::take(&mut self.unaggregated),
+            drained,
+        )
+    }
 }
 
 pub(crate) enum GroupedAggregateState {
@@ -121,6 +155,8 @@ pub(crate) enum GroupedAggregateState {
         strategy: Option<AggStrategy>,
         partial_agg_threshold: usize,
         high_cardinality_threshold_ratio: f64,
+        budget: Option<SpillBudget>,
+        buffered_total: u64,
     },
     Done,
 }
@@ -137,20 +173,25 @@ impl GroupedAggregateState {
             strategy: None,
             partial_agg_threshold,
             high_cardinality_threshold_ratio,
+            budget: None,
+            buffered_total: 0,
         }
     }
 
-    fn push(
+    async fn push(
         &mut self,
         input: MicroPartition,
         params: &GroupedAggregateParams,
         global_strategy_lock: &Arc<Mutex<Option<AggStrategy>>>,
+        memory_manager: &Arc<MemoryManager>,
     ) -> DaftResult<()> {
         let Self::Accumulating {
             inner_states,
             strategy,
             partial_agg_threshold,
             high_cardinality_threshold_ratio,
+            budget,
+            buffered_total,
         } = self
         else {
             panic!("GroupedAggregateSink should be in Accumulating state");
@@ -171,7 +212,79 @@ impl GroupedAggregateState {
             )?;
             decided_strategy.execute_strategy(inner_states, input, params)?;
         }
+
+        if let Some(spill) = &params.spill {
+            let budget = budget.get_or_insert_with(|| SpillBudget::new(memory_manager.clone()));
+            Self::reconcile_and_maybe_spill(inner_states, budget, buffered_total, spill).await?;
+        }
         Ok(())
+    }
+
+    /// Reconciles this worker's buffered bytes with the shared budget and,
+    /// when growth is denied, sheds the largest buffered hash partitions to
+    /// disk until the growth fits or nothing buffered remains.
+    ///
+    /// Invariant on return: `buffered_total` equals the bytes currently
+    /// buffered across `inner_states` and mirrors the bytes held from the
+    /// shared budget.
+    async fn reconcile_and_maybe_spill(
+        inner_states: &mut [Option<SinglePartitionAggregateState>],
+        budget: &mut SpillBudget,
+        buffered_total: &mut u64,
+        spill: &SpillContext,
+    ) -> DaftResult<()> {
+        loop {
+            let buffered: u64 = inner_states
+                .iter()
+                .flatten()
+                .map(|state| state.buffered_bytes)
+                .sum();
+            if buffered <= *buffered_total {
+                budget.shrink(*buffered_total - buffered);
+                *buffered_total = buffered;
+                return Ok(());
+            }
+            let growth = buffered - *buffered_total;
+            if budget.try_grow(growth) {
+                *buffered_total = buffered;
+                return Ok(());
+            }
+
+            // Budget denied: shed the largest buffered partition and retry.
+            // If nothing is left to shed, record the growth anyway —
+            // execution must proceed, and the debt keeps pressure on other
+            // operators.
+            let largest = inner_states
+                .iter_mut()
+                .flatten()
+                .filter(|state| state.buffered_bytes > 0)
+                .max_by_key(|state| state.buffered_bytes);
+            let Some(state) = largest else {
+                budget.grow_unchecked(growth);
+                *buffered_total = buffered;
+                return Ok(());
+            };
+            let (partial, raw, drained) = state.drain_buffered();
+            if !partial.is_empty() {
+                let run = spill
+                    .scratch()?
+                    .spill(partial, spill.compression.clone())
+                    .await?;
+                state.spilled_partial.push(run);
+            }
+            if !raw.is_empty() {
+                let run = spill
+                    .scratch()?
+                    .spill(raw, spill.compression.clone())
+                    .await?;
+                state.spilled_raw.push(run);
+            }
+            // Release only the shed bytes that were previously accounted;
+            // bytes newer than the last reconcile never entered the budget.
+            let accounted = drained.min(*buffered_total);
+            budget.shrink(accounted);
+            *buffered_total -= accounted;
+        }
     }
 
     fn determine_agg_strategy(
@@ -227,6 +340,31 @@ impl GroupedAggregateState {
     }
 }
 
+/// Spill configuration and lazily created scratch space shared by every
+/// worker of one aggregation.
+struct SpillContext {
+    spill_dirs: Vec<String>,
+    compression: Option<String>,
+    scratch: Mutex<Option<Arc<SpillScratch>>>,
+}
+
+impl SpillContext {
+    /// Returns the shared scratch directory, creating it on first use so
+    /// queries that never spill touch no disk.
+    fn scratch(&self) -> DaftResult<Arc<SpillScratch>> {
+        let mut guard = self
+            .scratch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(scratch) = guard.as_ref() {
+            return Ok(scratch.clone());
+        }
+        let scratch = Arc::new(SpillScratch::try_new(&self.spill_dirs)?);
+        *guard = Some(scratch.clone());
+        Ok(scratch)
+    }
+}
+
 struct GroupedAggregateParams {
     // The original aggregations and group by expressions
     original_aggregations: Vec<BoundAggExpr>,
@@ -237,6 +375,8 @@ struct GroupedAggregateParams {
     final_agg_exprs: Vec<BoundAggExpr>,
     final_group_by: Vec<BoundExpr>,
     final_projections: Vec<BoundExpr>,
+    // Spill configuration; absent when spilling is disabled.
+    spill: Option<SpillContext>,
 }
 
 pub struct GroupedAggregateSink {
@@ -309,6 +449,11 @@ impl GroupedAggregateSink {
                 final_agg_exprs,
                 final_group_by,
                 final_projections,
+                spill: cfg.enable_spilling.then(|| SpillContext {
+                    spill_dirs: cfg.spill_dirs.clone(),
+                    compression: cfg.flight_shuffle_compression.clone(),
+                    scratch: Mutex::new(None),
+                }),
             }),
             partial_agg_threshold: cfg.partial_aggregation_threshold,
             high_cardinality_threshold_ratio: cfg.high_cardinality_aggregation_threshold,
@@ -333,10 +478,13 @@ impl BlockingSink for GroupedAggregateSink {
     ) -> BlockingSinkSinkResult<Self> {
         let params = self.grouped_aggregate_params.clone();
         let strategy_lock = self.global_strategy_lock.clone();
+        let memory_manager = spawner.memory_manager().clone();
         spawner
             .spawn(
                 async move {
-                    state.push(input, &params, &strategy_lock)?;
+                    state
+                        .push(input, &params, &strategy_lock, &memory_manager)
+                        .await?;
                     Ok(state)
                 },
                 Span::current(),
@@ -377,6 +525,15 @@ impl BlockingSink for GroupedAggregateSink {
                             for state in per_partition_state.into_iter().flatten() {
                                 unaggregated.extend(state.unaggregated);
                                 partially_aggregated.extend(state.partially_aggregated);
+                                // Restore any state this partition shed to
+                                // disk under memory pressure, in the same
+                                // buckets it was shed from.
+                                for run in state.spilled_raw {
+                                    unaggregated.extend(run.read_back().await?);
+                                }
+                                for run in state.spilled_partial {
+                                    partially_aggregated.extend(run.read_back().await?);
+                                }
                             }
 
                             // If we have no partially aggregated partitions, aggregate the unaggregated partitions using the original aggregations

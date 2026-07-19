@@ -41,6 +41,7 @@ daft-scan = {path = "../daft-scan", default-features = false}
 daft-shuffles = {path = "../daft-shuffles", default-features = false}
 daft-warc = {path = "../daft-warc", default-features = false}
 daft-writers = {path = "../daft-writers", default-features = false}
+uuid = {workspace = true}
 futures = {workspace = true}
 indexmap = {workspace = true}
 indicatif = {workspace = true}
@@ -95,3 +96,6 @@ workspace = true
 edition = {workspace = true}
 name = "daft-local-execution"
 version = {workspace = true}
+
+[dev-dependencies]
+tempfile = "3.23.0"

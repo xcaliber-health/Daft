@@ -81,6 +81,9 @@
             * [Distributed Execution](distributed/index.md)
             * [Running on Kubernetes](distributed/kubernetes.md)
             * [Running on Ray](distributed/ray.md)
+            * Query Serving
+                * [Overview](serve/README.md)
+                * [User Guide](serve/user-guide.md)
         * Optimization
             * [Managing Memory Usage](optimization/memory.md)
             * [Partitioning and Batching](optimization/partitioning.md)

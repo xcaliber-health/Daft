@@ -16,6 +16,12 @@ pub enum IcebergRewriteError {
 
     #[error("output_spec_id {output} not present in table specs")]
     UnknownOutputSpec { output: i32 },
+
+    #[error("unsupported option(s) {names:?}; supported options are {supported:?}")]
+    UnknownOptions {
+        names: Vec<String>,
+        supported: Vec<String>,
+    },
 }
 
 impl From<IcebergRewriteError> for DaftError {

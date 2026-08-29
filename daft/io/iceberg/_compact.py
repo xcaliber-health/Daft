@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import uuid as _uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -54,6 +55,16 @@ WRITE_TARGET_FILE_SIZE_BYTES_KEY = "write.target-file-size-bytes"
 # coexist with the rewrite. ``snapshot`` is safe only when no concurrent process
 # deletes data from the touched partitions (e.g. an append-only writer).
 CONFLICT_ISOLATION_KEY = "conflict-isolation"
+
+# Caller-supplied identity for an idempotent replay of the same rewrite.
+REWRITE_ID_KEY = "rewrite-id"
+
+# Content marker for a data file, as opposed to a row-level delete file.
+_DATA_CONTENT = 0
+
+# Field id the spec reserves for the data file path inside a positional delete.
+# Its bounds say which data files the delete can cover.
+_DELETE_FILE_PATH_FIELD_ID = 2147483546
 CONFLICT_ISOLATION_SERIALIZABLE = "serializable"
 CONFLICT_ISOLATION_SNAPSHOT = "snapshot"
 _VALID_CONFLICT_ISOLATIONS = (
@@ -73,6 +84,16 @@ def _parse_conflict_isolation(raw_options: dict[str, Any]) -> str:
     if value not in _VALID_CONFLICT_ISOLATIONS:
         raise ValueError(f"{CONFLICT_ISOLATION_KEY} must be one of {_VALID_CONFLICT_ISOLATIONS}, got {value!r}")
     return value
+
+
+def _parse_rewrite_id(raw_options: dict[str, Any]) -> str | None:
+    """Pop the caller-supplied rewrite id from ``raw_options``.
+
+    Removed in place like the isolation level, so it never reaches the option
+    validator, which recognizes only planning options.
+    """
+    value = raw_options.pop(REWRITE_ID_KEY, None)
+    return str(value) if value else None
 
 
 @dataclass(frozen=True)
@@ -145,11 +166,13 @@ def run(
         parsed_sort_order = _parse_sort_order(sort_order, table)
     elif strategy == "zorder":
         parsed_zorder_by = _parse_zorder_columns(zorder_by, table)
+    output_sort_order_id = _resolve_sort_order(table, strategy, parsed_sort_order)
 
     raw_options = dict(options or {})
     # Pop orchestration-only options before the planner validator, which rejects
     # keys it does not recognize.
     conflict_isolation = _parse_conflict_isolation(raw_options)
+    explicit_rewrite_id = _parse_rewrite_id(raw_options)
     # Fall back to the table property when the caller did not pass an explicit
     # target file size; this lets writers and the rewriter agree on output size
     # without restating it at every callsite.
@@ -168,6 +191,7 @@ def run(
     starting_snapshot_id: int | None = int(starting_snapshot.snapshot_id) if starting_snapshot is not None else None
     if starting_snapshot_id is not None:
         scan_kwargs["snapshot_id"] = starting_snapshot_id
+    _raise_if_equality_deletes_present(table, starting_snapshot)
     scan = table.scan(**scan_kwargs)
     plan_files = list(scan.plan_files())
 
@@ -178,9 +202,14 @@ def run(
         path = task.file.file_path
         pos_deletes: list[str] = []
         has_eq = False
+        deleted_rows = 0
         for d in task.delete_files:
             if d.content == DataFileContent.POSITION_DELETES:
                 pos_deletes.append(d.file_path)
+                # A delete naming no data file applies across a partition, so
+                # its rows cannot be attributed to this one.
+                if getattr(d, "referenced_data_file", None) == path:
+                    deleted_rows += int(d.record_count or 0)
             elif d.content == DataFileContent.EQUALITY_DELETES:
                 has_eq = True
                 eq_delete_files.append(d.file_path)
@@ -192,6 +221,8 @@ def run(
                 "partition_spec_id": int(task.file.spec_id),
                 "positional_delete_paths": pos_deletes,
                 "has_equality_deletes": has_eq,
+                "record_count": int(task.file.record_count or 0),
+                "deleted_record_count": deleted_rows,
             }
         )
         plan_by_path[path] = task
@@ -202,7 +233,7 @@ def run(
     current_spec_id = int(table.spec().spec_id)
     groups = _rust_iceberg.plan_file_groups_py(candidates, raw_options, current_spec_id)
 
-    rewrite_id = _resolve_rewrite_id(table, branch, strategy, normalized, candidates, raw_options)
+    rewrite_id = _resolve_rewrite_id(table, branch, strategy, normalized, candidates, explicit_rewrite_id)
     cached = _lookup_idempotent_result(table, rewrite_id, strategy)
     if cached is not None:
         logger.info("rewrite_data_files: idempotency hit on rewrite_id=%s; skipping", rewrite_id)
@@ -233,6 +264,7 @@ def run(
         strategy=strategy,
         sort_order=parsed_sort_order,
         zorder_by=parsed_zorder_by,
+        output_sort_order_id=output_sort_order_id,
     )
 
     result = _commit(
@@ -252,6 +284,31 @@ def run(
         if removed:
             result = _augment_result_with_dangling(result, removed)
     return result
+
+
+def _raise_if_equality_deletes_present(table: PyIcebergTable, snapshot: Any) -> None:
+    """Refuse a rewrite over a table carrying equality deletes, before planning it.
+
+    An equality delete names the column values it removes rather than the rows'
+    positions, so it applies to any data file in its partition and cannot be
+    resolved by reading one file. Replacing those files without applying it would
+    bring the deleted rows back.
+
+    Checked here rather than while reading the plan, because the catalog library
+    raises its own error the moment a scan meets one, which would reach the
+    caller instead of this one and say nothing about what to do.
+    """
+    from pyiceberg.manifest import DataFileContent
+
+    if snapshot is None:
+        return
+    offending: list[str] = []
+    for manifest in snapshot.manifests(table.io):
+        for entry in manifest.fetch_manifest_entry(table.io, discard_deleted=True):
+            if entry.data_file.content == DataFileContent.EQUALITY_DELETES:
+                offending.append(entry.data_file.file_path)
+    if offending:
+        raise EqualityDeletesPresent(f"equality deletes present in files: {sorted(set(offending))}")
 
 
 def _io_config_for_table(table: PyIcebergTable) -> IOConfig:
@@ -282,6 +339,7 @@ def _rewrite_groups(
     strategy: str,
     sort_order: list[tuple[str, bool, bool]] | None,
     zorder_by: list[str] | None,
+    output_sort_order_id: int,
 ) -> list[_GroupOutput]:
     """Rewrite the file groups through the streaming engine, bounded in flight.
 
@@ -313,6 +371,7 @@ def _rewrite_groups(
             strategy=strategy,
             sort_order=sort_order,
             zorder_by=zorder_by,
+            output_sort_order_id=output_sort_order_id,
         )
 
     if not distributed or max_concurrent == 1 or len(groups) <= 1:
@@ -393,6 +452,93 @@ def _parse_zorder_columns(
     return out
 
 
+# Write property read by the writer to size its first output file. Named for the
+# engine, since Iceberg defines no such property.
+INFLATION_FACTOR_PROPERTY = "daft.write.inflation-factor"
+
+# The ratio is a property of the data and its codec, so a few files describe the
+# table as well as all of them.
+_INFLATION_SAMPLE_FILES = 3
+
+
+def _measure_inflation_factor(table: PyIcebergTable, paths: list[str]) -> float | None:
+    """Measure how much the data expands from disk into memory.
+
+    Read from the footers of a few input files, which record both sizes. The
+    writer rolls a new file once the rows it holds are estimated to have reached
+    the target on disk, and without a measurement it starts from a configured
+    guess, so its first file comes out mis-sized. Returns ``None`` when the
+    footers cannot be read, leaving that guess in place.
+    """
+    import pyarrow.parquet as pq
+
+    compressed = 0
+    uncompressed = 0
+    for path in paths[:_INFLATION_SAMPLE_FILES]:
+        try:
+            with table.io.new_input(path).open() as handle:
+                metadata = pq.ParquetFile(handle).metadata
+            for index in range(metadata.num_row_groups):
+                group = metadata.row_group(index)
+                uncompressed += int(group.total_byte_size)
+                compressed += sum(int(group.column(c).total_compressed_size) for c in range(group.num_columns))
+        except (OSError, ValueError) as exc:
+            logger.debug("rewrite_data_files: could not measure %s: %s", path, exc)
+            return None
+    if compressed <= 0 or uncompressed <= 0:
+        return None
+    return uncompressed / compressed
+
+
+def _resolve_sort_order(
+    table: PyIcebergTable,
+    strategy: str,
+    sort_order: list[tuple[str, bool, bool]] | None,
+) -> int:
+    """Return the sort order id the output files will declare.
+
+    Only a sort strategy produces an order the format can express: a bin-pack
+    does not order rows, and a space-filling curve is not a sequence of
+    per-column sorts, so both record the unsorted order.
+
+    An order already registered on the table is reused. One that is not is
+    recorded as unsorted rather than registered, matching the reference: a
+    rewrite orders its own output, which says nothing about how the table should
+    be ordered, and registering would change metadata every other writer reads.
+    """
+    from pyiceberg.table.sorting import (
+        UNSORTED_SORT_ORDER_ID,
+        NullOrder,
+        SortDirection,
+        SortField,
+    )
+    from pyiceberg.transforms import IdentityTransform
+
+    if strategy != "sort" or not sort_order:
+        return UNSORTED_SORT_ORDER_ID
+
+    schema = table.schema()
+    fields = [
+        SortField(
+            source_id=schema.find_field(name).field_id,
+            transform=IdentityTransform(),
+            direction=SortDirection.DESC if descending else SortDirection.ASC,
+            null_order=NullOrder.NULLS_FIRST if nulls_first else NullOrder.NULLS_LAST,
+        )
+        for (name, descending, nulls_first) in sort_order
+    ]
+
+    for candidate in table.sort_orders().values():
+        if list(candidate.fields) == fields:
+            return int(candidate.order_id)
+
+    logger.warning(
+        "rewrite_data_files: the requested sort order matches none registered on the "
+        "table, so the rewritten files will not be marked as sorted"
+    )
+    return UNSORTED_SORT_ORDER_ID
+
+
 def _parse_sort_order(
     sort_order: list[tuple[str, str, str]] | None,
     table: PyIcebergTable,
@@ -428,6 +574,7 @@ def _rewrite_group(
     strategy: str,
     sort_order: list[tuple[str, bool, bool]] | None,
     zorder_by: list[str] | None,
+    output_sort_order_id: int,
 ) -> _GroupOutput:
     """Read one group's files, optionally re-cluster, and write target-sized outputs.
 
@@ -443,6 +590,10 @@ def _rewrite_group(
 
     target_size = int(normalized_options["target-file-size-bytes"])
     output_spec_id = int(group["output_spec_id"])
+    # How much input each output file is read from. Only bin-pack uses it: the
+    # clustering strategies shuffle first, and their target is derived from the
+    # shuffle instead.
+    split_size = int(group.get("input_split_size") or target_size)
 
     df = _group_dataframe(
         table=table,
@@ -452,7 +603,19 @@ def _rewrite_group(
         io_config=io_config,
     )
 
-    write_target = target_size
+    # Measured only for bin-pack, whose writer rolls straight through the input.
+    # The clustering strategies shuffle first, so the ratio measured on the input
+    # files does not describe what their writer sees.
+    inflation_factor = _measure_inflation_factor(table, input_paths) if strategy == "binpack" else None
+
+    write_target = split_size
+    if strategy == "binpack" and _writes_one_file_per_partition():
+        # Each partition is written on its own, so a partition above the target
+        # rolls and strands its remainder as a file of its own, and remainders
+        # cannot be merged across partitions. The reference allows a file to
+        # reach halfway between the target and the maximum for exactly this
+        # reason, which absorbs the remainder instead.
+        write_target = max(write_target, _write_max_file_size(normalized_options))
     if strategy == "sort":
         assert sort_order is not None
         df = df.sort(
@@ -466,11 +629,9 @@ def _rewrite_group(
         df = _apply_zorder(df, zorder_by, normalized_options)
         write_target = _shuffled_target_size(target_size, normalized_options)
     else:  # binpack: no re-clustering, so coalesce to target-sized partitions
-        df = _coalesce_binpack(
+        df = _repartition_for_output(
             df,
-            n_inputs=len(input_paths),
-            bytes_rewritten=bytes_rewritten,
-            target_size=target_size,
+            expected_output_files=int(group.get("expected_output_files") or 1),
         )
 
     data_files = _collect_data_files(
@@ -479,6 +640,8 @@ def _rewrite_group(
         io_config=io_config,
         target_size=write_target,
         output_spec_id=output_spec_id,
+        output_sort_order_id=output_sort_order_id,
+        inflation_factor=inflation_factor,
     )
     bytes_added = sum(int(getattr(d, "file_size_in_bytes", 0)) for d in data_files)
 
@@ -547,23 +710,47 @@ def _apply_zorder(
 _MIN_SHUFFLED_TARGET_BYTES = 1024 * 1024
 
 
-def _coalesce_binpack(df: DataFrame, *, n_inputs: int, bytes_rewritten: int, target_size: int) -> DataFrame:
-    """Coalesce a binpack group to roughly target-sized partitions on a cluster.
+def _writes_one_file_per_partition() -> bool:
+    """Whether the runner emits a file per partition rather than one stream."""
+    from daft import runners
 
-    A distributed write emits one output file per input partition, so packing
-    many small files would not reduce the file count without first reducing the
-    partition count. The size-based writer still rolls an oversized partition
-    into multiple files, so only coalescing (never splitting) is required here.
-    A single-node run streams and rolls by size already, leaving this a no-op.
+    return runners.get_or_create_runner().name == "ray"
+
+
+def _write_max_file_size(normalized_options: dict[str, Any]) -> int:
+    """Largest a single output file may reach while writing.
+
+    Halfway between the target and the maximum, as the reference sizes it, so a
+    group whose content does not divide evenly is absorbed into the files being
+    written rather than left as an undersized remainder.
+    """
+    target = int(normalized_options["target-file-size-bytes"])
+    maximum = int(normalized_options["max-file-size-bytes"])
+    return target + max(0, maximum - target) // 2
+
+
+def _repartition_for_output(df: DataFrame, *, expected_output_files: int) -> DataFrame:
+    """Give a bin-pack group one partition per file it is meant to become.
+
+    A distributed write emits a file per partition, and the scan starts with one
+    partition per input file, so without this a group of six inputs is written as
+    six independent streams and each leaves its own undersized remainder. A
+    rewrite that turns six files into twelve is worse than doing nothing.
+
+    Only ever coalesces. Splitting would divide partitions round-robin rather
+    than by size, which cannot make a partition that already exceeds the target
+    write one file, and costs a shuffle to learn that.
+
+    A single-node run needs none of it: the group streams through one writer that
+    rolls by size, so partitioning does not decide the output.
     """
     from daft import runners
 
     if runners.get_or_create_runner().name != "ray":
         return df
-    target_partitions = max(1, (bytes_rewritten + target_size - 1) // target_size)
-    if target_partitions < n_inputs:
-        return df.into_partitions(target_partitions)
-    return df
+    if expected_output_files < 1 or df.num_partitions() <= expected_output_files:
+        return df
+    return df.into_partitions(expected_output_files)
 
 
 def _shuffled_target_size(target_size: int, normalized_options: dict[str, Any]) -> int:
@@ -587,6 +774,8 @@ def _collect_data_files(
     io_config: IOConfig,
     target_size: int,
     output_spec_id: int,
+    output_sort_order_id: int,
+    inflation_factor: float | None,
 ) -> list[Any]:
     """Write the frame's rows as target-sized data files and return their metadata.
 
@@ -601,6 +790,9 @@ def _collect_data_files(
         io_config,
         target_file_size_bytes=target_size,
         partition_spec_id=output_spec_id,
+        require_matching_columns=True,
+        sort_order_id=output_sort_order_id,
+        inflation_factor=inflation_factor,
     )
     write_df = DataFrame(write_builder)
     write_df.collect()
@@ -632,11 +824,10 @@ def _resolve_rewrite_id(
     strategy: str,
     normalized_options: dict[str, Any],
     candidates: list[dict[str, Any]],
-    raw_options: dict[str, Any],
+    explicit: str | None,
 ) -> str:
-    explicit = raw_options.get("rewrite-id")
     if explicit:
-        return str(explicit)
+        return explicit
     payload = {
         "table_uuid": str(table.metadata.table_uuid),
         "branch": branch or "main",
@@ -746,6 +937,7 @@ def _commit(
             branch=branch,
             starting_snapshot_id=starting_snapshot_id,
             conflict_isolation=conflict_isolation,
+            use_starting_sequence_number=bool(normalized_options["use-starting-sequence-number"]),
         )
     return _commit_single(
         table=table,
@@ -756,6 +948,7 @@ def _commit(
         branch=branch,
         starting_snapshot_id=starting_snapshot_id,
         conflict_isolation=conflict_isolation,
+        use_starting_sequence_number=bool(normalized_options["use-starting-sequence-number"]),
     )
 
 
@@ -769,6 +962,7 @@ def _commit_single(
     branch: str | None,
     starting_snapshot_id: int | None,
     conflict_isolation: str,
+    use_starting_sequence_number: bool,
 ) -> RewriteResult:
     result, err = _commit_batch(
         table=table,
@@ -780,6 +974,7 @@ def _commit_single(
         branch=branch,
         starting_snapshot_id=starting_snapshot_id,
         conflict_isolation=conflict_isolation,
+        use_starting_sequence_number=use_starting_sequence_number,
     )
     if result is None:
         assert err is not None
@@ -805,6 +1000,7 @@ def _commit_partial(
     branch: str | None,
     starting_snapshot_id: int | None,
     conflict_isolation: str,
+    use_starting_sequence_number: bool,
 ) -> RewriteResult:
     n_batches = min(max(1, int(max_commits)), len(outputs))
     chunk_size = (len(outputs) + n_batches - 1) // n_batches
@@ -833,6 +1029,7 @@ def _commit_partial(
             branch=branch,
             starting_snapshot_id=starting_snapshot_id,
             conflict_isolation=conflict_isolation,
+            use_starting_sequence_number=use_starting_sequence_number,
         )
         if result is None:
             orphan_paths = _orphan_output_paths(batch)
@@ -876,6 +1073,205 @@ def _commit_partial(
     )
 
 
+def _starting_sequence_number(table: PyIcebergTable, starting_snapshot_id: int | None) -> int | None:
+    """Sequence number of the snapshot a rewrite planned against.
+
+    Returns ``None`` when there is no such snapshot or it records no sequence
+    number, which leaves the commit assigning a fresh one.
+    """
+    if starting_snapshot_id is None:
+        return None
+    snapshot = table.metadata.snapshot_by_id(int(starting_snapshot_id))
+    if snapshot is None:
+        return None
+    sequence_number = getattr(snapshot, "sequence_number", None)
+    return None if sequence_number is None else int(sequence_number)
+
+
+_COMPACTION_PRODUCER_CLASS: type | None = None
+
+
+def _compaction_producer_class() -> type:
+    """Return the snapshot producer a rewrite commits through.
+
+    Built on first use and cached, because defining it needs an import that is
+    only available once a catalog is installed.
+
+    A rewrite replaces files without changing rows, which the base overwrite
+    producer gets almost right: it already keeps untouched manifests and marks
+    the replaced entries deleted. Three things it does not do, and this producer
+    does. Added files are grouped by the partitioning they were written under,
+    rather than all being declared under the table's current one, so writing
+    output under an older spec does not index past the end of a partition
+    record. Added entries can carry the sequence number of the snapshot the
+    rewrite planned against, so an existing row-level delete still applies to
+    the rows it was written for. And the snapshot is labelled a replace rather
+    than an overwrite, so readers that distinguish a reorganization from a
+    change in the data see it for what it is.
+    """
+    global _COMPACTION_PRODUCER_CLASS
+    if _COMPACTION_PRODUCER_CLASS is not None:
+        return _COMPACTION_PRODUCER_CLASS
+
+    from pyiceberg.table.update.snapshot import _OverwriteFiles
+
+    class _CompactionProducer(_OverwriteFiles):  # type: ignore[misc, valid-type]
+        """Commits a rewrite: the same rows, laid out in different files."""
+
+        def __init__(
+            self,
+            *,
+            operation: Any,
+            transaction: Any,
+            io: Any,
+            commit_uuid: _uuid.UUID,
+            snapshot_properties: dict[str, str],
+            branch: str | None,
+            starting_sequence_number: int | None,
+        ) -> None:
+            super().__init__(
+                operation=operation,
+                transaction=transaction,
+                io=io,
+                commit_uuid=commit_uuid,
+                snapshot_properties=dict(snapshot_properties),
+                branch=branch,
+            )
+            self._starting_sequence_number = starting_sequence_number
+
+        def _added_entry_sequence_number(self) -> int | None:
+            """Sequence number to stamp on added entries, or ``None`` to assign a new one.
+
+            A row-level delete applies to data whose sequence number is at or
+            below its own. Giving rewritten files the sequence number of the
+            snapshot they were read from keeps those deletes applying; giving
+            them the new snapshot's number would place them beyond every
+            existing delete and bring the deleted rows back. Only format version
+            2 and later carry sequence numbers.
+            """
+            if self._transaction.table_metadata.format_version < 2:
+                return None
+            return self._starting_sequence_number
+
+        def _manifests(self) -> list[Any]:
+            from collections import defaultdict
+
+            from pyiceberg.manifest import ManifestEntry, ManifestEntryStatus, write_manifest
+            from pyiceberg.utils.concurrent import ExecutorFactory
+
+            metadata = self._transaction.table_metadata
+
+            def _write_added_manifests() -> list[Any]:
+                if not self._added_data_files:
+                    return []
+                by_spec: dict[int, list[Any]] = defaultdict(list)
+                for data_file in self._added_data_files:
+                    by_spec[int(data_file.spec_id)].append(data_file)
+
+                sequence_number = self._added_entry_sequence_number()
+                written: list[Any] = []
+                for spec_id, data_files in by_spec.items():
+                    with write_manifest(
+                        format_version=metadata.format_version,
+                        spec=metadata.specs()[spec_id],
+                        schema=metadata.schema(),
+                        output_file=self.new_manifest_output(),
+                        snapshot_id=self._snapshot_id,
+                        avro_compression=self._compression,
+                    ) as writer:
+                        for data_file in data_files:
+                            writer.add_entry(
+                                ManifestEntry.from_args(
+                                    status=ManifestEntryStatus.ADDED,
+                                    snapshot_id=self._snapshot_id,
+                                    sequence_number=sequence_number,
+                                    file_sequence_number=None,
+                                    data_file=data_file,
+                                )
+                            )
+                    written.append(writer.to_manifest_file())
+                return written
+
+            def _write_deleted_manifests() -> list[Any]:
+                deleted_entries = self._deleted_entries()
+                if not deleted_entries:
+                    return []
+                by_spec: dict[int, list[Any]] = defaultdict(list)
+                for entry in deleted_entries:
+                    by_spec[int(entry.data_file.spec_id)].append(entry)
+
+                written: list[Any] = []
+                for spec_id, entries in by_spec.items():
+                    with write_manifest(
+                        format_version=metadata.format_version,
+                        spec=metadata.specs()[spec_id],
+                        schema=metadata.schema(),
+                        output_file=self.new_manifest_output(),
+                        snapshot_id=self._snapshot_id,
+                        avro_compression=self._compression,
+                    ) as writer:
+                        for entry in entries:
+                            writer.add_entry(entry)
+                    written.append(writer.to_manifest_file())
+                return written
+
+            executor = ExecutorFactory.get_or_create()
+            added = executor.submit(_write_added_manifests)
+            deleted = executor.submit(_write_deleted_manifests)
+            existing = executor.submit(self._existing_manifests)
+            return self._process_manifests(added.result() + deleted.result() + existing.result())
+
+        def _summary(self, snapshot_properties: dict[str, str] | None = None) -> Any:
+            from pyiceberg.table import TableProperties
+            from pyiceberg.table.snapshots import (
+                Operation,
+                SnapshotSummaryCollector,
+                Summary,
+                update_snapshot_summaries,
+            )
+
+            properties = dict(snapshot_properties or {})
+            metadata = self._transaction.table_metadata
+            specs = metadata.specs()
+            schema = metadata.schema()
+
+            collector = SnapshotSummaryCollector(
+                partition_summary_limit=int(
+                    metadata.properties.get(
+                        TableProperties.WRITE_PARTITION_SUMMARY_LIMIT,
+                        TableProperties.WRITE_PARTITION_SUMMARY_LIMIT_DEFAULT,
+                    )
+                )
+            )
+            for data_file in self._added_data_files:
+                collector.add_file(
+                    data_file=data_file,
+                    partition_spec=specs[int(data_file.spec_id)],
+                    schema=schema,
+                )
+            for data_file in self._deleted_data_files:
+                collector.remove_file(
+                    data_file=data_file,
+                    partition_spec=specs[int(data_file.spec_id)],
+                    schema=schema,
+                )
+
+            previous_snapshot = (
+                metadata.snapshot_by_id(self._parent_snapshot_id) if self._parent_snapshot_id is not None else None
+            )
+            # Totals are recomputed, not carried forward. The arithmetic does
+            # not depend on the operation, but the helper only admits the ones
+            # it was written for, so it runs under one and is relabelled after.
+            totals = update_snapshot_summaries(
+                summary=Summary(operation=Operation.OVERWRITE, **collector.build(), **properties),
+                previous_summary=previous_snapshot.summary if previous_snapshot is not None else None,
+            )
+            return Summary(operation=Operation.REPLACE, **totals.additional_properties)
+
+    _COMPACTION_PRODUCER_CLASS = _CompactionProducer
+    return _COMPACTION_PRODUCER_CLASS
+
+
 def _commit_batch(
     *,
     table: PyIcebergTable,
@@ -887,6 +1283,7 @@ def _commit_batch(
     branch: str | None,
     starting_snapshot_id: int | None,
     conflict_isolation: str,
+    use_starting_sequence_number: bool,
 ) -> tuple[RewriteResult | None, Exception | None]:
     all_data_files = [df_ for o in batch for df_ in o.data_files]
     input_paths = sorted({p for o in batch for p in o.input_data_files})
@@ -942,19 +1339,30 @@ def _commit_batch(
             touched_partitions=touched_partitions,
             batch=batch,
             rewrite_id=rewrite_id,
+            branch=branch,
             isolation=conflict_isolation,
         )
+        from pyiceberg.table.refs import MAIN_BRANCH
+        from pyiceberg.table.snapshots import Operation
+
+        starting_sequence_number = (
+            _starting_sequence_number(table, starting_snapshot_id) if use_starting_sequence_number else None
+        )
         tx = table.transaction()
-        update_kwargs: dict[str, Any] = {"snapshot_properties": snapshot_props}
-        if branch is not None:
-            update_kwargs["branch"] = branch
-        update = tx.update_snapshot(**update_kwargs)
-        with update.overwrite() as ow:
-            for p in input_paths:
-                task = plan_by_path[p]
-                ow.delete_data_file(task.file)
-            for df_ in all_data_files:
-                ow.append_data_file(df_)
+        producer = _compaction_producer_class()(
+            operation=Operation.REPLACE,
+            transaction=tx,
+            io=table.io,
+            commit_uuid=_uuid.uuid4(),
+            snapshot_properties=snapshot_props,
+            branch=branch if branch is not None else MAIN_BRANCH,
+            starting_sequence_number=starting_sequence_number,
+        )
+        for p in input_paths:
+            producer.delete_data_file(plan_by_path[p].file)
+        for df_ in all_data_files:
+            producer.append_data_file(df_)
+        producer.commit()
         tx.commit_transaction()
         table.refresh()
         snap = table.snapshot_by_name(branch) if branch is not None else table.current_snapshot()
@@ -988,64 +1396,172 @@ def _validate_no_overlap(
     touched_partitions: set[Any],
     batch: list[_GroupOutput],
     rewrite_id: str,
+    branch: str | None,
     isolation: str = CONFLICT_ISOLATION_SERIALIZABLE,
 ) -> None:
     """Reject the commit if foreign writes since the plan snapshot affect this batch.
 
-    Under ``serializable`` isolation, raises :class:`RewriteConflict` when either
+    Three conditions raise :class:`RewriteConflict`. At every isolation level:
     (a) one of this batch's input files is no longer reachable from the current
-    head, or (b) a foreign snapshot committed after ``starting_snapshot_id``
-    added a data file in a partition this batch is rewriting. Under ``snapshot``
-    isolation, only condition (a) is enforced: concurrent additions of new files
-    to a touched partition are permitted, so the check is safe to use only when
-    no concurrent process deletes data from those partitions. Snapshots produced
-    by the same rewrite (matched by ``daft.rewrite-id``) are excluded so
-    partial-progress batches do not collide with their own predecessors.
-    """
-    if isolation == CONFLICT_ISOLATION_SNAPSHOT:
-        _raise_if_inputs_vanished(table, input_paths, batch)
-        return
+    head, and (b) a foreign snapshot added a row-level delete that applies to a
+    file this batch is replacing — the delete names data files and row positions,
+    so replacing those files would leave it matching nothing and bring the
+    removed rows back. Under ``serializable`` isolation additionally: (c) a
+    foreign snapshot added a data file in a partition this batch is rewriting.
 
-    head = table.current_snapshot()
+    Under ``snapshot`` isolation only (a) and (b) apply, so concurrent appends to
+    a touched partition are permitted while concurrent deletes are still refused.
+    Snapshots produced by the same rewrite (matched by ``daft.rewrite-id``) are
+    excluded so partial-progress batches do not collide with their own
+    predecessors.
+    """
+    foreign = _foreign_snapshots_since(table, starting_snapshot_id, rewrite_id, branch)
+
+    if isolation != CONFLICT_ISOLATION_SNAPSHOT:
+        for snapshot in foreign:
+            for added in _added_files(snapshot, table):
+                if int(added.content) != int(_DATA_CONTENT):
+                    continue
+                partition_key = _stable_partition_key(added.partition)
+                if partition_key in touched_partitions:
+                    orphans = _orphan_output_paths(batch)
+                    raise RewriteConflict(
+                        f"snapshot {int(snapshot.snapshot_id)} added a data file in "
+                        f"partition {partition_key!r} after the rewrite plan was "
+                        f"taken; orphan outputs: {orphans!r}"
+                    )
+
+    _raise_if_new_deletes_apply(
+        foreign,
+        table,
+        input_paths=input_paths,
+        touched_partitions=touched_partitions,
+        batch=batch,
+    )
+    _raise_if_inputs_vanished(table, input_paths, batch, branch)
+
+
+def _branch_head(table: PyIcebergTable, branch: str | None) -> Any | None:
+    """Return the snapshot at the head of the reference being rewritten."""
+    return table.snapshot_by_name(branch) if branch is not None else table.current_snapshot()
+
+
+def _foreign_snapshots_since(
+    table: PyIcebergTable,
+    starting_snapshot_id: int | None,
+    rewrite_id: str,
+    branch: str | None,
+) -> list[Any]:
+    """Return the snapshots committed by others between the plan snapshot and head.
+
+    Walks parent links back from the head of the branch being rewritten, which
+    is where the rewrite planned from; walking the table's default reference
+    instead treats every snapshot on it as a foreign writer the moment a branch
+    diverges. Snapshots this rewrite produced itself are left out, so a
+    partial-progress batch does not conflict with its own predecessors.
+    """
+    head = _branch_head(table, branch)
     if head is None or starting_snapshot_id is None or int(head.snapshot_id) == int(starting_snapshot_id):
-        _raise_if_inputs_vanished(table, input_paths, batch)
-        return
+        return []
 
     ancestry: list[Any] = []
-    snap = head
+    snapshot = head
     visited: set[int] = set()
-    while snap is not None and int(snap.snapshot_id) != int(starting_snapshot_id):
-        sid = int(snap.snapshot_id)
-        if sid in visited:
+    while snapshot is not None and int(snapshot.snapshot_id) != int(starting_snapshot_id):
+        snapshot_id = int(snapshot.snapshot_id)
+        if snapshot_id in visited:
             break
-        visited.add(sid)
-        ancestry.append(snap)
-        parent_id = getattr(snap, "parent_snapshot_id", None)
-        snap = table.metadata.snapshot_by_id(parent_id) if parent_id is not None else None
+        visited.add(snapshot_id)
+        if _snapshot_rewrite_id(snapshot) != rewrite_id:
+            ancestry.append(snapshot)
+        parent_id = getattr(snapshot, "parent_snapshot_id", None)
+        snapshot = table.metadata.snapshot_by_id(parent_id) if parent_id is not None else None
+    return ancestry
 
-    for s in ancestry:
-        if _snapshot_rewrite_id(s) == rewrite_id:
-            continue
-        added = _added_data_files(s, table)
-        for df_ in added:
-            partition_key = _stable_partition_key(df_.partition)
-            if partition_key in touched_partitions:
-                orphans = _orphan_output_paths(batch)
-                raise RewriteConflict(
-                    f"snapshot {int(s.snapshot_id)} added a data file in "
-                    f"partition {partition_key!r} after the rewrite plan was "
-                    f"taken; orphan outputs: {orphans!r}"
-                )
 
-    _raise_if_inputs_vanished(table, input_paths, batch)
+def _raise_if_new_deletes_apply(
+    foreign: list[Any],
+    table: PyIcebergTable,
+    *,
+    input_paths: list[str],
+    touched_partitions: set[Any],
+    batch: list[_GroupOutput],
+) -> None:
+    """Refuse the commit when a foreign delete applies to a file being replaced.
+
+    A row-level delete removes rows by naming the data file and the positions
+    inside it. Replacing that file leaves the delete matching nothing, so the
+    rows it removed reappear. Every isolation level refuses this.
+    """
+    inputs = set(input_paths)
+    for snapshot in foreign:
+        for added in _added_files(snapshot, table):
+            if int(added.content) == int(_DATA_CONTENT):
+                continue
+            if not _delete_may_apply(added, inputs, touched_partitions):
+                continue
+            orphans = _orphan_output_paths(batch)
+            raise RewriteConflict(
+                f"snapshot {int(snapshot.snapshot_id)} added the row-level delete "
+                f"{added.file_path!r} covering a file this rewrite replaces; "
+                f"committing would restore the rows it removed. Orphan outputs: {orphans!r}"
+            )
+
+
+def _delete_may_apply(
+    delete_file: Any,
+    input_paths: set[str],
+    touched_partitions: set[Any],
+) -> bool:
+    """Whether a delete file can cover any of the data files being replaced.
+
+    Narrows on the most precise evidence the file carries: the data file it
+    names, then the range of paths its statistics cover, then the partition it
+    sits in. Each step only ever widens the match, so an unreadable or absent
+    statistic makes the answer more conservative, never less.
+    """
+    referenced = getattr(delete_file, "referenced_data_file", None)
+    if referenced is not None:
+        return str(referenced) in input_paths
+
+    bounds = _delete_path_bounds(delete_file)
+    if bounds is not None:
+        lower, upper = bounds
+        return any(lower <= path <= upper for path in input_paths)
+
+    return _stable_partition_key(delete_file.partition) in touched_partitions
+
+
+def _delete_path_bounds(delete_file: Any) -> tuple[str, str] | None:
+    """Return the range of data file paths a positional delete covers, if recorded.
+
+    Positional deletes carry lower and upper bounds over the path column, which
+    bound the files they name without reading the delete file. Bounds may be
+    truncated, but truncation only widens the range, so containment stays sound.
+    Returns ``None`` when either bound is missing or is not decodable text.
+    """
+    lower_bounds = getattr(delete_file, "lower_bounds", None) or {}
+    upper_bounds = getattr(delete_file, "upper_bounds", None) or {}
+    lower_raw = lower_bounds.get(_DELETE_FILE_PATH_FIELD_ID)
+    upper_raw = upper_bounds.get(_DELETE_FILE_PATH_FIELD_ID)
+    if lower_raw is None or upper_raw is None:
+        return None
+    try:
+        return bytes(lower_raw).decode("utf-8"), bytes(upper_raw).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 def _raise_if_inputs_vanished(
     table: PyIcebergTable,
     input_paths: list[str],
     batch: list[_GroupOutput],
+    branch: str | None,
 ) -> None:
-    live = {t.file.file_path for t in table.scan().plan_files()}
+    """Refuse the commit when an input is no longer live on the branch being rewritten."""
+    head = _branch_head(table, branch)
+    scan = table.scan() if head is None else table.scan(snapshot_id=int(head.snapshot_id))
+    live = {t.file.file_path for t in scan.plan_files()}
     missing = [p for p in input_paths if p not in live]
     if missing:
         orphans = _orphan_output_paths(batch)
@@ -1057,32 +1573,43 @@ def _snapshot_rewrite_id(snapshot: Any) -> str | None:
     return summary.get(SNAPSHOT_PROP_REWRITE_ID)
 
 
-def _added_data_files(snapshot: Any, table: PyIcebergTable) -> list[Any]:
-    """Return data files added by ``snapshot`` (status ADDED).
+def _added_files(snapshot: Any, table: PyIcebergTable) -> list[Any]:
+    """Return the data and delete files ``snapshot`` added (status ADDED).
 
     A manifest's ``added_snapshot_id`` identifies the single snapshot that
     contributed new entries to it. Manifests with a different
-    ``added_snapshot_id`` cannot contain ADDED entries for the snapshot we
-    are inspecting, so we skip them before performing any per-entry I/O.
+    ``added_snapshot_id`` cannot contain ADDED entries for the snapshot being
+    inspected, so they are skipped before any per-entry I/O.
+
+    Raises :class:`RewriteConflict` if the snapshot's manifests cannot be read.
+    This feeds the commit-time conflict checks, and a check that cannot run has
+    established nothing, so the commit is refused rather than allowed through on
+    missing evidence.
     """
     from pyiceberg.manifest import ManifestEntryStatus
 
-    out: list[Any] = []
+    snapshot_id = int(snapshot.snapshot_id)
     try:
         manifests = snapshot.manifests(table.io)
-    except Exception:
-        return out
-    sid = int(snapshot.snapshot_id)
-    for m in manifests:
-        if int(getattr(m, "added_snapshot_id", -1)) != sid:
+    except OSError as exc:
+        raise RewriteConflict(
+            f"could not read the manifests of snapshot {snapshot_id} to check for "
+            f"conflicting writes, so the rewrite cannot be shown to be safe: {exc}"
+        ) from exc
+
+    out: list[Any] = []
+    for manifest in manifests:
+        if int(getattr(manifest, "added_snapshot_id", -1)) != snapshot_id:
             continue
         try:
-            entries = m.fetch_manifest_entry(table.io, discard_deleted=False)
-        except Exception:
-            continue
-        for entry in entries:
-            if int(entry.status) == int(ManifestEntryStatus.ADDED):
-                out.append(entry.data_file)
+            entries = manifest.fetch_manifest_entry(table.io, discard_deleted=False)
+        except OSError as exc:
+            raise RewriteConflict(
+                f"could not read manifest {manifest.manifest_path!r} of snapshot "
+                f"{snapshot_id} to check for conflicting writes, so the rewrite "
+                f"cannot be shown to be safe: {exc}"
+            ) from exc
+        out.extend(entry.data_file for entry in entries if int(entry.status) == int(ManifestEntryStatus.ADDED))
     return out
 
 

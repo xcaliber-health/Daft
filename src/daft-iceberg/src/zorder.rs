@@ -26,184 +26,244 @@ use crate::errors::IcebergRewriteError;
 /// column is appended just long enough to sort, then projected away before write.
 pub const ZORDER_KEY_COL: &str = "__daft_zorder_key__";
 
-/// Encode each row of `array` as an ordered byte slice. Returns one `Vec<u8>` per row.
+/// Fixed-width ordered encodings for one column, laid out end to end.
 ///
-/// Per-type widths: int8/uint8 = 1 byte, int16/uint16 = 2, int32/uint32/date32 = 4,
-/// int64/uint64/timestamp = 8, float32 = 4, float64 = 8, decimal128 = 16, boolean = 1,
-/// utf8/binary = `var_length_contribution` bytes (truncate-and-pad). Nulls produce a
-/// zero-filled slice of the column's width.
+/// One allocation per column rather than one per row, which matters because a
+/// rewrite encodes every row of every clustering column.
+pub struct OrderedColumn {
+    bytes: Vec<u8>,
+    width: usize,
+}
+
+impl OrderedColumn {
+    fn new(rows: usize, width: usize) -> Self {
+        Self {
+            bytes: vec![0u8; rows * width],
+            width,
+        }
+    }
+
+    /// Encoded bytes for one row.
+    #[must_use]
+    pub fn row(&self, row: usize) -> &[u8] {
+        &self.bytes[row * self.width..(row + 1) * self.width]
+    }
+
+    /// Width in bytes of every row's encoding.
+    #[must_use]
+    pub const fn width(&self) -> usize {
+        self.width
+    }
+
+    fn slot(&mut self, row: usize) -> &mut [u8] {
+        let width = self.width;
+        &mut self.bytes[row * width..(row + 1) * width]
+    }
+}
+
+/// Bytes every whole number, floating point value, and date or timestamp is
+/// encoded into, matching the reference.
+///
+/// The width is what keeps the clustering balanced. A column encoded at its
+/// natural width carries its significant bits at a lower offset than a wider
+/// one, so it reaches the high order bits of the interleaved key first and the
+/// wider column stops contributing. Encoding every number at one width puts
+/// their significant bits at the same offset, so neither dominates.
+const PRIMITIVE_WIDTH: usize = 8;
+
+/// Bytes a 128-bit decimal is encoded into, which is its natural width.
+const DECIMAL_WIDTH: usize = 16;
+
+fn downcast<'a, T: 'static>(
+    array: &'a dyn Array,
+    expected: &str,
+) -> Result<&'a T, IcebergRewriteError> {
+    array
+        .as_any()
+        .downcast_ref::<T>()
+        .ok_or_else(|| IcebergRewriteError::UnsupportedZOrderType {
+            column: expected.to_string(),
+            dtype: format!("{:?}", array.data_type()),
+        })
+}
+
+/// Encode each row of `array` as an ordered byte slice of one fixed width.
+///
+/// Whole numbers, floating point values, dates and timestamps all encode to
+/// [`PRIMITIVE_WIDTH`] bytes, decimals to sixteen, and text and binary to
+/// `var_length_contribution` bytes by truncating or padding. Nulls encode to
+/// zeroes, which sorts them first.
 pub fn normalize_to_ordered_bytes(
     array: &dyn Array,
     var_length_contribution: u32,
-) -> Result<Vec<Vec<u8>>, IcebergRewriteError> {
+) -> Result<OrderedColumn, IcebergRewriteError> {
     let n = array.len();
-    let mut out: Vec<Vec<u8>> = Vec::with_capacity(n);
     let var_len = var_length_contribution as usize;
 
     match array.data_type() {
-        DataType::Boolean => fill(&mut out, array, n, |i, nulls| {
-            let a = array.as_any().downcast_ref::<BooleanArray>().unwrap();
-            if nulls.is_null(i) {
-                vec![0u8; 1]
-            } else if a.value(i) {
-                vec![0x01u8]
-            } else {
-                vec![0x00u8]
+        DataType::Boolean => {
+            let a = downcast::<BooleanArray>(array, "boolean")?;
+            Ok(whole_numbers(n, |i| i64::from(a.value(i)), array))
+        }
+        DataType::Int8 => {
+            let a = downcast::<Int8Array>(array, "int8")?;
+            Ok(whole_numbers(n, |i| i64::from(a.value(i)), array))
+        }
+        DataType::Int16 => {
+            let a = downcast::<Int16Array>(array, "int16")?;
+            Ok(whole_numbers(n, |i| i64::from(a.value(i)), array))
+        }
+        DataType::Int32 => {
+            let a = downcast::<Int32Array>(array, "int32")?;
+            Ok(whole_numbers(n, |i| i64::from(a.value(i)), array))
+        }
+        DataType::Int64 => {
+            let a = downcast::<Int64Array>(array, "int64")?;
+            Ok(whole_numbers(n, |i| a.value(i), array))
+        }
+        DataType::UInt8 => {
+            let a = downcast::<UInt8Array>(array, "uint8")?;
+            Ok(unsigned_numbers(n, |i| u64::from(a.value(i)), array))
+        }
+        DataType::UInt16 => {
+            let a = downcast::<UInt16Array>(array, "uint16")?;
+            Ok(unsigned_numbers(n, |i| u64::from(a.value(i)), array))
+        }
+        DataType::UInt32 => {
+            let a = downcast::<UInt32Array>(array, "uint32")?;
+            Ok(unsigned_numbers(n, |i| u64::from(a.value(i)), array))
+        }
+        DataType::UInt64 => {
+            let a = downcast::<UInt64Array>(array, "uint64")?;
+            Ok(unsigned_numbers(n, |i| a.value(i), array))
+        }
+        DataType::Float32 => {
+            let a = downcast::<Float32Array>(array, "float32")?;
+            Ok(floats(n, |i| f64::from(a.value(i)), array))
+        }
+        DataType::Float64 => {
+            let a = downcast::<Float64Array>(array, "float64")?;
+            Ok(floats(n, |i| a.value(i), array))
+        }
+        DataType::Date32 => {
+            let a = downcast::<Date32Array>(array, "date32")?;
+            Ok(whole_numbers(n, |i| i64::from(a.value(i)), array))
+        }
+        DataType::Timestamp(unit, _) => Ok(match unit {
+            TimeUnit::Second => {
+                let a = downcast::<TimestampSecondArray>(array, "timestamp")?;
+                whole_numbers(n, |i| a.value(i), array)
+            }
+            TimeUnit::Millisecond => {
+                let a = downcast::<TimestampMillisecondArray>(array, "timestamp")?;
+                whole_numbers(n, |i| a.value(i), array)
+            }
+            TimeUnit::Microsecond => {
+                let a = downcast::<TimestampMicrosecondArray>(array, "timestamp")?;
+                whole_numbers(n, |i| a.value(i), array)
+            }
+            TimeUnit::Nanosecond => {
+                let a = downcast::<TimestampNanosecondArray>(array, "timestamp")?;
+                whole_numbers(n, |i| a.value(i), array)
             }
         }),
-        DataType::Int8 => fill_int!(out, array, Int8Array, i8, n, 1),
-        DataType::Int16 => fill_int!(out, array, Int16Array, i16, n, 2),
-        DataType::Int32 => fill_int!(out, array, Int32Array, i32, n, 4),
-        DataType::Int64 => fill_int!(out, array, Int64Array, i64, n, 8),
-        DataType::UInt8 => fill_uint!(out, array, UInt8Array, u8, n, 1),
-        DataType::UInt16 => fill_uint!(out, array, UInt16Array, u16, n, 2),
-        DataType::UInt32 => fill_uint!(out, array, UInt32Array, u32, n, 4),
-        DataType::UInt64 => fill_uint!(out, array, UInt64Array, u64, n, 8),
-        DataType::Float32 => fill(&mut out, array, n, |i, nulls| {
-            let a = array.as_any().downcast_ref::<Float32Array>().unwrap();
-            if nulls.is_null(i) {
-                vec![0u8; 4]
-            } else {
-                encode_float32(a.value(i)).to_vec()
-            }
-        }),
-        DataType::Float64 => fill(&mut out, array, n, |i, nulls| {
-            let a = array.as_any().downcast_ref::<Float64Array>().unwrap();
-            if nulls.is_null(i) {
-                vec![0u8; 8]
-            } else {
-                encode_float64(a.value(i)).to_vec()
-            }
-        }),
-        DataType::Date32 => fill_int!(out, array, Date32Array, i32, n, 4),
-        DataType::Timestamp(unit, _) => match unit {
-            TimeUnit::Second => fill_int!(out, array, TimestampSecondArray, i64, n, 8),
-            TimeUnit::Millisecond => fill_int!(out, array, TimestampMillisecondArray, i64, n, 8),
-            TimeUnit::Microsecond => fill_int!(out, array, TimestampMicrosecondArray, i64, n, 8),
-            TimeUnit::Nanosecond => fill_int!(out, array, TimestampNanosecondArray, i64, n, 8),
-        },
-        DataType::Decimal128(_, _) => fill(&mut out, array, n, |i, nulls| {
-            let a = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
-            if nulls.is_null(i) {
-                vec![0u8; 16]
-            } else {
+        DataType::Decimal128(_, _) => {
+            let a = downcast::<Decimal128Array>(array, "decimal128")?;
+            let mut out = OrderedColumn::new(n, DECIMAL_WIDTH);
+            for i in 0..n {
+                if array.is_null(i) {
+                    continue;
+                }
                 let mut bytes = a.value(i).to_be_bytes();
                 bytes[0] ^= 0x80;
-                bytes.to_vec()
+                out.slot(i).copy_from_slice(&bytes);
             }
-        }),
-        DataType::Utf8 => fill_var!(out, array, StringArray, str_to_bytes, n, var_len),
-        DataType::LargeUtf8 => fill_var!(out, array, LargeStringArray, str_to_bytes, n, var_len),
-        DataType::Binary => fill_var!(out, array, BinaryArray, bytes_passthrough, n, var_len),
+            Ok(out)
+        }
+        DataType::Utf8 => {
+            let a = downcast::<StringArray>(array, "utf8")?;
+            Ok(variable_width(n, var_len, |i| a.value(i).as_bytes(), array))
+        }
+        DataType::LargeUtf8 => {
+            let a = downcast::<LargeStringArray>(array, "utf8")?;
+            Ok(variable_width(n, var_len, |i| a.value(i).as_bytes(), array))
+        }
+        DataType::Binary => {
+            let a = downcast::<BinaryArray>(array, "binary")?;
+            Ok(variable_width(n, var_len, |i| a.value(i), array))
+        }
         DataType::LargeBinary => {
-            fill_var!(out, array, LargeBinaryArray, bytes_passthrough, n, var_len);
+            let a = downcast::<LargeBinaryArray>(array, "binary")?;
+            Ok(variable_width(n, var_len, |i| a.value(i), array))
         }
-        other => {
-            return Err(IcebergRewriteError::UnsupportedZOrderType {
-                column: String::new(),
-                dtype: format!("{other:?}"),
-            });
-        }
+        other => Err(IcebergRewriteError::UnsupportedZOrderType {
+            column: String::new(),
+            dtype: format!("{other:?}"),
+        }),
     }
-    Ok(out)
 }
 
-fn fill<F: FnMut(usize, &dyn ArrayNullCheck) -> Vec<u8>>(
-    out: &mut Vec<Vec<u8>>,
-    array: &dyn Array,
-    n: usize,
-    mut f: F,
-) {
-    let null_check = NullCheckImpl { array };
+/// Encode signed values so that two's-complement order matches byte order.
+fn whole_numbers<F: Fn(usize) -> i64>(n: usize, value: F, nulls: &dyn Array) -> OrderedColumn {
+    let mut out = OrderedColumn::new(n, PRIMITIVE_WIDTH);
     for i in 0..n {
-        out.push(f(i, &null_check));
+        if nulls.is_null(i) {
+            continue;
+        }
+        let bytes = (value(i) ^ i64::MIN).to_be_bytes();
+        out.slot(i).copy_from_slice(&bytes);
     }
+    out
 }
 
-trait ArrayNullCheck {
-    fn is_null(&self, i: usize) -> bool;
-}
-struct NullCheckImpl<'a> {
-    array: &'a dyn Array,
-}
-impl ArrayNullCheck for NullCheckImpl<'_> {
-    fn is_null(&self, i: usize) -> bool {
-        self.array.is_null(i)
+/// Encode unsigned values, whose byte order already matches their value order.
+fn unsigned_numbers<F: Fn(usize) -> u64>(n: usize, value: F, nulls: &dyn Array) -> OrderedColumn {
+    let mut out = OrderedColumn::new(n, PRIMITIVE_WIDTH);
+    for i in 0..n {
+        if nulls.is_null(i) {
+            continue;
+        }
+        let bytes = value(i).to_be_bytes();
+        out.slot(i).copy_from_slice(&bytes);
     }
+    out
 }
 
-macro_rules! fill_int {
-    ($out:expr, $array:expr, $arr_ty:ty, $prim_ty:ty, $n:expr, $width:literal) => {{
-        let a = $array.as_any().downcast_ref::<$arr_ty>().unwrap();
-        for i in 0..$n {
-            if a.is_null(i) {
-                $out.push(vec![0u8; $width]);
-            } else {
-                let v = a.value(i) as $prim_ty;
-                let mut bytes = v.to_be_bytes();
-                // Flip the sign bit so that two's-complement order matches lexicographic order.
-                bytes[0] ^= 0x80;
-                $out.push(bytes.to_vec());
-            }
+/// Encode floating point values through the total-order transform.
+fn floats<F: Fn(usize) -> f64>(n: usize, value: F, nulls: &dyn Array) -> OrderedColumn {
+    let mut out = OrderedColumn::new(n, PRIMITIVE_WIDTH);
+    for i in 0..n {
+        if nulls.is_null(i) {
+            continue;
         }
-    }};
+        out.slot(i).copy_from_slice(&encode_float64(value(i)));
+    }
+    out
 }
-pub(crate) use fill_int;
 
-macro_rules! fill_uint {
-    ($out:expr, $array:expr, $arr_ty:ty, $prim_ty:ty, $n:expr, $width:literal) => {{
-        let a = $array.as_any().downcast_ref::<$arr_ty>().unwrap();
-        for i in 0..$n {
-            if a.is_null(i) {
-                $out.push(vec![0u8; $width]);
-            } else {
-                let v = a.value(i) as $prim_ty;
-                $out.push(v.to_be_bytes().to_vec());
-            }
+/// Take the leading bytes of each value, zero padded to a common width.
+fn variable_width<'a, F: Fn(usize) -> &'a [u8]>(
+    n: usize,
+    width: usize,
+    value: F,
+    nulls: &dyn Array,
+) -> OrderedColumn {
+    let mut out = OrderedColumn::new(n, width);
+    for i in 0..n {
+        if nulls.is_null(i) {
+            continue;
         }
-    }};
-}
-pub(crate) use fill_uint;
-
-fn str_to_bytes(s: &str) -> &[u8] {
-    s.as_bytes()
-}
-fn bytes_passthrough(b: &[u8]) -> &[u8] {
-    b
-}
-
-macro_rules! fill_var {
-    ($out:expr, $array:expr, $arr_ty:ty, $extract:expr, $n:expr, $var_len:expr) => {{
-        let a = $array.as_any().downcast_ref::<$arr_ty>().unwrap();
-        for i in 0..$n {
-            if a.is_null(i) {
-                $out.push(vec![0u8; $var_len]);
-            } else {
-                let raw: &[u8] = $extract(a.value(i));
-                let mut buf = vec![0u8; $var_len];
-                let take = raw.len().min($var_len);
-                buf[..take].copy_from_slice(&raw[..take]);
-                $out.push(buf);
-            }
-        }
-    }};
-}
-pub(crate) use fill_var;
-
-fn encode_float32(v: f32) -> [u8; 4] {
-    let bits = v.to_bits();
-    // Flip sign bit for non-negatives; flip all bits for negatives. NaN sorts last
-    // because its raw bit pattern's top bits are 1.
-    let mapped = if bits & 0x8000_0000 == 0 {
-        bits ^ 0x8000_0000
-    } else {
-        !bits
-    };
-    mapped.to_be_bytes()
+        let raw = value(i);
+        let take = raw.len().min(width);
+        out.slot(i)[..take].copy_from_slice(&raw[..take]);
+    }
+    out
 }
 
 fn encode_float64(v: f64) -> [u8; 8] {
     let bits = v.to_bits();
+    // Flip the sign bit for non-negatives and every bit for negatives, so the
+    // result orders the way the values do. NaN sorts last.
     let mapped = if bits & 0x8000_0000_0000_0000 == 0 {
         bits ^ 0x8000_0000_0000_0000
     } else {
@@ -212,45 +272,43 @@ fn encode_float64(v: f64) -> [u8; 8] {
     mapped.to_be_bytes()
 }
 
-/// Interleave the bits of each row's per-column byte arrays into a single binary key.
+/// Interleave the columns' bits into one key per row, most significant first.
 ///
-/// `columns[c][r]` is the normalized bytes for column `c` row `r`. Output has `n_rows`
-/// entries each of length `output_size`. Shorter columns are zero-padded.
-pub fn interleave_bits(columns: &[Vec<Vec<u8>>], output_size: u64) -> Vec<Vec<u8>> {
-    if columns.is_empty() {
+/// A column that has run out of bytes is skipped rather than contributing a
+/// zero, so the columns still carrying information keep the whole of the
+/// remaining key. Output shorter than the interleave is truncated, and output
+/// longer is left zero padded.
+pub fn interleave_bits(columns: &[OrderedColumn], output_size: u64) -> Vec<u8> {
+    let output_bytes = output_size as usize;
+    if columns.is_empty() || output_bytes == 0 {
         return Vec::new();
     }
-    let n_rows = columns[0].len();
-    debug_assert!(columns.iter().all(|c| c.len() == n_rows));
-    let output_bytes = output_size as usize;
+    let n_rows = columns[0].bytes.len() / columns[0].width.max(1);
     let output_bits = output_bytes * 8;
+    let max_col_bits = columns.iter().map(|c| c.width * 8).max().unwrap_or(0);
 
-    let mut out: Vec<Vec<u8>> = Vec::with_capacity(n_rows);
-    for r in 0..n_rows {
-        let mut buf = vec![0u8; output_bytes];
+    let mut out = vec![0u8; n_rows * output_bytes];
+    for row in 0..n_rows {
+        let dst = &mut out[row * output_bytes..(row + 1) * output_bytes];
         let mut out_bit = 0usize;
-        let max_col_bits = columns.iter().map(|c| c[r].len() * 8).max().unwrap_or(0);
-        let mut src_bit = 0usize;
-        while out_bit < output_bits && src_bit < max_col_bits {
+        for src_bit in 0..max_col_bits {
+            if out_bit >= output_bits {
+                break;
+            }
             for col in columns {
                 if out_bit >= output_bits {
                     break;
                 }
-                let bytes = &col[r];
-                let bit = if src_bit < bytes.len() * 8 {
-                    let byte = bytes[src_bit / 8];
-                    (byte >> (7 - (src_bit % 8))) & 1
-                } else {
-                    0
-                };
-                if bit != 0 {
-                    buf[out_bit / 8] |= 1 << (7 - (out_bit % 8));
+                if src_bit >= col.width * 8 {
+                    continue;
+                }
+                let byte = col.row(row)[src_bit / 8];
+                if (byte >> (7 - (src_bit % 8))) & 1 != 0 {
+                    dst[out_bit / 8] |= 1 << (7 - (out_bit % 8));
                 }
                 out_bit += 1;
             }
-            src_bit += 1;
         }
-        out.push(buf);
     }
     out
 }
@@ -279,15 +337,16 @@ pub fn build_zorder_key_array(
             });
         }
     }
-    let mut per_column: Vec<Vec<Vec<u8>>> = Vec::with_capacity(arrays.len());
+    let mut per_column: Vec<OrderedColumn> = Vec::with_capacity(arrays.len());
     for a in arrays {
         per_column.push(normalize_to_ordered_bytes(
             a.as_ref(),
             var_length_contribution,
         )?);
     }
+    let width = max_output_size as usize;
     let keys = interleave_bits(&per_column, max_output_size);
-    let arr = BinaryArray::from_iter_values(keys.iter().map(|v| v.as_slice()));
+    let arr = BinaryArray::from_iter_values((0..n_rows).map(|r| &keys[r * width..(r + 1) * width]));
     Ok(arr.into_data())
 }
 
@@ -296,6 +355,17 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    /// Build a column from explicit rows, all of one width.
+    fn column(rows: &[&[u8]]) -> OrderedColumn {
+        let width = rows[0].len();
+        let mut out = OrderedColumn::new(rows.len(), width);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row.len(), width, "rows must share a width");
+            out.slot(i).copy_from_slice(row);
+        }
+        out
+    }
 
     fn assert_lex_order_matches<T, F>(values: Vec<T>, encode: F)
     where
@@ -323,7 +393,7 @@ mod tests {
         assert_lex_order_matches(vals, |v| {
             let arr = Int32Array::from(vec![v]);
             let bytes = normalize_to_ordered_bytes(&arr, 8).unwrap();
-            bytes[0].clone()
+            bytes.row(0).to_vec()
         });
     }
 
@@ -341,7 +411,7 @@ mod tests {
         assert_lex_order_matches(vals, |v| {
             let arr = Int64Array::from(vec![v]);
             let bytes = normalize_to_ordered_bytes(&arr, 8).unwrap();
-            bytes[0].clone()
+            bytes.row(0).to_vec()
         });
     }
 
@@ -361,7 +431,7 @@ mod tests {
         assert_lex_order_matches(vals, |v| {
             let arr = Float64Array::from(vec![v]);
             let bytes = normalize_to_ordered_bytes(&arr, 8).unwrap();
-            bytes[0].clone()
+            bytes.row(0).to_vec()
         });
     }
 
@@ -369,27 +439,71 @@ mod tests {
     fn null_becomes_zero_padded_bytes() {
         let arr = Int32Array::from(vec![Some(1), None, Some(2)]);
         let bytes = normalize_to_ordered_bytes(&arr, 8).unwrap();
-        assert_eq!(bytes[1], vec![0u8; 4]);
-        assert_eq!(bytes[0].len(), 4);
-        assert_eq!(bytes[2].len(), 4);
+        assert_eq!(
+            bytes.width(),
+            PRIMITIVE_WIDTH,
+            "a narrow int widens like any other"
+        );
+        assert_eq!(bytes.row(1), vec![0u8; PRIMITIVE_WIDTH]);
+    }
+
+    #[test]
+    fn narrow_and_wide_whole_numbers_encode_alike() {
+        // The point of one width: the same value encodes identically whatever
+        // its column's natural size, so neither column dominates the key.
+        let narrow = normalize_to_ordered_bytes(&Int32Array::from(vec![12_345i32]), 8).unwrap();
+        let wide = normalize_to_ordered_bytes(&Int64Array::from(vec![12_345i64]), 8).unwrap();
+        assert_eq!(narrow.row(0), wide.row(0));
+    }
+
+    #[test]
+    fn narrow_and_wide_floats_encode_alike() {
+        let narrow = normalize_to_ordered_bytes(&Float32Array::from(vec![0.5f32]), 8).unwrap();
+        let wide = normalize_to_ordered_bytes(&Float64Array::from(vec![0.5f64]), 8).unwrap();
+        assert_eq!(narrow.row(0), wide.row(0));
+    }
+
+    #[test]
+    fn an_exhausted_column_is_skipped_rather_than_padded() {
+        // A four-byte column beside an eight-byte one runs out halfway. The
+        // longer column should keep the rest of the key to itself.
+        let short = column(&[&[0u8; 4]]);
+        let long = column(&[&[0xFFu8; 8]]);
+
+        let key = interleave_bits(&[short, long], 16);
+
+        // The first 32 bits of each column interleave into eight bytes, one bit
+        // in two coming from the all-zero short column: 0x55 repeated.
+        assert_eq!(
+            &key[..8],
+            &[0x55u8; 8],
+            "both columns alternate while both have bytes"
+        );
+        // The short column is spent after that, so the long column's remaining
+        // 32 bits land consecutively rather than every other bit.
+        assert_eq!(
+            &key[8..12],
+            &[0xFFu8; 4],
+            "the surviving column keeps the rest"
+        );
+        assert_eq!(&key[12..], &[0u8; 4], "nothing is left to fill the tail");
     }
 
     #[test]
     fn utf8_truncates_and_pads() {
         let arr = StringArray::from(vec![Some("a"), Some("abcdefghijklmnop"), None]);
         let bytes = normalize_to_ordered_bytes(&arr, 4).unwrap();
-        assert_eq!(bytes[0], b"a\x00\x00\x00");
-        assert_eq!(bytes[1], b"abcd");
-        assert_eq!(bytes[2], vec![0u8; 4]);
+        assert_eq!(bytes.row(0), b"a\x00\x00\x00");
+        assert_eq!(bytes.row(1), b"abcd");
+        assert_eq!(bytes.row(2), vec![0u8; 4]);
     }
 
     #[test]
     fn boolean_encoding_matches_canonical() {
         let arr = BooleanArray::from(vec![Some(true), Some(false), None]);
         let bytes = normalize_to_ordered_bytes(&arr, 8).unwrap();
-        assert_eq!(bytes[0], vec![0x01u8]);
-        assert_eq!(bytes[1], vec![0x00u8]);
-        assert_eq!(bytes[2], vec![0x00u8]);
+        assert!(bytes.row(0) > bytes.row(1), "true sorts after false");
+        assert_eq!(bytes.row(2), vec![0u8; PRIMITIVE_WIDTH], "null sorts first");
     }
 
     #[test]
@@ -406,7 +520,8 @@ mod tests {
         .with_precision_and_scale(20, 4)
         .unwrap();
         let bytes = normalize_to_ordered_bytes(&arr, 8).unwrap();
-        for w in bytes[..5].windows(2) {
+        let rows: Vec<Vec<u8>> = (0..5).map(|i| bytes.row(i).to_vec()).collect();
+        for w in rows.windows(2) {
             assert!(
                 w[0] <= w[1],
                 "decimal ordering broken: {:?} vs {:?}",
@@ -414,18 +529,16 @@ mod tests {
                 w[1]
             );
         }
-        assert_eq!(bytes[5], vec![0u8; 16]);
+        assert_eq!(bytes.row(5), vec![0u8; DECIMAL_WIDTH]);
     }
 
     #[test]
     fn partial_null_row_still_clusters_by_other_columns() {
-        let a = vec![vec![0x80u8, 0, 0, 0], vec![0u8; 4]];
-        let b = vec![vec![0x80u8, 0, 0, 0], vec![0x80u8, 0, 0, 0]];
+        let a = column(&[&[0x80u8, 0, 0, 0], &[0u8; 4]]);
+        let b = column(&[&[0x80u8, 0, 0, 0], &[0x80u8, 0, 0, 0]]);
         let out = interleave_bits(&[a, b], 8);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].len(), 8);
-        assert_eq!(out[1].len(), 8);
-        assert_ne!(out[0], out[1]);
+        assert_eq!(out.len(), 16, "two rows of eight bytes");
+        assert_ne!(out[..8], out[8..]);
     }
 
     #[test]
@@ -435,24 +548,24 @@ mod tests {
         // Interleaved (A bit then B bit) gives: 11 11 11 11 11 11 11 11 starting with A=1,B=1.
         // Sequence: A0=1,B0=1, A1=0,B1=1, A2=1,B2=1, A3=0,B3=1, A4=1,B4=1, A5=0,B5=1, A6=1,B6=1, A7=0,B7=1
         // → 11 01 11 01 11 01 11 01 = 0xDD 0xDD
-        let cols = vec![vec![vec![0xAAu8]], vec![vec![0xFFu8]]];
+        let cols = vec![column(&[&[0xAAu8]]), column(&[&[0xFFu8]])];
         let out = interleave_bits(&cols, 2);
-        assert_eq!(out[0], vec![0xDDu8, 0xDDu8]);
+        assert_eq!(out, vec![0xDDu8, 0xDDu8]);
     }
 
     #[test]
     fn interleave_all_zero_inputs_yield_all_zero_key() {
-        let cols = vec![vec![vec![0u8; 4]], vec![vec![0u8; 4]]];
+        let cols = vec![column(&[&[0u8; 4]]), column(&[&[0u8; 4]])];
         let out = interleave_bits(&cols, 4);
-        assert_eq!(out[0], vec![0u8; 4]);
+        assert_eq!(out, vec![0u8; 4]);
     }
 
     #[test]
     fn interleave_respects_output_size_truncation() {
-        let cols = vec![vec![vec![0xFFu8; 16]], vec![vec![0xFFu8; 16]]];
+        let cols = vec![column(&[&[0xFFu8; 16]]), column(&[&[0xFFu8; 16]])];
         let out = interleave_bits(&cols, 4);
-        assert_eq!(out[0].len(), 4);
-        assert!(out[0].iter().all(|b| *b == 0xFFu8));
+        assert_eq!(out.len(), 4);
+        assert!(out.iter().all(|b| *b == 0xFFu8));
     }
 
     #[test]

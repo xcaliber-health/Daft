@@ -361,8 +361,8 @@ class IcebergTable(Table):
             (default true), ``delete-file-threshold``,
             ``partial-progress.enabled``, ``partial-progress.max-commits``,
             ``partial-progress.max-failed-commits``, ``compression-factor``,
-            ``remove-dangling-deletes``, ``zorder.max-output-size``,
-            ``zorder.var-length-contribution``,
+            ``remove-dangling-deletes``, ``max-output-size`` and
+            ``var-length-contribution`` (zorder only), ``delete-ratio-threshold``,
             ``conflict-isolation`` (``"serializable"`` default or ``"snapshot"``).
             Commit retry is tuned via
             table properties ``commit.retry.num-retries``,

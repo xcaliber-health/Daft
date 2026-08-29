@@ -69,6 +69,7 @@ pub fn create_pyarrow_catalog_writer(
             iceberg_schema,
             iceberg_properties,
             partition_spec_id,
+            sort_order_id,
             io_config,
             ..
         }) => {
@@ -78,6 +79,7 @@ pub fn create_pyarrow_catalog_writer(
                 iceberg_schema,
                 iceberg_properties,
                 *partition_spec_id,
+                *sort_order_id,
                 partition_values,
                 io_config.as_ref(),
             )?;

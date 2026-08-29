@@ -31,6 +31,7 @@ fn err_to_py(e: IcebergRewriteError) -> PyErr {
         IcebergRewriteError::InvalidOption { .. } => PyValueError::new_err(e.to_string()),
         IcebergRewriteError::UnsupportedZOrderType { .. } => PyValueError::new_err(e.to_string()),
         IcebergRewriteError::UnknownOutputSpec { .. } => PyValueError::new_err(e.to_string()),
+        IcebergRewriteError::UnknownOptions { .. } => PyValueError::new_err(e.to_string()),
     }
 }
 
@@ -43,7 +44,51 @@ macro_rules! get_opt {
     }};
 }
 
+/// Every option the planner reads. A key outside this set is refused rather than
+/// ignored, so a mistyped option fails instead of quietly doing nothing.
+const SUPPORTED_OPTIONS: &[&str] = &[
+    "compression-factor",
+    "delete-file-threshold",
+    "delete-ratio-threshold",
+    "max-concurrent-file-group-rewrites",
+    "max-file-group-size-bytes",
+    "max-file-size-bytes",
+    "max-files-to-rewrite",
+    "max-output-size",
+    "min-file-size-bytes",
+    "min-input-files",
+    "output-spec-id",
+    "partial-progress.enabled",
+    "partial-progress.max-commits",
+    "partial-progress.max-failed-commits",
+    "remove-dangling-deletes",
+    "rewrite-all",
+    "rewrite-job-order",
+    "shuffle-partitions-per-file",
+    "target-file-size-bytes",
+    "use-starting-sequence-number",
+    "var-length-contribution",
+];
+
+fn reject_unknown_options(py_opts: &Bound<'_, PyDict>) -> PyResult<()> {
+    let mut unknown: Vec<String> = py_opts
+        .keys()
+        .iter()
+        .filter_map(|key| key.extract::<String>().ok())
+        .filter(|key| !SUPPORTED_OPTIONS.contains(&key.as_str()))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort();
+    Err(err_to_py(IcebergRewriteError::UnknownOptions {
+        names: unknown,
+        supported: SUPPORTED_OPTIONS.iter().map(|s| (*s).to_string()).collect(),
+    }))
+}
+
 fn parse_options(py_opts: &Bound<'_, PyDict>) -> PyResult<RewriteOptions> {
+    reject_unknown_options(py_opts)?;
     let mut o = RewriteOptions::default();
     if let Some(v) = get_opt!(py_opts, "target-file-size-bytes", u64) {
         o.target_file_size_bytes = v;
@@ -56,6 +101,9 @@ fn parse_options(py_opts: &Bound<'_, PyDict>) -> PyResult<RewriteOptions> {
     }
     if let Some(v) = get_opt!(py_opts, "delete-file-threshold", u32) {
         o.delete_file_threshold = v;
+    }
+    if let Some(v) = get_opt!(py_opts, "delete-ratio-threshold", f64) {
+        o.delete_ratio_threshold = v;
     }
     if let Some(v) = get_opt!(py_opts, "rewrite-all", bool) {
         o.rewrite_all = v;
@@ -119,6 +167,8 @@ fn candidate_from_dict(d: &Bound<'_, PyDict>) -> PyResult<CandidateFile> {
     let positional_delete_paths =
         get_opt!(d, "positional_delete_paths", Vec<String>).unwrap_or_default();
     let has_equality_deletes = get_opt!(d, "has_equality_deletes", bool).unwrap_or(false);
+    let record_count = get_opt!(d, "record_count", u64).unwrap_or(0);
+    let deleted_record_count = get_opt!(d, "deleted_record_count", u64).unwrap_or(0);
     Ok(CandidateFile {
         path,
         size_bytes,
@@ -126,6 +176,8 @@ fn candidate_from_dict(d: &Bound<'_, PyDict>) -> PyResult<CandidateFile> {
         partition_spec_id,
         positional_delete_paths,
         has_equality_deletes,
+        record_count,
+        deleted_record_count,
     })
 }
 
@@ -134,6 +186,8 @@ fn group_to_dict<'py>(py: Python<'py>, g: &FileGroup) -> PyResult<Bound<'py, PyD
     out.set_item("partition_key", &g.partition_key)?;
     out.set_item("output_spec_id", g.output_spec_id)?;
     out.set_item("total_bytes", g.total_bytes)?;
+    out.set_item("expected_output_files", g.expected_output_files)?;
+    out.set_item("input_split_size", g.input_split_size)?;
     let files = PyList::empty(py);
     for f in &g.files {
         let fd = PyDict::new(py);
@@ -143,6 +197,8 @@ fn group_to_dict<'py>(py: Python<'py>, g: &FileGroup) -> PyResult<Bound<'py, PyD
         fd.set_item("partition_spec_id", f.partition_spec_id)?;
         fd.set_item("positional_delete_paths", &f.positional_delete_paths)?;
         fd.set_item("has_equality_deletes", f.has_equality_deletes)?;
+        fd.set_item("record_count", f.record_count)?;
+        fd.set_item("deleted_record_count", f.deleted_record_count)?;
         files.append(fd)?;
     }
     out.set_item("files", files)?;
@@ -190,6 +246,7 @@ fn validate_options_py<'py>(
     d.set_item("min-input-files", o.min_input_files)?;
     d.set_item("max-file-group-size-bytes", o.max_file_group_size_bytes)?;
     d.set_item("delete-file-threshold", o.delete_file_threshold)?;
+    d.set_item("delete-ratio-threshold", o.delete_ratio_threshold)?;
     d.set_item("rewrite-all", o.rewrite_all)?;
     d.set_item("partial-progress.enabled", o.partial_progress_enabled)?;
     d.set_item(

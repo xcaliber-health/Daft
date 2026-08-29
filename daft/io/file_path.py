@@ -24,7 +24,9 @@ def from_glob_path(path: str | list[str], io_config: IOConfig | None = None) -> 
 
     1. path: the path to the file/directory
     2. size: size of the object in bytes
-    3. rows: the total rows of parquet object, it's None for other formats.
+    3. num_rows: the total rows of a parquet object; None for other formats
+    4. mtime: last modification time in milliseconds since the epoch; None where
+       the storage backend does not report one
 
     Args:
         path (str|list): Path to files on disk (allows wildcards).

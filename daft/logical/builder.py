@@ -402,6 +402,10 @@ class LogicalPlanBuilder:
         io_config: IOConfig,
         target_file_size_bytes: int | None = None,
         partition_spec_id: int | None = None,
+        *,
+        require_matching_columns: bool = False,
+        sort_order_id: int = 0,
+        inflation_factor: float | None = None,
     ) -> LogicalPlanBuilder:
         """Build a plan that writes this DataFrame as data files for a destination table.
 
@@ -419,6 +423,19 @@ class LogicalPlanBuilder:
             When set, writes using the destination's partition spec with this id
             rather than its current spec. Used by compaction when re-clustering a
             group into a different partitioning.
+        require_matching_columns
+            When set, refuse a write whose columns do not line up with the
+            destination's. Used by compaction, where the rows came from the table
+            itself, so a mismatch means they were read under names it no longer
+            uses and writing would empty a column.
+        sort_order_id
+            Identifier of the order the rows being written are in. Defaults to the
+            unsorted order, which is what a write that does not order its rows
+            records. Compaction sets it when the rewrite sorted the rows, since
+            that is the only durable evidence the output is clustered.
+        inflation_factor
+            Measured ratio of in-memory to on-disk size, used to size the first
+            output file. Left unset the writer starts from a configured guess.
         """
         from daft.io.iceberg.iceberg_write import get_missing_columns, partition_field_to_expr
 
@@ -426,7 +443,9 @@ class LogicalPlanBuilder:
         location = table.metadata.properties.get("write.data.path", f"{table.location()}/data")
         partition_spec = table.spec() if partition_spec_id is None else table.specs()[partition_spec_id]
         schema = table.schema()
-        missing_columns = get_missing_columns(self.schema().to_pyarrow_schema(), schema)
+        missing_columns = get_missing_columns(
+            self.schema().to_pyarrow_schema(), schema, require_matching_columns=require_matching_columns
+        )
         builder = (
             self._builder
             if len(missing_columns) == 0
@@ -436,9 +455,19 @@ class LogicalPlanBuilder:
         props = dict(table.properties)
         if target_file_size_bytes is not None:
             props["write.target-file-size-bytes"] = str(int(target_file_size_bytes))
+        if inflation_factor is not None:
+            props["daft.write.inflation-factor"] = repr(float(inflation_factor))
         columns = [col.name for col in schema.columns]
         builder = builder.iceberg_write(
-            name, location, partition_spec.spec_id, partition_cols, schema, props, columns, io_config
+            name,
+            location,
+            partition_spec.spec_id,
+            partition_cols,
+            schema,
+            props,
+            columns,
+            sort_order_id,
+            io_config,
         )
         return LogicalPlanBuilder(builder)
 

@@ -1941,8 +1941,7 @@ class PySeriesIterator:
     def __next__(self) -> Any: ...
     def __iter__(self) -> PySeriesIterator: ...
 
-class PyShowOptions:
-    ...
+class PyShowOptions: ...
 
 class OperatorMetrics:
     def inc_counter(
@@ -2376,6 +2375,7 @@ class LogicalPlanBuilder:
         iceberg_schema: IcebergSchema,
         iceberg_properties: IcebergTableProperties,
         catalog_columns: list[str],
+        sort_order_id: int,
         io_config: IOConfig | None = None,
     ) -> LogicalPlanBuilder: ...
     def delta_write(
@@ -2570,7 +2570,6 @@ class LocalPhysicalPlan:
 
 class Input:
     """Input for NativeExecutor execution. Holds ScanTasks or GlobPaths."""
-
 
 class NativeExecutor:
     def __init__(self, is_flotilla_worker: bool, ip: str) -> None: ...

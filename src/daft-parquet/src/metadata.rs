@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
+};
 
 use bytes::{Bytes, BytesMut};
 use common_runtime::get_io_runtime;
@@ -23,6 +26,61 @@ fn get_field_id(info: &parquet::schema::types::BasicTypeInfo) -> Option<i32> {
     info.has_id().then(|| info.id())
 }
 
+/// Index of column name to field ID, used only for files whose schema carries no
+/// field IDs of its own.
+///
+/// A name is included only when exactly one field claims it. An ambiguous name
+/// -- the same leaf name under two different structs, for example -- is left out
+/// so it can never be resolved to the wrong column; such a column is reported as
+/// unresolvable instead of being silently mismatched.
+type NameIndex<'a> = HashMap<&'a str, i32>;
+
+/// Build the unambiguous name index for a field ID mapping.
+fn build_name_index(field_id_mapping: &BTreeMap<i32, Field>) -> NameIndex<'_> {
+    let mut seen_twice: HashSet<&str> = HashSet::new();
+    let mut index: NameIndex<'_> = HashMap::with_capacity(field_id_mapping.len());
+    for (field_id, field) in field_id_mapping {
+        let name: &str = &field.name;
+        if index.insert(name, *field_id).is_some() {
+            seen_twice.insert(name);
+        }
+    }
+    for name in seen_twice {
+        index.remove(name);
+    }
+    index
+}
+
+/// Report whether any node in the schema declares a field ID.
+///
+/// Data files registered rather than written by a catalog-aware writer carry no
+/// field IDs at all, which is the case the name index exists to serve.
+fn schema_declares_field_ids(root: &parquet::schema::types::Type) -> bool {
+    fn walk(tp: &parquet::schema::types::Type) -> bool {
+        if tp.get_basic_info().has_id() {
+            return true;
+        }
+        match tp {
+            parquet::schema::types::Type::GroupType { fields, .. } => {
+                fields.iter().any(|f| walk(f))
+            }
+            parquet::schema::types::Type::PrimitiveType { .. } => false,
+        }
+    }
+    match root {
+        parquet::schema::types::Type::GroupType { fields, .. } => fields.iter().any(|f| walk(f)),
+        parquet::schema::types::Type::PrimitiveType { .. } => false,
+    }
+}
+
+/// Resolve a node's field ID, falling back to its name when the file declares none.
+fn resolve_field_id(
+    info: &parquet::schema::types::BasicTypeInfo,
+    name_index: Option<&NameIndex<'_>>,
+) -> Option<i32> {
+    get_field_id(info).or_else(|| name_index.and_then(|index| index.get(info.name()).copied()))
+}
+
 /// Rewrite children of a group type per the field_id_mapping.
 ///
 /// When the parent has a logical type (LIST/MAP), intermediate children without
@@ -32,6 +90,7 @@ fn rewrite_children(
     fields: &[Arc<parquet::schema::types::Type>],
     has_logical_type: bool,
     field_id_mapping: &BTreeMap<i32, Field>,
+    name_index: Option<&NameIndex<'_>>,
 ) -> Vec<Arc<parquet::schema::types::Type>> {
     fields
         .iter()
@@ -40,12 +99,15 @@ fn rewrite_children(
                 // LIST/MAP intermediate nodes may lack field IDs but still
                 // contain mapped descendants (e.g. struct fields inside a list).
                 Some(Arc::new(
-                    rewrite_arrowrs_type_with_field_ids(child, field_id_mapping)
-                        .unwrap_or_else(|| recurse_children_only(child, field_id_mapping)),
+                    rewrite_arrowrs_type_with_field_ids(child, field_id_mapping, name_index)
+                        .unwrap_or_else(|| {
+                            recurse_children_only(child, field_id_mapping, name_index)
+                        }),
                 ))
             } else {
                 // Plain struct: drop children not in mapping.
-                rewrite_arrowrs_type_with_field_ids(child, field_id_mapping).map(Arc::new)
+                rewrite_arrowrs_type_with_field_ids(child, field_id_mapping, name_index)
+                    .map(Arc::new)
             }
         })
         .collect()
@@ -57,11 +119,13 @@ fn rewrite_children(
 fn rewrite_arrowrs_type_with_field_ids(
     tp: &parquet::schema::types::Type,
     field_id_mapping: &BTreeMap<i32, Field>,
+    name_index: Option<&NameIndex<'_>>,
 ) -> Option<parquet::schema::types::Type> {
     use parquet::schema::types::Type;
 
     let info = tp.get_basic_info();
-    let mapped_field = get_field_id(info).and_then(|fid| field_id_mapping.get(&fid))?;
+    let field_id = resolve_field_id(info, name_index)?;
+    let mapped_field = field_id_mapping.get(&field_id)?;
 
     match tp {
         Type::PrimitiveType {
@@ -78,20 +142,24 @@ fn rewrite_arrowrs_type_with_field_ids(
                 .with_length(*type_length)
                 .with_precision(*precision)
                 .with_scale(*scale)
-                .with_id(get_field_id(info))
+                .with_id(Some(field_id))
                 .build()
                 .expect("rebuilding primitive type with same attributes should not fail");
             Some(new_type)
         }
         Type::GroupType { fields, .. } => {
-            let new_children =
-                rewrite_children(fields, info.logical_type_ref().is_some(), field_id_mapping);
+            let new_children = rewrite_children(
+                fields,
+                info.logical_type_ref().is_some(),
+                field_id_mapping,
+                name_index,
+            );
             let new_type = Type::group_type_builder(&mapped_field.name)
                 .with_repetition(info.repetition())
                 .with_converted_type(info.converted_type())
                 .with_logical_type(info.logical_type_ref().cloned())
                 .with_fields(new_children)
-                .with_id(get_field_id(info))
+                .with_id(Some(field_id))
                 .build()
                 .expect("rebuilding group type with same attributes should not fail");
             Some(new_type)
@@ -105,14 +173,19 @@ fn rewrite_arrowrs_type_with_field_ids(
 fn recurse_children_only(
     tp: &parquet::schema::types::Type,
     field_id_mapping: &BTreeMap<i32, Field>,
+    name_index: Option<&NameIndex<'_>>,
 ) -> parquet::schema::types::Type {
     use parquet::schema::types::Type;
     match tp {
         Type::PrimitiveType { .. } => tp.clone(),
         Type::GroupType { fields, .. } => {
             let info = tp.get_basic_info();
-            let new_children =
-                rewrite_children(fields, info.logical_type_ref().is_some(), field_id_mapping);
+            let new_children = rewrite_children(
+                fields,
+                info.logical_type_ref().is_some(),
+                field_id_mapping,
+                name_index,
+            );
             Type::group_type_builder(info.name())
                 .with_repetition(info.repetition())
                 .with_converted_type(info.converted_type())
@@ -128,6 +201,16 @@ fn recurse_children_only(
 /// Applies field_ids to an arrow-rs `ParquetMetaData`:
 /// 1. Rename columns based on the `field_id_mapping`
 /// 2. Drop columns without a field_id or without a corresponding mapping entry
+///
+/// A file whose schema declares no field IDs at all -- which is what registering
+/// an externally written file produces -- is resolved by column name instead, so
+/// its columns are matched rather than dropped. Only unambiguous names are used,
+/// and a file that cannot be fully resolved that way is rejected rather than
+/// read as nulls.
+///
+/// # Errors
+/// Returns an error when the file declares no field IDs and at least one of its
+/// top-level columns cannot be matched to the schema by name.
 pub(crate) fn apply_field_ids_to_arrowrs_parquet_metadata(
     metadata: Arc<parquet::file::metadata::ParquetMetaData>,
     field_id_mapping: &BTreeMap<i32, Field>,
@@ -141,14 +224,43 @@ pub(crate) fn apply_field_ids_to_arrowrs_parquet_metadata(
     let old_schema = metadata.file_metadata().schema_descr();
     let old_root = old_schema.root_schema();
 
+    // A file that declares no field IDs is resolved by name; one that declares
+    // them keeps the existing behavior exactly.
+    let by_name =
+        (!schema_declares_field_ids(old_root)).then(|| build_name_index(field_id_mapping));
+    let name_index = by_name.as_ref();
+
     // 1. Rewrite the schema type tree: rename + filter by field_id_mapping
     let new_fields: Vec<_> = old_root
         .get_fields()
         .iter()
         .filter_map(|field| {
-            rewrite_arrowrs_type_with_field_ids(field, field_id_mapping).map(Arc::new)
+            rewrite_arrowrs_type_with_field_ids(field, field_id_mapping, name_index).map(Arc::new)
         })
         .collect();
+
+    if name_index.is_some() && new_fields.len() != old_root.get_fields().len() {
+        let resolved: HashSet<&str> = new_fields
+            .iter()
+            .filter_map(|f| resolve_field_id(f.get_basic_info(), name_index))
+            .filter_map(|fid| field_id_mapping.get(&fid))
+            .map(|f| -> &str { &f.name })
+            .collect();
+        let unresolved: Vec<&str> = old_root
+            .get_fields()
+            .iter()
+            .map(|f| f.get_basic_info().name())
+            .filter(|name| !resolved.contains(name))
+            .collect();
+        return Err(Error::ReaderInternal {
+            path: path.to_string(),
+            message: format!(
+                "file declares no field ids and these columns could not be matched by name: {}. \
+                 Reading it would silently produce nulls",
+                unresolved.join(", ")
+            ),
+        });
+    }
 
     let new_root = Type::group_type_builder(old_root.name())
         .with_fields(new_fields)
@@ -178,8 +290,8 @@ pub(crate) fn apply_field_ids_to_arrowrs_parquet_metadata(
                 .iter()
                 .filter_map(|col| {
                     let col_info = col.column_descr().self_type().get_basic_info();
-                    let new_descr =
-                        get_field_id(col_info).and_then(|fid| field_id_to_col_descr.get(&fid))?;
+                    let new_descr = resolve_field_id(col_info, name_index)
+                        .and_then(|fid| field_id_to_col_descr.get(&fid))?;
 
                     // Rebuild ColumnChunkMetaData with new descriptor.
                     // No set_column_descr on the builder, so we construct from scratch.
@@ -541,12 +653,85 @@ pub(crate) async fn read_parquet_metadata(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::BTreeMap, sync::Arc};
 
     use common_error::DaftResult;
+    use daft_core::{datatypes::Field, prelude::DataType};
     use daft_io::{IOClient, IOConfig};
+    use parquet::{
+        basic::{Repetition, Type as PhysicalType},
+        schema::types::Type,
+    };
 
-    use super::read_parquet_metadata;
+    use super::{build_name_index, read_parquet_metadata, schema_declares_field_ids};
+
+    fn leaf(name: &str, field_id: Option<i32>) -> Type {
+        Type::primitive_type_builder(name, PhysicalType::INT64)
+            .with_repetition(Repetition::OPTIONAL)
+            .with_id(field_id)
+            .build()
+            .unwrap()
+    }
+
+    fn root(children: Vec<Type>) -> Type {
+        Type::group_type_builder("schema")
+            .with_fields(children.into_iter().map(Arc::new).collect())
+            .build()
+            .unwrap()
+    }
+
+    fn field(name: &str) -> Field {
+        Field::new(name, DataType::Int64)
+    }
+
+    #[test]
+    fn name_index_maps_each_unique_name_to_its_field_id() {
+        let mapping = BTreeMap::from([(1, field("id")), (2, field("label"))]);
+        let index = build_name_index(&mapping);
+        assert_eq!(index.get("id"), Some(&1));
+        assert_eq!(index.get("label"), Some(&2));
+    }
+
+    #[test]
+    fn name_index_omits_names_claimed_by_more_than_one_field() {
+        // Two structs may each hold a child called `name`; resolving that by
+        // name could bind the wrong column, so it must not be resolvable.
+        let mapping = BTreeMap::from([(1, field("id")), (4, field("name")), (7, field("name"))]);
+        let index = build_name_index(&mapping);
+        assert_eq!(index.get("id"), Some(&1));
+        assert!(index.get("name").is_none());
+    }
+
+    #[test]
+    fn name_index_of_an_empty_mapping_is_empty() {
+        assert!(build_name_index(&BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn schema_without_any_field_id_is_detected() {
+        let schema = root(vec![leaf("id", None), leaf("label", None)]);
+        assert!(!schema_declares_field_ids(&schema));
+    }
+
+    #[test]
+    fn schema_with_any_field_id_is_detected() {
+        let schema = root(vec![leaf("id", Some(1)), leaf("label", None)]);
+        assert!(schema_declares_field_ids(&schema));
+    }
+
+    #[test]
+    fn field_ids_nested_below_the_root_are_detected() {
+        let inner = Type::group_type_builder("who")
+            .with_fields(vec![Arc::new(leaf("name", Some(4)))])
+            .build()
+            .unwrap();
+        assert!(schema_declares_field_ids(&root(vec![inner])));
+    }
+
+    #[test]
+    fn an_empty_schema_declares_no_field_ids() {
+        assert!(!schema_declares_field_ids(&root(vec![])));
+    }
     use crate::Error;
 
     #[tokio::test]

@@ -260,6 +260,10 @@ pub fn make_ipc_writer(
     Ok(file_writer)
 }
 
+/// Measured in-memory to on-disk size ratio, used to size the first output file.
+#[cfg(feature = "python")]
+const INFLATION_FACTOR_PROPERTY: &str = "daft.write.inflation-factor";
+
 #[cfg(feature = "python")]
 pub fn make_catalog_writer_factory(
     catalog_info: &daft_logical_plan::CatalogType<BoundExpr>,
@@ -272,14 +276,17 @@ pub fn make_catalog_writer_factory(
 
     // Honor Iceberg-spec table-level write properties:
     // https://iceberg.apache.org/docs/latest/configuration/#write-properties
-    let (target_file_size, target_row_group_size) = match catalog_info {
+    let (target_file_size, target_row_group_size, inflation_factor) = match catalog_info {
         daft_logical_plan::CatalogType::Iceberg(info) => Python::attach(|py| {
             let props = info.iceberg_properties.bind(py);
-            let read = |key: &str, default: usize| {
+            let read_str = |key: &str| {
                 props
                     .get_item(key)
                     .ok()
                     .and_then(|v| v.extract::<String>().ok())
+            };
+            let read = |key: &str, default: usize| {
+                read_str(key)
                     .and_then(|s| s.parse::<usize>().ok().filter(|&v| v > 0))
                     .unwrap_or(default)
             };
@@ -289,19 +296,26 @@ pub fn make_catalog_writer_factory(
                     "write.parquet.row-group-size-bytes",
                     cfg.parquet_target_row_group_size,
                 ),
+                // A rewrite measures this on the files it replaces; the
+                // configured default is only a guess until a file closes.
+                read_str(INFLATION_FACTOR_PROPERTY)
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .unwrap_or(cfg.parquet_inflation_factor),
             )
         }),
         _ => (
             cfg.parquet_target_filesize,
             cfg.parquet_target_row_group_size,
+            cfg.parquet_inflation_factor,
         ),
     };
 
     let file_size_calculator =
-        TargetInMemorySizeBytesCalculator::new(target_file_size, cfg.parquet_inflation_factor);
+        TargetInMemorySizeBytesCalculator::new(target_file_size, inflation_factor);
     let row_group_size_calculator = TargetInMemorySizeBytesCalculator::new(
         min(target_row_group_size, target_file_size),
-        cfg.parquet_inflation_factor,
+        inflation_factor,
     );
     let row_group_writer_factory = TargetBatchWriterFactory::new(
         Arc::new(base_writer_factory),

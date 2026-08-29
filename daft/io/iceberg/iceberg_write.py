@@ -24,18 +24,54 @@ if TYPE_CHECKING:
     from daft.dependencies import pa, pads, pq
 
 
-def get_missing_columns(data_schema: pa.Schema, iceberg_schema: IcebergSchema) -> ExpressionsProjection:
-    """Add null values for columns in the schema that are missing from the table."""
+def get_missing_columns(
+    data_schema: pa.Schema,
+    iceberg_schema: IcebergSchema,
+    *,
+    require_matching_columns: bool = False,
+) -> ExpressionsProjection:
+    """Add null values for columns in the table schema that are missing from the data.
+
+    Args:
+        data_schema (pa.Schema): Schema of the data about to be written.
+        iceberg_schema (IcebergSchema): Schema of the table being written to.
+        require_matching_columns (bool): When true, refuse a write whose columns do
+            not line up with the table's. Off by default, because a write may
+            deliberately supply a subset of the table's columns or carry extra ones
+            the table drops. A rewrite sets it, since there the data came from the
+            table itself and a mismatch can only mean the rows were read under names
+            the table no longer uses.
+
+    Returns:
+        ExpressionsProjection: One null literal per table column absent from the
+            data, typed to match.
+
+    Raises:
+        ValueError: If ``require_matching_columns`` is set and the data both lacks
+            columns the table has and carries columns the table does not. Padding one
+            while dropping the other is how a name mismatch — a column read under a
+            stale name, for instance — turns into a silently emptied column.
+    """
     from pyiceberg.io.pyarrow import schema_to_pyarrow
 
     iceberg_pyarrow_schema = schema_to_pyarrow(iceberg_schema)
 
     existing_columns = set(data_schema.names)
+    target_columns = set(iceberg_pyarrow_schema.names)
 
-    to_add = []
-    for name in iceberg_pyarrow_schema.names:
-        if name not in existing_columns:
-            to_add.append(lit(None).alias(name).cast(DataType.from_arrow_type(iceberg_pyarrow_schema.field(name).type)))
+    missing = [name for name in iceberg_pyarrow_schema.names if name not in existing_columns]
+    extra = sorted(existing_columns - target_columns)
+    if require_matching_columns and missing and extra:
+        raise ValueError(
+            "Refusing to write data whose columns do not line up with the table's: "
+            f"{sorted(missing)} would be filled with nulls while {extra} would be dropped. "
+            "The names most likely refer to the same columns, and writing would empty them."
+        )
+
+    to_add = [
+        lit(None).alias(name).cast(DataType.from_arrow_type(iceberg_pyarrow_schema.field(name).type))
+        for name in missing
+    ]
 
     return ExpressionsProjection(to_add)
 
@@ -143,6 +179,92 @@ def to_partition_representation(value: Any) -> Any:
         return value
 
 
+def nan_countable_fields(schema: IcebergSchema, properties: dict[str, str]) -> set[int]:
+    """Return the field ids a NaN count applies to.
+
+    Only floating-point columns can hold a NaN, and only those the metrics
+    configuration asks for are counted. Nested columns count too: a float inside
+    a struct, list, or map is a leaf like any other, and the reference records
+    one for it.
+
+    Args:
+        schema (IcebergSchema): Schema of the table being written to.
+        properties (dict[str, str]): Table properties, which carry the per-column
+            metrics configuration.
+
+    Returns:
+        set[int]: Field ids to count, empty when no column qualifies.
+    """
+    from pyiceberg.io.pyarrow import MetricModeTypes, compute_statistics_plan
+    from pyiceberg.schema import index_by_id
+    from pyiceberg.types import DoubleType, FloatType
+
+    plan = compute_statistics_plan(schema, properties)
+    countable: set[int] = set()
+    for field_id, field in index_by_id(schema).items():
+        if not isinstance(field.field_type, FloatType | DoubleType):
+            continue
+        collector = plan.get(field_id)
+        if collector is None or collector.mode.type == MetricModeTypes.NONE:
+            continue
+        countable.add(field_id)
+    return countable
+
+
+def _float_leaves(field: pa.Field, array: pa.Array) -> Iterator[tuple[int, pa.Array]]:
+    """Yield each floating-point leaf under ``field`` with its field id.
+
+    Descends structs, lists, and maps, so a float nested at any depth is reached.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    field_type = field.type
+    if pa.types.is_struct(field_type):
+        for index in range(field_type.num_fields):
+            yield from _float_leaves(field_type.field(index), array.field(index))
+    elif pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
+        yield from _float_leaves(field_type.value_field, pc.list_flatten(array))
+    elif pa.types.is_map(field_type):
+        yield from _float_leaves(field_type.key_field, array.keys)
+        yield from _float_leaves(field_type.item_field, array.items)
+    elif pa.types.is_floating(field_type):
+        raw = (field.metadata or {}).get(b"PARQUET:field_id")
+        if raw is not None:
+            yield int(raw), array
+
+
+def count_nans(table: pa.Table, countable: set[int]) -> dict[int, int]:
+    """Count NaN values per field id in one written batch.
+
+    Counting runs as a vectorized pass per leaf rather than row by row, and only
+    over the fields named in ``countable``.
+
+    Args:
+        table (pa.Table): Batch about to be written, already cast to the table's schema.
+        countable (set[int]): Field ids to count, as returned by :func:`nan_countable_fields`.
+
+    Returns:
+        dict[int, int]: NaN count by field id, omitting fields that hold none.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    counts: dict[int, int] = {}
+    if not countable:
+        return counts
+    for index, field in enumerate(table.schema):
+        column = table.column(index)
+        array = column.combine_chunks() if isinstance(column, pa.ChunkedArray) else column
+        for field_id, leaf in _float_leaves(field, array):
+            if field_id not in countable:
+                continue
+            total = pc.sum(pc.is_nan(leaf)).as_py()
+            if total:
+                counts[field_id] = counts.get(field_id, 0) + int(total)
+    return counts
+
+
 def make_iceberg_data_file(
     file_path: str,
     size: int,
@@ -151,6 +273,8 @@ def make_iceberg_data_file(
     spec_id: int,
     schema: IcebergSchema,
     properties: dict[str, str],
+    sort_order_id: int = 0,
+    nan_value_counts: dict[int, int] | None = None,
 ) -> DataFile:
     import pyiceberg
     from packaging.version import parse
@@ -161,18 +285,16 @@ def make_iceberg_data_file(
     from pyiceberg.manifest import DataFile, DataFileContent
     from pyiceberg.manifest import FileFormat as IcebergFileFormat
 
-    kwargs = {
+    # Bound to the version 2 layout whatever the table's version is: a manifest
+    # writer reads records in that layout and writes them out through its own.
+    kwargs: dict[str, Any] = {
         "content": DataFileContent.DATA,
         "file_path": file_path,
         "file_format": IcebergFileFormat.PARQUET,
         "partition": partition_record,
         "file_size_in_bytes": size,
-        # After this has been fixed:
-        # https://github.com/apache/iceberg-python/issues/271
-        # "sort_order_id": task.sort_order_id,
-        "sort_order_id": None,
-        # Just copy these from the table for now
-        "spec_id": spec_id,
+        # Zero is the format's unsorted order.
+        "sort_order_id": sort_order_id,
         "equality_ids": None,
         "key_metadata": None,
     }
@@ -186,20 +308,15 @@ def make_iceberg_data_file(
             parquet_column_mapping=parquet_path_to_id_mapping(schema),
         )
 
+        # The footer carries no NaN count, so merge in the one counted while writing.
+        serialized = statistics.to_serialized_dict()
+        if nan_value_counts:
+            serialized["nan_value_counts"] = {**(serialized.get("nan_value_counts") or {}), **nan_value_counts}
+
         if parse(pyiceberg.__version__) >= parse("0.10.0"):
-            data_file = DataFile.from_args(
-                **{
-                    **kwargs,
-                    **statistics.to_serialized_dict(),
-                }
-            )
+            data_file = DataFile.from_args(**{**kwargs, **serialized})
         else:
-            data_file = DataFile(
-                **{
-                    **kwargs,
-                    **statistics.to_serialized_dict(),
-                }
-            )
+            data_file = DataFile(**{**kwargs, **serialized})
     else:
         from pyiceberg.io.pyarrow import fill_parquet_file_metadata
 
@@ -211,6 +328,10 @@ def make_iceberg_data_file(
             stats_columns=compute_statistics_plan(schema, properties),
             parquet_column_mapping=parquet_path_to_id_mapping(schema),
         )
+
+    # Spec id lives on the manifest holding the file, not in the file's record,
+    # so the constructor argument is ignored and it is set as an attribute here.
+    data_file.spec_id = spec_id
 
     return data_file
 

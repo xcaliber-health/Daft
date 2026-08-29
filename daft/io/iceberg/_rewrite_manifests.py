@@ -61,6 +61,14 @@ SNAPSHOT_PROP_OUTPUT_MANIFESTS = "daft.output-manifests"
 SNAPSHOT_PROP_INPUT_BYTES = "daft.input-manifest-bytes"
 SNAPSHOT_PROP_OUTPUT_BYTES = "daft.output-manifest-bytes"
 
+# Standard snapshot summary keys for a manifest rewrite. The keys above stay:
+# they carry byte counts these have no place for.
+SUMMARY_MANIFESTS_CREATED = "manifests-created"
+SUMMARY_MANIFESTS_KEPT = "manifests-kept"
+SUMMARY_MANIFESTS_REPLACED = "manifests-replaced"
+SUMMARY_ENTRIES_PROCESSED = "entries-processed"
+SUMMARY_CHANGED_PARTITION_COUNT = "changed-partition-count"
+
 
 @dataclass(frozen=True)
 class RewriteManifestsResult:
@@ -323,6 +331,11 @@ def _commit_attempt(
         producer.build_new_manifests()
         producer.snapshot_properties[SNAPSHOT_PROP_OUTPUT_MANIFESTS] = str(len(producer.new_manifests))
         producer.snapshot_properties[SNAPSHOT_PROP_OUTPUT_BYTES] = str(producer.bytes_added)
+        producer.snapshot_properties[SUMMARY_MANIFESTS_CREATED] = str(len(producer.new_manifests))
+        producer.snapshot_properties[SUMMARY_MANIFESTS_KEPT] = str(len(plan.untouched_manifests))
+        producer.snapshot_properties[SUMMARY_MANIFESTS_REPLACED] = str(len(plan.matching_manifests))
+        producer.snapshot_properties[SUMMARY_ENTRIES_PROCESSED] = str(producer.entries_processed)
+        producer.snapshot_properties[SUMMARY_CHANGED_PARTITION_COUNT] = str(producer.changed_partition_count)
         producer.commit()
         committed_snapshot_id = int(producer.snapshot_id)
         added = len(producer.new_manifests)
@@ -389,6 +402,8 @@ def _producer_class() -> type:
             self._untouched_manifests: list[Any] = list(plan.untouched_manifests)
             self._new_manifests: list[Any] = []
             self._bytes_added = 0
+            self._entries_processed = 0
+            self._changed_partitions: set[tuple[int, tuple[Any, ...]]] = set()
 
         @property
         def new_manifests(self) -> list[Any]:
@@ -397,6 +412,16 @@ def _producer_class() -> type:
         @property
         def bytes_added(self) -> int:
             return self._bytes_added
+
+        @property
+        def entries_processed(self) -> int:
+            """Number of live manifest entries read and rewritten."""
+            return self._entries_processed
+
+        @property
+        def changed_partition_count(self) -> int:
+            """Number of distinct partitions whose entries moved to a new manifest."""
+            return len(self._changed_partitions)
 
         def _existing_manifests(self) -> list[Any]:
             return list(self._untouched_manifests) + list(self._new_manifests)
@@ -468,6 +493,8 @@ def _producer_class() -> type:
                 spec_id = manifest.partition_spec_id
                 spec = specs[spec_id]
                 for entry in entries:
+                    self._entries_processed += 1
+                    self._changed_partitions.add((spec_id, tuple(entry.data_file.partition)))
                     cluster_key = _cluster_key(entry.data_file, spec, self._sort_by)
                     key = (spec_id, cluster_key)
                     roller = rollers.get(key)

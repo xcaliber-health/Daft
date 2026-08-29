@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import warnings
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from pyiceberg.schema import visit
 
@@ -18,7 +18,7 @@ from daft.daft import (
     StorageConfig,
 )
 from daft.dependencies import pa
-from daft.io.iceberg._expressions import convert_row_filter
+from daft.io.iceberg._expressions import convert_row_filter, retarget_references
 from daft.io.iceberg._metadata import (
     convert_iceberg_data_type,
     convert_iceberg_schema,
@@ -39,6 +39,9 @@ if TYPE_CHECKING:
     from pyiceberg.typedef import Record
 
 logger = logging.getLogger(__name__)
+
+# Which schema a scan reads its rows under.
+SchemaSource = Literal["snapshot", "current"]
 
 
 def _iceberg_count_result_function(total_count: int, field_name: str) -> Iterator[PyRecordBatch]:
@@ -88,10 +91,26 @@ class IcebergScanOperator(ScanOperator):
         snapshot_id: int | None,
         storage_config: StorageConfig,
         ignore_corrupt_files: bool = False,
+        *,
+        schema_source: SchemaSource = "snapshot",
     ) -> None:
+        """Scan a table, optionally as of a snapshot.
+
+        Parameters
+        ----------
+        schema_source : SchemaSource
+            Which schema the rows are read under. ``"snapshot"`` reads them as
+            the snapshot recorded them, which is what time travel means.
+            ``"current"`` reads them under the table's current schema, which is
+            what a rewrite needs: schema-only changes such as a rename create no
+            snapshot, so the snapshot's schema can name columns the table no
+            longer uses, and rows read under those names would be written back
+            under the current ones as nulls.
+        """
         super().__init__()
+        read_as_of = None if schema_source == "current" else snapshot_id
         iceberg_schema = (
-            iceberg_table.schema() if snapshot_id is None else iceberg_table.scan(snapshot_id=snapshot_id).projection()
+            iceberg_table.schema() if read_as_of is None else iceberg_table.scan(snapshot_id=read_as_of).projection()
         )
         self._iceberg_table = iceberg_table
         self._iceberg_schema = iceberg_schema
@@ -178,7 +197,13 @@ class IcebergScanOperator(ScanOperator):
     def _create_regular_scan_tasks(self, pushdowns: PyPushdowns) -> Iterator[ScanTask]:
         """Create regular scan tasks without count pushdown."""
         limit = pushdowns.limit
-        row_filter = convert_row_filter(pushdowns, self._iceberg_schema)
+        # Predicates use the names this operator projects, but the scan binds
+        # them against the current schema, so a rename must be mapped first.
+        row_filter = retarget_references(
+            convert_row_filter(pushdowns, self._iceberg_schema),
+            self._iceberg_schema,
+            self._iceberg_table.schema(),
+        )
 
         iceberg_tasks = self._iceberg_table.scan(
             row_filter=row_filter,
@@ -338,7 +363,12 @@ class IcebergFileGroupScanOperator(IcebergScanOperator):
         storage_config: StorageConfig,
         tasks: list[FileScanTask],
     ) -> None:
-        super().__init__(iceberg_table, snapshot_id=snapshot_id, storage_config=storage_config)
+        super().__init__(
+            iceberg_table,
+            snapshot_id=snapshot_id,
+            storage_config=storage_config,
+            schema_source="current",
+        )
         self._tasks = tasks
 
     def name(self) -> str:

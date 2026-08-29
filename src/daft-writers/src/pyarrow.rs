@@ -129,6 +129,7 @@ impl PyArrowWriter {
         schema: &pyo3::Py<pyo3::PyAny>,
         properties: &pyo3::Py<pyo3::PyAny>,
         partition_spec_id: i64,
+        sort_order_id: i64,
         partition_values: Option<&RecordBatch>,
         io_config: Option<&daft_io::IOConfig>,
     ) -> DaftResult<Self> {
@@ -153,6 +154,7 @@ impl PyArrowWriter {
                 schema,
                 properties,
                 partition_spec_id,
+                sort_order_id,
                 partition_values,
                 io_config.map(|cfg| daft_io::python::IOConfig {
                     config: cfg.clone(),

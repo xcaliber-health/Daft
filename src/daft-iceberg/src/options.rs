@@ -11,6 +11,10 @@ pub const MAX_TARGET_FILE_SIZE_BYTES: u64 = 5 * GIB;
 pub const DEFAULT_MIN_INPUT_FILES: u32 = 5;
 pub const DEFAULT_MAX_GROUP_BYTES: u64 = 100 * GIB;
 pub const DEFAULT_DELETE_FILE_THRESHOLD: u32 = u32::MAX;
+/// Deleted fraction of a file at which it is rewritten on that ground alone.
+pub const DEFAULT_DELETE_RATIO_THRESHOLD: f64 = 0.3;
+/// Per-file open cost allowed for when sizing a split.
+pub const SPLIT_OVERHEAD: u64 = 5 * 1024;
 pub const DEFAULT_MAX_COMMITS: u32 = 10;
 pub const DEFAULT_MAX_CONCURRENT: u32 = 5;
 pub const DEFAULT_ZORDER_VAR_LEN_CONTRIBUTION: u32 = 8;
@@ -53,6 +57,7 @@ pub struct RewriteOptions {
     pub min_input_files: u32,
     pub max_file_group_size_bytes: u64,
     pub delete_file_threshold: u32,
+    pub delete_ratio_threshold: f64,
     pub rewrite_all: bool,
     pub partial_progress_enabled: bool,
     pub partial_progress_max_commits: u32,
@@ -81,6 +86,7 @@ impl Default for RewriteOptions {
             min_input_files: DEFAULT_MIN_INPUT_FILES,
             max_file_group_size_bytes: DEFAULT_MAX_GROUP_BYTES,
             delete_file_threshold: DEFAULT_DELETE_FILE_THRESHOLD,
+            delete_ratio_threshold: DEFAULT_DELETE_RATIO_THRESHOLD,
             rewrite_all: false,
             partial_progress_enabled: false,
             partial_progress_max_commits: DEFAULT_MAX_COMMITS,
@@ -118,6 +124,48 @@ impl RewriteOptions {
         }
     }
 
+    /// Upper size a file may reach while writing. Halfway between target and
+    /// max, so an uneven remainder is absorbed rather than left undersized.
+    #[must_use]
+    pub fn write_max_file_size_bytes(&self) -> u64 {
+        let target = self.target_file_size_bytes;
+        let max = self.effective_max_file_size_bytes();
+        target + (max.saturating_sub(target)) / 2
+    }
+
+    /// Number of files a group of `input_bytes` is written as. Rounds down when
+    /// spreading the remainder keeps the average within 10% of target, else up.
+    #[must_use]
+    pub fn expected_output_files(&self, input_bytes: u64) -> u64 {
+        let target = self.target_file_size_bytes;
+        if input_bytes < target {
+            return 1;
+        }
+        let with_remainder = input_bytes.div_ceil(target);
+        let without_remainder = input_bytes / target;
+        if input_bytes % target > self.effective_min_file_size_bytes() {
+            return with_remainder;
+        }
+        let average = input_bytes / without_remainder;
+        let ceiling = (1.1 * target as f64).min(self.write_max_file_size_bytes() as f64);
+        if (average as f64) < ceiling {
+            without_remainder
+        } else {
+            with_remainder
+        }
+    }
+
+    /// How much input each output file is read from. Floored at the target and
+    /// capped at [`Self::write_max_file_size_bytes`].
+    #[must_use]
+    pub fn input_split_size(&self, input_bytes: u64) -> u64 {
+        let estimated = input_bytes / self.expected_output_files(input_bytes) + SPLIT_OVERHEAD;
+        if estimated < self.target_file_size_bytes {
+            return self.target_file_size_bytes;
+        }
+        estimated.min(self.write_max_file_size_bytes())
+    }
+
     /// Failed-commit budget under partial-progress. Defaults to `partial_progress_max_commits`.
     pub fn effective_max_failed_commits(&self) -> u32 {
         self.partial_progress_max_failed_commits
@@ -143,17 +191,14 @@ impl RewriteOptions {
                 ),
             ));
         }
-        if self.min_input_files < 2 {
+        if self.min_input_files == 0 {
             return Err(invalid(
                 "min-input-files",
-                format!("must be >= 2, got {}", self.min_input_files),
+                format!("must be > 0, got {}", self.min_input_files),
             ));
         }
-        if self.max_file_group_size_bytes < self.target_file_size_bytes {
-            return Err(invalid(
-                "max-file-group-size-bytes",
-                "must be >= target-file-size-bytes".into(),
-            ));
+        if self.max_file_group_size_bytes == 0 {
+            return Err(invalid("max-file-group-size-bytes", "must be > 0".into()));
         }
         if self.partial_progress_enabled && self.partial_progress_max_commits == 0 {
             return Err(invalid(
@@ -171,6 +216,12 @@ impl RewriteOptions {
             return Err(invalid(
                 "shuffle-partitions-per-file",
                 "must be >= 1".into(),
+            ));
+        }
+        if !(self.delete_ratio_threshold > 0.0 && self.delete_ratio_threshold <= 1.0) {
+            return Err(invalid(
+                "delete-ratio-threshold",
+                format!("must be > 0 and <= 1, got {}", self.delete_ratio_threshold),
             ));
         }
         if !(self.compression_factor > 0.0 && self.compression_factor.is_finite()) {
@@ -276,6 +327,76 @@ pub enum Strategy {
 
 #[cfg(test)]
 mod tests {
+
+    /// Cross-checked against Iceberg's `SizeBasedFileRewritePlanner`.
+    #[test]
+    fn size_arithmetic_matches_the_reference() {
+        // (target, input bytes, write max, expected output files, input split size)
+        let cases: &[(u64, u64, u64, u64, u64)] = &[
+            (2097152, 1048576, 2936012, 1, 2097152),
+            (2097152, 1887436, 2936012, 1, 2097152),
+            (2097152, 2097152, 2936012, 1, 2102272),
+            (2097152, 3145728, 2936012, 2, 2097152),
+            (2097152, 4194304, 2936012, 2, 2102272),
+            (2097152, 5662310, 2936012, 3, 2097152),
+            (2097152, 6291456, 2936012, 3, 2102272),
+            (2097152, 11534336, 2936012, 5, 2311987),
+            (2097152, 20971520, 2936012, 10, 2102272),
+            (2097152, 36280729, 2936012, 17, 2139280),
+            (8388608, 4194304, 11744051, 1, 8388608),
+            (8388608, 7549747, 11744051, 1, 8388608),
+            (8388608, 8388608, 11744051, 1, 8393728),
+            (8388608, 12582912, 11744051, 2, 8388608),
+            (8388608, 16777216, 11744051, 2, 8393728),
+            (8388608, 22649241, 11744051, 3, 8388608),
+            (8388608, 25165824, 11744051, 3, 8393728),
+            (8388608, 46137344, 11744051, 5, 9232588),
+            (8388608, 83886080, 11744051, 10, 8393728),
+            (8388608, 145122918, 11744051, 17, 8541762),
+            (67108864, 33554432, 93952409, 1, 67108864),
+            (67108864, 60397977, 93952409, 1, 67108864),
+            (67108864, 67108864, 93952409, 1, 67113984),
+            (67108864, 100663296, 93952409, 2, 67108864),
+            (67108864, 134217728, 93952409, 2, 67113984),
+            (67108864, 181193932, 93952409, 3, 67108864),
+            (67108864, 201326592, 93952409, 3, 67113984),
+            (67108864, 369098752, 93952409, 5, 73824870),
+            (67108864, 671088640, 93952409, 10, 67113984),
+            (67108864, 1160983347, 93952409, 17, 68298258),
+            (536870912, 268435456, 751619276, 1, 536870912),
+            (536870912, 483183820, 751619276, 1, 536870912),
+            (536870912, 536870912, 751619276, 1, 536876032),
+            (536870912, 805306368, 751619276, 2, 536870912),
+            (536870912, 1073741824, 751619276, 2, 536876032),
+            (536870912, 1449551462, 751619276, 3, 536870912),
+            (536870912, 1610612736, 751619276, 3, 536876032),
+            (536870912, 2952790016, 751619276, 5, 590563123),
+            (536870912, 5368709120, 751619276, 10, 536876032),
+            (536870912, 9287866777, 751619276, 17, 546350224),
+        ];
+        for &(target, input_bytes, write_max, files, split) in cases {
+            let o = RewriteOptions {
+                target_file_size_bytes: target,
+                ..RewriteOptions::default()
+            };
+            assert_eq!(
+                o.write_max_file_size_bytes(),
+                write_max,
+                "write max for {target}"
+            );
+            assert_eq!(
+                o.expected_output_files(input_bytes),
+                files,
+                "expected output files for {input_bytes} at target {target}"
+            );
+            assert_eq!(
+                o.input_split_size(input_bytes),
+                split,
+                "input split size for {input_bytes} at target {target}"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -293,9 +414,43 @@ mod tests {
     }
 
     #[test]
-    fn rejects_min_input_files_below_2() {
+    fn accepts_min_input_files_of_one() {
         let o = RewriteOptions {
             min_input_files: 1,
+            ..Default::default()
+        };
+        assert!(
+            o.validate().is_ok(),
+            "the reference requires only that it be positive"
+        );
+    }
+
+    #[test]
+    fn rejects_min_input_files_of_zero() {
+        let o = RewriteOptions {
+            min_input_files: 0,
+            ..Default::default()
+        };
+        assert!(o.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_a_group_cap_below_the_target() {
+        let o = RewriteOptions {
+            target_file_size_bytes: 128 * 1024 * 1024,
+            max_file_group_size_bytes: 4 * 1024 * 1024,
+            ..Default::default()
+        };
+        assert!(
+            o.validate().is_ok(),
+            "a small cap bounds a group rather than being invalid"
+        );
+    }
+
+    #[test]
+    fn rejects_a_group_cap_of_zero() {
+        let o = RewriteOptions {
+            max_file_group_size_bytes: 0,
             ..Default::default()
         };
         assert!(o.validate().is_err());

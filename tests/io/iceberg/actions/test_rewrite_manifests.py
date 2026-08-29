@@ -246,3 +246,24 @@ def test_sort_by_partition_field(local_catalog):
     assert result.snapshot_id is not None
     table.refresh()
     assert sorted(_read_ids(table)) == pre_ids
+
+
+def test_manifest_rewrite_records_the_standard_summary_counts(make_tiny_table):
+    """The snapshot summary carries the accounting the format defines for it.
+
+    The same facts are also recorded under private keys carrying byte counts,
+    but tooling reads the standard ones.
+    """
+    from daft.catalog import Table as _Table
+
+    table = make_tiny_table(name="default.t_manifest_summary", n_files=8, rows_per_file=3)
+
+    _Table.from_iceberg(table).rewrite_manifests()
+
+    table.refresh()
+    summary = table.current_snapshot().summary
+    assert int(summary["manifests-replaced"]) == 8
+    assert int(summary["manifests-created"]) >= 1
+    assert int(summary["manifests-kept"]) == 0
+    assert int(summary["entries-processed"]) == 8
+    assert int(summary["changed-partition-count"]) == 1

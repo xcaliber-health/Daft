@@ -67,20 +67,25 @@ impl TargetFileSizeWriter {
     }
 
     async fn rotate_writer_and_update_estimates(&mut self) -> DaftResult<()> {
+        // Close first. A writer that buffers, as the Parquet one does until its
+        // footer is flushed, does not know its on-disk size before this, so
+        // measuring earlier under-reports it and inflates the estimate for every
+        // file after.
+        let closed = self.current_writer.close().await?;
+        let bytes_on_disk = self.current_writer.bytes_written();
+
         // Record the size of the current file and update the inflation factor
         self.size_calculator.record_and_update_inflation_factor(
-            self.current_writer.bytes_written(),
+            bytes_on_disk,
             self.current_in_memory_bytes_written,
         );
         // Update the target size estimate
         self.current_in_memory_size_estimate =
             self.size_calculator.calculate_target_in_memory_size_bytes();
 
-        // Close the current writer and add the result to the results
-        if let Some(result) = self.current_writer.close().await? {
+        if let Some(result) = closed {
             self.results.push(result);
-            self.bytes_per_file
-                .push(self.current_writer.bytes_written());
+            self.bytes_per_file.push(bytes_on_disk);
         }
 
         // Create a new writer and reset the current bytes written

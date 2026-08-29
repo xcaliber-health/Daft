@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import time
 
 import pandas as pd
 import pytest
@@ -80,7 +81,7 @@ def test_glob_files(tmpdir):
         bar_filepath.write_text("b" * i)
 
     daft_df = daft.from_glob_path(os.path.join(tmpdir, "*.foo"))
-    daft_pd_df = daft_df.to_pandas()
+    daft_pd_df = daft_df.select("path", "size", "num_rows").to_pandas()
 
     pd_df = pd.DataFrame.from_records(
         {"path": "file://" + str(path.as_posix()), "size": size, "num_rows": None}
@@ -89,6 +90,22 @@ def test_glob_files(tmpdir):
     pd_df = pd_df[~pd_df["path"].str.endswith(".bar")]
     pd_df = pd_df.astype({"num_rows": float})
     assert_df_equals(daft_pd_df, pd_df, sort_key="path")
+
+
+def test_glob_files_reports_modification_time(tmpdir):
+    before = time.time()
+    filepath = pathlib.Path(tmpdir) / "file.foo"
+    filepath.write_text("a" * 10)
+    after = time.time()
+
+    listing = daft.from_glob_path(os.path.join(tmpdir, "*.foo")).to_pydict()
+
+    assert listing["mtime"] == sorted(listing["mtime"])
+    (mtime,) = listing["mtime"]
+    assert mtime is not None
+    # Reported in milliseconds since the epoch, so it falls inside the window
+    # the file was written in, allowing a second either side for clock coarseness.
+    assert (before - 1) * 1000 <= mtime <= (after + 1) * 1000
 
 
 def test_glob_files_with_empty_path():
@@ -101,7 +118,7 @@ def test_glob_files_single_file(tmpdir):
     filepath = pathlib.Path(tmpdir) / "file.foo"
     filepath.write_text("b" * 10)
     daft_df = daft.from_glob_path(os.path.join(tmpdir, "file.foo"))
-    daft_pd_df = daft_df.to_pandas()
+    daft_pd_df = daft_df.select("path", "size", "num_rows").to_pandas()
     pd_df = pd.DataFrame.from_records([{"path": "file://" + str(filepath), "size": 10, "num_rows": None}])
     pd_df = pd_df.astype({"num_rows": float})
     assert_df_equals(daft_pd_df, pd_df, sort_key="path")
@@ -118,14 +135,13 @@ def test_glob_files_directory(tmpdir):
             filepaths.append(filepath)
 
     daft_df = daft.from_glob_path(str(tmpdir))
-    daft_pd_df = daft_df.to_pandas()
+    daft_pd_df = daft_df.select("path", "size", "num_rows").to_pandas()
 
     listing_records = [
         {"path": "file://" + str(path.as_posix()), "size": size, "num_rows": None}
         for path, size in zip(filepaths, [i for i in range(10) for _ in range(2)])
     ]
 
-    listing_records = listing_records
     pd_df = pd.DataFrame.from_records(listing_records)
     pd_df = pd_df.astype({"num_rows": float})
     assert_df_equals(daft_pd_df, pd_df, sort_key="path")
@@ -142,7 +158,7 @@ def test_glob_files_recursive(tmpdir):
             paths.append(filepath)
 
     daft_df = daft.from_glob_path(os.path.join(tmpdir, "**"))
-    daft_pd_df = daft_df.to_pandas()
+    daft_pd_df = daft_df.select("path", "size", "num_rows").to_pandas()
     listing_records = [
         {"path": "file://" + str(path.as_posix()), "size": size, "num_rows": None}
         for path, size in zip(paths, [i for i in range(10) for _ in range(2)])
@@ -174,7 +190,7 @@ def test_glob_files_from_multiple_path(tmpdir):
 
     # glob files from folder a & b and a non-exist path
     daft_df = daft.from_glob_path([str(folder_a), str(folder_b), "/not_exists"])
-    daft_pd_df = daft_df.to_pandas()
+    daft_pd_df = daft_df.select("path", "size", "num_rows").to_pandas()
 
     listing_records = [
         {"path": "file://" + str(path.as_posix()), "size": size, "num_rows": None}
@@ -186,11 +202,11 @@ def test_glob_files_from_multiple_path(tmpdir):
 
     # glob files from folder a and b twice
     daft_df = daft.from_glob_path([str(folder_a), str(folder_b), str(folder_a), str(folder_b)])
-    assert_df_equals(daft_df.to_pandas(), pd_df, sort_key="path")
+    assert_df_equals(daft_df.select("path", "size", "num_rows").to_pandas(), pd_df, sort_key="path")
 
     # glob files with different glob paths with same results.
     daft_df = daft.from_glob_path([str(folder_a), str(folder_b), str(folder_a) + "/*.foo"])
-    assert_df_equals(daft_df.to_pandas(), pd_df, sort_key="path")
+    assert_df_equals(daft_df.select("path", "size", "num_rows").to_pandas(), pd_df, sort_key="path")
 
     daft_df = daft.from_glob_path(str(pathlib.Path(tmpdir))).collect()
     assert 0 == len(daft_df)

@@ -19,8 +19,10 @@ from daft.io.delta_lake.delta_lake_write import (
 )
 from daft.io.iceberg.iceberg_write import (
     coerce_pyarrow_table_to_schema,
+    count_nans,
     make_iceberg_data_file,
     make_iceberg_record,
+    nan_countable_fields,
 )
 from daft.recordbatch.partitioning import (
     partition_strings_to_path,
@@ -499,6 +501,7 @@ class IcebergWriter(ParquetFileWriter):
         schema: IcebergSchema,
         properties: IcebergTableProperties,
         partition_spec_id: int,
+        sort_order_id: int = 0,
         partition_values: RecordBatch | None = None,
         io_config: IOConfig | None = None,
     ):
@@ -526,7 +529,12 @@ class IcebergWriter(ParquetFileWriter):
         self.iceberg_schema = schema
         self.file_schema = schema_to_pyarrow(schema)
         self.partition_spec_id = partition_spec_id
+        self.sort_order_id = sort_order_id
         self.properties = properties
+        # A Parquet footer records no NaN count, so accumulate it while writing.
+        # Empty when no column can hold one, which skips the work.
+        self._nan_countable = nan_countable_fields(schema, dict(properties or {}))
+        self._nan_counts: dict[int, int] = {}
 
     def _create_writer(self, schema: pa.Schema) -> pq.ParquetWriter:
         opts: dict[str, Any] = {}
@@ -553,6 +561,8 @@ class IcebergWriter(ParquetFileWriter):
         if self.current_writer is None:
             self.current_writer = self._create_writer(self.file_schema)
         casted = coerce_pyarrow_table_to_schema(table.to_arrow(), self.file_schema)
+        for field_id, count in count_nans(casted, self._nan_countable).items():
+            self._nan_counts[field_id] = self._nan_counts.get(field_id, 0) + count
         row_group_byte_cap = self._iceberg_writer_opts.get("row_group_byte_size")
         if row_group_byte_cap is not None and len(table) > 0:
             approx_bytes_per_row = max(1, casted.nbytes // max(1, len(table)))
@@ -584,6 +594,8 @@ class IcebergWriter(ParquetFileWriter):
             self.partition_spec_id,
             self.iceberg_schema,
             self.properties,
+            sort_order_id=self.sort_order_id,
+            nan_value_counts=dict(self._nan_counts),
         )
         return RecordBatch.from_pydict({"data_file": [data_file]})
 

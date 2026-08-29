@@ -922,6 +922,7 @@ impl LogicalPlanBuilder {
         partition_cols: Vec<ExprRef>,
         iceberg_schema: Arc<Py<PyAny>>,
         iceberg_properties: Arc<Py<PyAny>>,
+        sort_order_id: i64,
         io_config: Option<IOConfig>,
         catalog_columns: Vec<String>,
     ) -> DaftResult<Self> {
@@ -933,6 +934,7 @@ impl LogicalPlanBuilder {
                 partition_cols,
                 iceberg_schema,
                 iceberg_properties,
+                sort_order_id,
                 io_config,
             }),
             catalog_columns,
@@ -1722,6 +1724,7 @@ impl PyLogicalPlanBuilder {
         iceberg_schema,
         iceberg_properties,
         catalog_columns,
+        sort_order_id,
         io_config=None
     ))]
     pub fn iceberg_write(
@@ -1733,6 +1736,7 @@ impl PyLogicalPlanBuilder {
         iceberg_schema: pyo3::Py<pyo3::PyAny>,
         iceberg_properties: pyo3::Py<pyo3::PyAny>,
         catalog_columns: Vec<String>,
+        sort_order_id: i64,
         io_config: Option<common_io_config::python::IOConfig>,
     ) -> PyResult<Self> {
         Ok(self
@@ -1744,6 +1748,7 @@ impl PyLogicalPlanBuilder {
                 pyexprs_to_exprs(partition_cols),
                 Arc::new(iceberg_schema),
                 Arc::new(iceberg_properties),
+                sort_order_id,
                 io_config.map(|cfg| cfg.config),
                 catalog_columns,
             )?

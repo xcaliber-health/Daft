@@ -17,11 +17,33 @@ pub struct CandidateFile {
     pub partition_spec_id: i32,
     pub positional_delete_paths: Vec<String>,
     pub has_equality_deletes: bool,
+    /// Rows the data file holds, before deletes are applied.
+    #[serde(default)]
+    pub record_count: u64,
+    /// Rows removed by delete files naming this one. A delete naming no data
+    /// file cannot be attributed, so it counts for nothing here.
+    #[serde(default)]
+    pub deleted_record_count: u64,
 }
 
 impl CandidateFile {
     fn positional_delete_count(&self) -> u32 {
         self.positional_delete_paths.len() as u32
+    }
+
+    /// Whether the file carries at least `threshold` delete files.
+    fn too_many_deletes(&self, threshold: u32) -> bool {
+        self.positional_delete_count() >= threshold
+    }
+
+    /// Whether the deleted fraction reaches `threshold`. Clamped to the file's
+    /// own row count, so a shared delete cannot push the ratio above one.
+    fn too_high_delete_ratio(&self, threshold: f64) -> bool {
+        if self.positional_delete_paths.is_empty() || self.record_count == 0 {
+            return false;
+        }
+        let deleted = self.deleted_record_count.min(self.record_count) as f64;
+        deleted / self.record_count as f64 >= threshold
     }
 }
 
@@ -31,6 +53,10 @@ pub struct FileGroup {
     pub output_spec_id: i32,
     pub files: Vec<CandidateFile>,
     pub total_bytes: u64,
+    /// How many files this group is written as, decided before writing.
+    pub expected_output_files: u64,
+    /// How much input each of those files is read from.
+    pub input_split_size: u64,
 }
 
 impl FileGroup {
@@ -40,7 +66,35 @@ impl FileGroup {
             output_spec_id,
             files: Vec::new(),
             total_bytes: 0,
+            expected_output_files: 1,
+            input_split_size: 0,
         }
+    }
+
+    /// Fill in the write shape once the group's contents are final.
+    fn resolve_write_shape(&mut self, opts: &RewriteOptions) {
+        self.expected_output_files = opts.expected_output_files(self.total_bytes);
+        self.input_split_size = opts.input_split_size(self.total_bytes);
+    }
+
+    /// Whether the group is worth rewriting. Any one reason suffices: enough
+    /// files, enough content, too much content, or a heavily deleted file.
+    fn is_worth_rewriting(&self, opts: &RewriteOptions) -> bool {
+        let enough_input_files =
+            self.files.len() > 1 && self.files.len() as u32 >= opts.min_input_files;
+        let enough_content = self.files.len() > 1 && self.total_bytes > opts.target_file_size_bytes;
+        let too_much_content = self.total_bytes > opts.effective_max_file_size_bytes();
+        enough_input_files
+            || enough_content
+            || too_much_content
+            || self
+                .files
+                .iter()
+                .any(|f| f.too_many_deletes(opts.delete_file_threshold))
+            || self
+                .files
+                .iter()
+                .any(|f| f.too_high_delete_ratio(opts.delete_ratio_threshold))
     }
 
     fn push(&mut self, f: CandidateFile) {
@@ -51,11 +105,13 @@ impl FileGroup {
 
 /// Group candidate files for rewrite.
 ///
-/// Steps: bucket by `(partition_key, partition_spec_id)`, drop files that fall
-/// inside `[min_file_size_bytes, max_file_size_bytes]` and below
-/// `delete_file_threshold`, skip buckets below `min_input_files`, bin-pack into
-/// groups capped by `max_file_group_size_bytes`, then sort across buckets by
-/// `job_order`.
+/// Steps: bucket by `(partition_key, partition_spec_id)`; keep files outside the
+/// desired size range or carrying too many deletes; bin-pack each bucket into
+/// groups capped by `max_file_group_size_bytes`; discard packed groups not worth
+/// rewriting; sort by `job_order`; and cut to `max_files_to_rewrite`.
+///
+/// The two filters are separate on purpose: what decides a rewrite is the shape
+/// of each packed group, not of the bucket it came from.
 pub fn plan_file_groups(
     candidates: Vec<CandidateFile>,
     opts: &RewriteOptions,
@@ -92,55 +148,64 @@ pub fn plan_file_groups(
                     || needs_spec_change
                     || f.size_bytes < lower
                     || f.size_bytes > upper
-                    || f.positional_delete_count() >= opts.delete_file_threshold
+                    || f.too_many_deletes(opts.delete_file_threshold)
+                    || f.too_high_delete_ratio(opts.delete_ratio_threshold)
             })
             .collect();
 
-        if !opts.rewrite_all
-            && !needs_spec_change
-            && (survivors.len() as u32) < opts.min_input_files
-        {
-            continue;
-        }
-
-        groups.extend(pack(
+        let forced = opts.rewrite_all || needs_spec_change;
+        for mut group in pack(
             survivors,
             &part_key,
             output_spec_id,
             opts.max_file_group_size_bytes,
-        ));
+        ) {
+            if forced || group.is_worth_rewriting(opts) {
+                group.resolve_write_shape(opts);
+                groups.push(group);
+            }
+        }
     }
 
     sort_groups(&mut groups, opts.job_order);
-
-    // Drop trailing groups so the cumulative file count fits the cap.
-    if let Some(cap) = opts.max_files_to_rewrite {
-        let mut remaining = cap as usize;
-        let mut idx = 0;
-        while idx < groups.len() {
-            let n = groups[idx].files.len();
-            if n <= remaining {
-                remaining -= n;
-                idx += 1;
-            } else {
-                break;
-            }
-        }
-        groups.truncate(idx);
-    }
+    apply_file_cap(&mut groups, opts);
 
     Ok(groups)
 }
 
+/// Cut the selection down to `max_files_to_rewrite`. A group that does not fit
+/// whole is taken in part, so a cap below the first group still does that work.
+fn apply_file_cap(groups: &mut Vec<FileGroup>, opts: &RewriteOptions) {
+    let Some(cap) = opts.max_files_to_rewrite else {
+        return;
+    };
+    let mut remaining = cap as usize;
+    let mut kept: Vec<FileGroup> = Vec::with_capacity(groups.len());
+    for mut group in std::mem::take(groups) {
+        if remaining == 0 {
+            break;
+        }
+        if group.files.len() > remaining {
+            group.files.truncate(remaining);
+            group.total_bytes = group.files.iter().map(|f| f.size_bytes).sum();
+            group.resolve_write_shape(opts);
+        }
+        remaining -= group.files.len();
+        kept.push(group);
+    }
+    *groups = kept;
+}
+
+/// Pack files into groups of at most `cap` bytes, in the order they were
+/// scanned. Files arrive roughly ordered by the data they hold, so packing in
+/// that order keeps each group's rows contiguous and its bounds narrow; sorting
+/// by size first packs tighter but scatters the rows across every output file.
 fn pack(
-    mut files: Vec<CandidateFile>,
+    files: Vec<CandidateFile>,
     partition_key: &str,
     output_spec_id: i32,
     cap: u64,
 ) -> Vec<FileGroup> {
-    // First-fit-decreasing: biggest files first so oversized singletons land in their own group
-    // and the remainder packs efficiently.
-    files.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
     let mut out: Vec<FileGroup> = Vec::new();
     let mut current = FileGroup::empty(partition_key.to_string(), output_spec_id);
     for f in files {
@@ -180,6 +245,8 @@ mod tests {
             partition_spec_id: spec,
             positional_delete_paths: vec![],
             has_equality_deletes: false,
+            record_count: 1,
+            deleted_record_count: 0,
         }
     }
 
@@ -308,9 +375,7 @@ mod tests {
             job_order: JobOrder::BytesDesc,
             ..opts(target, 2, 5 * target)
         };
-        // Two partitions, two files each. After job-order sort the partition with
-        // larger files comes first; the cap of 3 keeps only that group entirely
-        // (2 files) and drops the second group (would push us over the cap).
+        // The cap of 3 takes the first group whole, then one file from the next.
         let candidates = vec![
             cf("/big0.parquet", 10_000_000, "p=a", 0),
             cf("/big1.parquet", 10_000_000, "p=a", 0),
@@ -319,13 +384,140 @@ mod tests {
         ];
         let groups = plan_file_groups(candidates, &o, 0).unwrap();
         let total_files: usize = groups.iter().map(|g| g.files.len()).sum();
-        assert!(
-            total_files <= 3,
-            "cap not honored: {} files in {} groups",
-            total_files,
-            groups.len()
+        assert_eq!(total_files, 3, "the cap should be filled, not undershot");
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].files.len(), 2);
+        assert_eq!(groups[1].files.len(), 1);
+    }
+
+    #[test]
+    fn a_cap_below_the_first_group_still_does_that_much_work() {
+        let target = 64 * 1024 * 1024;
+        let o = RewriteOptions {
+            max_files_to_rewrite: Some(2),
+            ..opts(target, 2, 5 * target)
+        };
+        let candidates = (0..5)
+            .map(|i| cf(&format!("/f{i}.parquet"), 1024, "p=a", 0))
+            .collect();
+
+        let groups = plan_file_groups(candidates, &o, 0).unwrap();
+
+        let total_files: usize = groups.iter().map(|g| g.files.len()).sum();
+        assert_eq!(
+            total_files, 2,
+            "a cap under the first group must not yield nothing"
         );
         assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].total_bytes, 2048,
+            "a sliced group reports what it kept"
+        );
+    }
+
+    #[test]
+    fn a_small_packed_group_is_discarded_like_the_reference() {
+        let target = 64 * 1024 * 1024;
+        let o = opts(target, 5, 5 * target);
+        let candidates = vec![
+            cf("/a.parquet", 1024, "p=a", 0),
+            cf("/b.parquet", 1024, "p=a", 0),
+        ];
+
+        assert!(plan_file_groups(candidates, &o, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_group_holding_more_than_a_target_is_kept_below_min_input_files() {
+        let target = 4 * 1024 * 1024;
+        let o = opts(target, 5, 5 * target);
+        let candidates = vec![
+            cf("/a.parquet", 5 * 512 * 1024, "p=a", 0),
+            cf("/b.parquet", 5 * 512 * 1024, "p=a", 0),
+        ];
+
+        let groups = plan_file_groups(candidates, &o, 0).unwrap();
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].files.len(), 2);
+    }
+
+    #[test]
+    fn a_heavily_deleted_file_is_rewritten_on_its_own() {
+        let target = 64 * 1024 * 1024;
+        let o = RewriteOptions {
+            delete_ratio_threshold: 0.3,
+            ..opts(target, 5, 5 * target)
+        };
+        let mut deleted = cf("/deleted.parquet", target, "p=a", 0);
+        deleted.positional_delete_paths = vec!["/d.parquet".into()];
+        deleted.record_count = 100;
+        deleted.deleted_record_count = 40;
+
+        let groups = plan_file_groups(vec![deleted], &o, 0).unwrap();
+
+        assert_eq!(
+            groups.len(),
+            1,
+            "a file past the delete ratio is worth rewriting alone"
+        );
+        assert_eq!(groups[0].files.len(), 1);
+    }
+
+    #[test]
+    fn a_lightly_deleted_file_is_left_alone() {
+        let target = 64 * 1024 * 1024;
+        let o = RewriteOptions {
+            delete_ratio_threshold: 0.3,
+            ..opts(target, 5, 5 * target)
+        };
+        let mut deleted = cf("/deleted.parquet", target, "p=a", 0);
+        deleted.positional_delete_paths = vec!["/d.parquet".into()];
+        deleted.record_count = 100;
+        deleted.deleted_record_count = 10;
+
+        assert!(plan_file_groups(vec![deleted], &o, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_delete_naming_no_data_file_leaves_the_ratio_at_zero() {
+        let target = 64 * 1024 * 1024;
+        let o = RewriteOptions {
+            delete_ratio_threshold: 0.3,
+            ..opts(target, 5, 5 * target)
+        };
+        let mut deleted = cf("/deleted.parquet", target, "p=a", 0);
+        deleted.positional_delete_paths = vec!["/d.parquet".into()];
+        deleted.record_count = 100;
+        deleted.deleted_record_count = 0;
+
+        assert!(plan_file_groups(vec![deleted], &o, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn groups_carry_the_write_shape_decided_for_them() {
+        let target = 2 * 1024 * 1024;
+        let o = opts(target, 2, 100 * target);
+        let candidates = (0..6)
+            .map(|i| cf(&format!("/f{i}.parquet"), 1024 * 1024, "p=a", 0))
+            .collect();
+
+        let groups = plan_file_groups(candidates, &o, 0).unwrap();
+
+        assert_eq!(groups.len(), 1);
+        let group = &groups[0];
+        assert_eq!(
+            group.expected_output_files,
+            o.expected_output_files(group.total_bytes)
+        );
+        assert_eq!(
+            group.input_split_size,
+            o.input_split_size(group.total_bytes)
+        );
+        assert!(
+            group.expected_output_files > 1,
+            "six undersized files add up to several targets' worth"
+        );
     }
 
     #[test]
@@ -363,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_max_below_target_rejected() {
+    fn invalid_max_file_size_below_target_rejected() {
         let o = RewriteOptions {
             target_file_size_bytes: 100 * 1024 * 1024,
             max_file_group_size_bytes: 5 * 100 * 1024 * 1024,
@@ -371,6 +563,23 @@ mod tests {
             ..RewriteOptions::default()
         };
         assert!(o.validate().is_err());
+    }
+
+    #[test]
+    fn a_group_cap_below_the_target_bounds_each_group() {
+        let cap = 4 * 1024 * 1024;
+        let o = opts(64 * 1024 * 1024, 2, cap);
+        let candidates = (0..8)
+            .map(|i| cf(&format!("/f{i}.parquet"), 1024 * 1024, "p=a", 0))
+            .collect();
+
+        let groups = plan_file_groups(candidates, &o, 0).unwrap();
+
+        assert!(
+            groups.len() > 1,
+            "a cap under the target splits the bucket into several groups"
+        );
+        assert!(groups.iter().all(|g| g.total_bytes <= cap));
     }
 
     #[test]

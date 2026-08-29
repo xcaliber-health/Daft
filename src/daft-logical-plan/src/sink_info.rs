@@ -76,6 +76,8 @@ pub struct IcebergCatalogInfo<E = ExprRef> {
     #[educe(PartialEq(ignore))]
     #[educe(Hash(ignore))]
     pub iceberg_properties: Arc<pyo3::Py<pyo3::PyAny>>,
+    /// Sort order the written rows are in. Zero is unsorted.
+    pub sort_order_id: i64,
     pub io_config: Option<IOConfig>,
 }
 
@@ -304,6 +306,7 @@ impl IcebergCatalogInfo {
             partition_cols: BoundExpr::bind_all(&self.partition_cols, schema)?,
             iceberg_schema: self.iceberg_schema,
             iceberg_properties: self.iceberg_properties,
+            sort_order_id: self.sort_order_id,
             io_config: self.io_config,
         })
     }

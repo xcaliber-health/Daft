@@ -118,3 +118,89 @@ def convert_filter(filter: PyExpr | None, schema: IcebergSchema) -> IcebergBoole
     except Exception as e:
         logger.warning("Could not convert filter to Iceberg expression, skipping pushdown: %s", e)
         return None
+
+
+def retarget_references(
+    expression: IcebergBooleanExpression,
+    source_schema: IcebergSchema,
+    target_schema: IcebergSchema,
+) -> IcebergBooleanExpression:
+    """Rewrite an unbound predicate's column references from one schema's names to another's.
+
+    Predicates are built from the names a reader projects, but they are bound
+    against the table's current schema. When a column has been renamed the two
+    disagree, and binding either fails or — if the old name has since been reused
+    for a different column — silently resolves to the wrong field. Field ids are
+    stable across renames, so each reference is mapped through its id.
+
+    Parameters
+    ----------
+    expression : IcebergBooleanExpression
+        Unbound predicate whose references name fields of ``source_schema``.
+    source_schema : IcebergSchema
+        Schema the references were written against.
+    target_schema : IcebergSchema
+        Schema the predicate will be bound against.
+
+    Returns:
+    -------
+    IcebergBooleanExpression
+        The predicate with every reference renamed to its ``target_schema`` name.
+        Returned unchanged when the two schemas name every field identically.
+
+    Notes:
+    -----
+    A field dropped from ``target_schema`` is left alone rather than reported
+    here; a predicate that actually references it fails at bind time, where the
+    error names the column.
+    """
+    from pyiceberg.schema import index_by_id
+
+    renames: dict[str, str] = {}
+    for field_id in index_by_id(source_schema):
+        source_name = source_schema.find_column_name(field_id)
+        target_name = target_schema.find_column_name(field_id)
+        if source_name is not None and target_name is not None and source_name != target_name:
+            renames[source_name] = target_name
+    if not renames:
+        return expression
+    return _rename_references(expression, renames)
+
+
+def _rename_references(
+    expression: IcebergBooleanExpression,
+    renames: dict[str, str],
+) -> IcebergBooleanExpression:
+    """Rebuild a predicate tree with each reference name replaced per ``renames``."""
+    from pyiceberg.expressions import (
+        And,
+        LiteralPredicate,
+        Not,
+        Or,
+        Reference,
+        SetPredicate,
+        UnaryPredicate,
+        UnboundPredicate,
+    )
+
+    if isinstance(expression, And | Or):
+        return type(expression)(
+            _rename_references(expression.left, renames),
+            _rename_references(expression.right, renames),
+        )
+    if isinstance(expression, Not):
+        return Not(_rename_references(expression.child, renames))
+    if not isinstance(expression, UnboundPredicate):
+        return expression
+
+    term = expression.term
+    if not isinstance(term, Reference):
+        return expression
+    renamed = Reference(renames.get(term.name, term.name))
+    if isinstance(expression, UnaryPredicate):
+        return type(expression)(term=renamed)
+    if isinstance(expression, LiteralPredicate):
+        return type(expression)(term=renamed, literal=expression.literal)
+    if isinstance(expression, SetPredicate):
+        return type(expression)(term=renamed, literals=expression.literals)
+    return expression

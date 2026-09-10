@@ -26,26 +26,49 @@ fn get_field_id(info: &parquet::schema::types::BasicTypeInfo) -> Option<i32> {
     info.has_id().then(|| info.id())
 }
 
-/// Index of column name to field ID, used only for files whose schema carries no
-/// field IDs of its own.
+/// Index of column name to field ID for files whose schema carries no field IDs.
 ///
-/// A name is included only when exactly one field claims it. An ambiguous name
-/// -- the same leaf name under two different structs, for example -- is left out
-/// so it can never be resolved to the wrong column; such a column is reported as
-/// unresolvable instead of being silently mismatched.
+/// A name is present only when exactly one field claims it, so an ambiguous
+/// name is reported as unresolvable rather than bound to the wrong column.
 type NameIndex<'a> = HashMap<&'a str, i32>;
 
+/// Field metadata key carrying the names a table's name mapping assigns to a field.
+///
+/// The names are one per line. A file registered before a column was renamed
+/// still carries the old name, and the mapping records that the old name
+/// refers to this field.
+pub const NAME_MAPPING_METADATA_KEY: &str = "iceberg.name-mapping";
+
 /// Build the unambiguous name index for a field ID mapping.
+///
+/// Every field is indexed under its current name and under each name the
+/// table's declared name mapping assigns to it. A name that two different
+/// fields claim is left out.
 fn build_name_index(field_id_mapping: &BTreeMap<i32, Field>) -> NameIndex<'_> {
-    let mut seen_twice: HashSet<&str> = HashSet::new();
+    let mut ambiguous: HashSet<&str> = HashSet::new();
     let mut index: NameIndex<'_> = HashMap::with_capacity(field_id_mapping.len());
     for (field_id, field) in field_id_mapping {
-        let name: &str = &field.name;
-        if index.insert(name, *field_id).is_some() {
-            seen_twice.insert(name);
+        let aliases = field
+            .metadata
+            .get(NAME_MAPPING_METADATA_KEY)
+            .map(|joined| {
+                joined
+                    .lines()
+                    .filter(|name| !name.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let current: &str = &field.name;
+        for name in std::iter::once(current).chain(aliases) {
+            match index.insert(name, *field_id) {
+                Some(previous) if previous != *field_id => {
+                    ambiguous.insert(name);
+                }
+                _ => {}
+            }
         }
     }
-    for name in seen_twice {
+    for name in ambiguous {
         index.remove(name);
     }
     index
@@ -53,8 +76,8 @@ fn build_name_index(field_id_mapping: &BTreeMap<i32, Field>) -> NameIndex<'_> {
 
 /// Report whether any node in the schema declares a field ID.
 ///
-/// Data files registered rather than written by a catalog-aware writer carry no
-/// field IDs at all, which is the case the name index exists to serve.
+/// A data file registered rather than written through the table carries no
+/// field IDs at all, which is the case the name index serves.
 fn schema_declares_field_ids(root: &parquet::schema::types::Type) -> bool {
     fn walk(tp: &parquet::schema::types::Type) -> bool {
         if tp.get_basic_info().has_id() {
@@ -202,11 +225,9 @@ fn recurse_children_only(
 /// 1. Rename columns based on the `field_id_mapping`
 /// 2. Drop columns without a field_id or without a corresponding mapping entry
 ///
-/// A file whose schema declares no field IDs at all -- which is what registering
-/// an externally written file produces -- is resolved by column name instead, so
-/// its columns are matched rather than dropped. Only unambiguous names are used,
-/// and a file that cannot be fully resolved that way is rejected rather than
-/// read as nulls.
+/// A file whose schema declares no field IDs at all is resolved by column name
+/// instead, using only unambiguous names; a file that cannot be fully resolved
+/// that way is rejected rather than read as nulls.
 ///
 /// # Errors
 /// Returns an error when the file declares no field IDs and at least one of its
@@ -224,8 +245,8 @@ pub(crate) fn apply_field_ids_to_arrowrs_parquet_metadata(
     let old_schema = metadata.file_metadata().schema_descr();
     let old_root = old_schema.root_schema();
 
-    // A file that declares no field IDs is resolved by name; one that declares
-    // them keeps the existing behavior exactly.
+    // Only a file that declares no field IDs at all is resolved by name; one
+    // that declares any is resolved by ID alone.
     let by_name =
         (!schema_declares_field_ids(old_root)).then(|| build_name_index(field_id_mapping));
     let name_index = by_name.as_ref();
@@ -699,7 +720,7 @@ mod tests {
         let mapping = BTreeMap::from([(1, field("id")), (4, field("name")), (7, field("name"))]);
         let index = build_name_index(&mapping);
         assert_eq!(index.get("id"), Some(&1));
-        assert!(index.get("name").is_none());
+        assert!(!index.contains_key("name"));
     }
 
     #[test]

@@ -42,6 +42,19 @@ where
 }
 
 /// A serving process bound to a host and port.
+/// One tenant as configured from the client: name, token, and its optional
+/// per-tenant limits (concurrent queries, queue timeout, query timeout, plan
+/// payload bytes, memory cap bytes), each `None` where the default applies.
+type TenantSpec = (
+    String,
+    String,
+    Option<usize>,
+    Option<u64>,
+    Option<u64>,
+    Option<usize>,
+    Option<usize>,
+);
+
 #[pyclass(module = "daft.daft", name = "DaftServeServer", frozen)]
 pub struct PyDaftServer {
     port: u16,
@@ -82,15 +95,7 @@ impl PyDaftServer {
         disable_plan_payload: bool,
         query_timeout_secs: u64,
         query_memory_cap_bytes: usize,
-        tenants: Vec<(
-            String,
-            String,
-            Option<usize>,
-            Option<u64>,
-            Option<u64>,
-            Option<usize>,
-            Option<usize>,
-        )>,
+        tenants: Vec<TenantSpec>,
         session: Option<Py<PyAny>>,
         catalogs: Vec<String>,
     ) -> PyResult<Self> {

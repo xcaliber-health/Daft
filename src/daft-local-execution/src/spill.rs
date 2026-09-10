@@ -342,10 +342,7 @@ impl RunCursor {
 mod tests {
     use std::sync::Arc;
 
-    use daft_core::{
-        datatypes::{DataType, Field, Int64Array},
-        series::IntoSeries,
-    };
+    use daft_core::{datatypes::Int64Array, series::IntoSeries};
     use daft_recordbatch::RecordBatch;
 
     use super::*;

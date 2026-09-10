@@ -53,6 +53,7 @@ from typing import TYPE_CHECKING, Any, Literal, overload
 from daft.logical.schema import Schema
 
 if TYPE_CHECKING:
+    from daft.catalog.__iceberg import IcebergCatalog, IcebergTable
     from daft.expressions import Expression
     from daft.utils import ColumnInputType
     from daft.convert import InputListType
@@ -223,7 +224,7 @@ class Catalog(ABC):
         return catalog
 
     @staticmethod
-    def from_iceberg(catalog: object) -> Catalog:
+    def from_iceberg(catalog: object) -> IcebergCatalog:
         """Create a Daft Catalog from a PyIceberg catalog object.
 
         Args:
@@ -934,7 +935,7 @@ class Table(ABC):
         return table
 
     @staticmethod
-    def from_iceberg(table: object) -> Table:
+    def from_iceberg(table: object) -> IcebergTable:
         """Creates a Daft Table instance from an Iceberg table.
 
         Args:

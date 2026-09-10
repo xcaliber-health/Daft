@@ -93,7 +93,7 @@ def test_gpu_resource_request_behaves_like_native(remote_runner: RemoteRunner, n
     native_error: type[Exception] | None = None
     try:
         list(native_runner.run_iter_tables(df._builder))
-    except Exception as e:  # noqa: BLE001 - capturing behavior, not asserting a type yet
+    except Exception as e:
         native_error = type(e)
 
     if native_error is None:
@@ -102,6 +102,6 @@ def test_gpu_resource_request_behaves_like_native(remote_runner: RemoteRunner, n
         remote_error: type[Exception] | None = None
         try:
             list(remote_runner.run_iter_tables(df._builder))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             remote_error = type(e)
         assert remote_error is not None, "native rejected the GPU request but remote accepted it"

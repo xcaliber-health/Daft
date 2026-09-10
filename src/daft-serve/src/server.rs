@@ -392,20 +392,12 @@ impl FlightService for DaftServeService {
         let buffer = query.results_buffer_size.unwrap_or(8).clamp(1, 64);
         let (tx, rx) = async_channel::bounded(buffer);
         let sql_session = self.sql_session.clone();
-        let query_timeout_secs = limits.query_timeout_secs;
-        let memory_cap_bytes = limits.memory_cap_bytes;
+        let bounds = execute::QueryBounds {
+            timeout_secs: limits.query_timeout_secs,
+            memory_cap_bytes: limits.memory_cap_bytes,
+        };
         let task = common_runtime::get_io_runtime(true).spawn(async move {
-            execute::run_query(
-                query,
-                sql_session,
-                cancel,
-                permit,
-                guard,
-                tx,
-                query_timeout_secs,
-                memory_cap_bytes,
-            )
-            .await;
+            execute::run_query(query, sql_session, cancel, permit, guard, tx, bounds).await;
         });
 
         // The response stream owns the execution task: dropping the stream

@@ -15,7 +15,8 @@ from daft.recordbatch.partitioning import PartitionedTable, partition_strings_to
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from pyiceberg.manifest import DataFile
+    from pyiceberg.manifest import DataFile, DataFileContent
+    from pyiceberg.manifest import FileFormat as IcebergFileFormat
     from pyiceberg.partitioning import PartitionField as IcebergPartitionField
     from pyiceberg.schema import Schema as IcebergSchema
     from pyiceberg.table import TableProperties as IcebergTableProperties
@@ -35,12 +36,10 @@ def get_missing_columns(
     Args:
         data_schema (pa.Schema): Schema of the data about to be written.
         iceberg_schema (IcebergSchema): Schema of the table being written to.
-        require_matching_columns (bool): When true, refuse a write whose columns do
-            not line up with the table's. Off by default, because a write may
-            deliberately supply a subset of the table's columns or carry extra ones
-            the table drops. A rewrite sets it, since there the data came from the
-            table itself and a mismatch can only mean the rows were read under names
-            the table no longer uses.
+        require_matching_columns (bool): When true, refuse data that both lacks
+            table columns and carries extra ones. Off by default, since a write may
+            deliberately supply a subset of the table's columns or extra ones the
+            table drops.
 
     Returns:
         ExpressionsProjection: One null literal per table column absent from the
@@ -48,9 +47,8 @@ def get_missing_columns(
 
     Raises:
         ValueError: If ``require_matching_columns`` is set and the data both lacks
-            columns the table has and carries columns the table does not. Padding one
-            while dropping the other is how a name mismatch — a column read under a
-            stale name, for instance — turns into a silently emptied column.
+            columns the table has and carries columns the table does not; padding
+            one while dropping the other would silently empty a renamed column.
     """
     from pyiceberg.io.pyarrow import schema_to_pyarrow
 
@@ -183,9 +181,8 @@ def nan_countable_fields(schema: IcebergSchema, properties: dict[str, str]) -> s
     """Return the field ids a NaN count applies to.
 
     Only floating-point columns can hold a NaN, and only those the metrics
-    configuration asks for are counted. Nested columns count too: a float inside
-    a struct, list, or map is a leaf like any other, and the reference records
-    one for it.
+    configuration asks for are counted. A float nested in a struct, list, or map
+    is a leaf like any other.
 
     Args:
         schema (IcebergSchema): Schema of the table being written to.
@@ -287,7 +284,7 @@ def make_iceberg_data_file(
 
     # Bound to the version 2 layout whatever the table's version is: a manifest
     # writer reads records in that layout and writes them out through its own.
-    kwargs: dict[str, Any] = {
+    kwargs: dict[str, DataFileContent | IcebergFileFormat | IcebergRecord | str | int | None] = {
         "content": DataFileContent.DATA,
         "file_path": file_path,
         "file_format": IcebergFileFormat.PARQUET,

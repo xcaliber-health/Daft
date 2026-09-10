@@ -1,11 +1,8 @@
-"""Delete files under the table location that no snapshot still references.
+"""Delete files under the table location that no snapshot references.
 
-Lists the files physically present under the table root and subtracts the files
-reachable from any snapshot; the remainder is deleted. Listing, canonicalization,
-and the set-difference run through the execution engine, so the work distributes
-on a cluster and streams on a single host, scaling to very large tables. The
-match is performed on canonicalized paths so that equivalent spellings of one
-location (an aliased scheme or host) never flag a live file as an orphan.
+The files listed under the table root minus the files reachable from any
+snapshot are deleted. Paths are compared in canonical form so equivalent
+spellings of one location never flag a live file as an orphan.
 """
 
 from __future__ import annotations
@@ -14,12 +11,17 @@ import datetime as _dt
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from daft.io.iceberg._common import (
     DEFAULT_DELETE_BACKOFF_BASE_SECONDS,
     DEFAULT_DELETE_NUM_RETRIES,
     DEFAULT_MAX_CONCURRENT_DELETES,
+    MaintenanceOptions,
+    option_bool,
+    option_float,
+    option_int,
+    option_mapping,
     validate_gc_enabled,
 )
 from daft.io.iceberg._engine import (
@@ -101,19 +103,66 @@ def run(
     file_list_view: DataFrame | None = None,
     prefix_listing: bool = False,
     stream_results: bool = False,
-    options: dict[str, Any] | None = None,
+    options: MaintenanceOptions | None = None,
 ) -> RemoveOrphanResult:
+    """Delete files under the table location that no snapshot references.
+
+    Files listed under ``location`` and modified before ``older_than`` are
+    compared, in canonical form, against every file reachable from any
+    snapshot; those absent are deleted unless ``dry_run`` is set.
+
+    Parameters
+    ----------
+    table
+        Table whose location is cleaned.
+    older_than
+        Modification-time cutoff as a datetime or epoch milliseconds; defaults
+        to three days ago and must be at least a day old unless
+        ``allow-recent`` is set.
+    location
+        Subpath of the table location to clean; defaults to the whole location.
+    dry_run
+        Report orphans without deleting them.
+    prefix_mismatch_mode
+        ``"error"``, ``"delete"`` or ``"ignore"`` for listed files whose scheme
+        or authority matches no reachable path.
+    file_list_view
+        Inventory with ``file_path`` and ``last_modified`` columns to use
+        instead of listing the store.
+    prefix_listing
+        Accepted for interface compatibility and ignored.
+    stream_results
+        Pull deletion candidates one partition at a time.
+    options
+        ``max-concurrent-deletes``, ``delete-num-retries``,
+        ``delete-backoff-base-seconds``, ``sample-limit``, ``allow-recent``,
+        ``equal-schemes`` and ``equal-authorities``.
+
+    Returns:
+    -------
+    RemoveOrphanResult
+        Orphan, deleted and failed counts with a bounded sample of paths.
+
+    Raises:
+    ------
+    ValueError
+        If ``gc.enabled`` is false, the cutoff is too recent, the mode is
+        unknown, or ``location`` lies outside the table location.
+    PrefixMismatchError
+        Under ``"error"`` mode, when a listed file's prefix matches no
+        reachable path.
+    """
     if prefix_mismatch_mode not in _VALID_PREFIX_MODES:
         raise ValueError(
             f"prefix_mismatch_mode must be one of {sorted(_VALID_PREFIX_MODES)}, got {prefix_mismatch_mode!r}"
         )
 
     opts = options or {}
-    max_concurrent_deletes = int(opts.get("max-concurrent-deletes", DEFAULT_MAX_CONCURRENT_DELETES))
-    delete_num_retries = int(opts.get("delete-num-retries", DEFAULT_DELETE_NUM_RETRIES))
-    delete_backoff_base = float(opts.get("delete-backoff-base-seconds", DEFAULT_DELETE_BACKOFF_BASE_SECONDS))
-    sample_limit = int(opts.get("sample-limit", DEFAULT_SAMPLE_LIMIT))
-    allow_recent = bool(opts.get("allow-recent", False))
+    max_concurrent_deletes = option_int(opts, "max-concurrent-deletes", DEFAULT_MAX_CONCURRENT_DELETES)
+    delete_num_retries = option_int(opts, "delete-num-retries", DEFAULT_DELETE_NUM_RETRIES)
+    delete_backoff_base = option_float(opts, "delete-backoff-base-seconds", DEFAULT_DELETE_BACKOFF_BASE_SECONDS)
+    sample_limit = option_int(opts, "sample-limit", DEFAULT_SAMPLE_LIMIT)
+    allow_recent = option_bool(opts, "allow-recent", False)
 
     validate_gc_enabled(table)
 
@@ -158,6 +207,7 @@ def run(
 
 
 def _resolve_older_than_ms(older_than: _dt.datetime | int | None, *, allow_recent: bool) -> int:
+    """Return the modification-time cutoff in epoch milliseconds, enforcing the one-day floor."""
     now_ms = int(time.time() * 1000)
     if older_than is None:
         return now_ms - DEFAULT_OLDER_THAN_MS
@@ -179,6 +229,7 @@ def _resolve_older_than_ms(older_than: _dt.datetime | int | None, *, allow_recen
 
 
 def _resolve_location(table: PyIcebergTable, location: str | None) -> str:
+    """Return the location to list, which must lie within the table location."""
     table_loc = table.location().rstrip("/")
     if location is None:
         return table_loc
@@ -214,7 +265,7 @@ def _reachable_frame(table: PyIcebergTable) -> DataFrame:
     current_md = getattr(table, "metadata_location", None)
     if current_md:
         extra.append((current_md, KIND_METADATA))
-    return union_paths([content, manifests, paths_frame(extra)])
+    return union_paths(content, manifests, paths_frame(extra))
 
 
 def _listed_frame(
@@ -225,20 +276,18 @@ def _listed_frame(
     file_list_view: DataFrame | None,
     prefix_listing: bool,
 ) -> DataFrame:
-    """Build the frame of physically-present files to compare against the table.
+    """Build the frame of files present under ``location``.
 
-    Uses a caller-supplied inventory when given, otherwise lists the object
-    store through the engine. The ``prefix_listing`` flag is accepted for flat
-    object-store listing semantics; engine listing is already prefix-based on
-    object stores.
+    The caller-supplied inventory is used when given; otherwise the store is
+    listed.
     """
     if file_list_view is not None:
         return file_list_view_frame(file_list_view, location=location, older_than_ms=older_than_ms)
-    del prefix_listing  # informational; engine listing already prefix-based
+    del prefix_listing  # Listing is already prefix-based, so the flag changes nothing.
     io_config = io_config_for_table(table)
     return listed_files_frame(location, io_config=io_config, older_than_ms=older_than_ms)
 
 
-def _build_canonicalizer(opts: dict[str, Any]) -> CanonSpec:
+def _build_canonicalizer(opts: MaintenanceOptions) -> CanonSpec:
     """Build a path canonicalizer from the scheme/authority equivalence options."""
-    return build_canon_spec(opts.get("equal-schemes"), opts.get("equal-authorities"))
+    return build_canon_spec(option_mapping(opts, "equal-schemes"), option_mapping(opts, "equal-authorities"))

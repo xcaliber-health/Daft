@@ -3,7 +3,8 @@ from __future__ import annotations
 import math
 import uuid
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from daft.datatype import DataType
 from daft.dependencies import pa, pacsv, pafs, pq
@@ -461,36 +462,95 @@ def _iceberg_bloom_filter_options(
     return options
 
 
+#: Rows per data page when the table sets no ``write.parquet.page-row-limit``.
+_DEFAULT_PAGE_ROW_LIMIT = 20_000
+#: Dictionary page ceiling when the table sets no ``write.parquet.dict-size-bytes``.
+_DEFAULT_DICT_SIZE_BYTES = 2 * 1024 * 1024
+#: Rows the dictionary decision looks at; a prefix says as much as the batch.
+_DICTIONARY_SAMPLE_ROWS = 65_536
+_DICT_ENCODING_COLUMN_PREFIX = "write.parquet.dict-encoding-enabled.column."
+_OBJECT_STORAGE_KEY = "write.object-storage.enabled"
+_PARTITIONED_PATHS_KEY = "write.object-storage.partitioned-paths"
+
+
+@dataclass(frozen=True)
+class _ParquetWriterOptions:
+    """Writer settings resolved from a table's ``write.*`` properties."""
+
+    compression: str
+    compression_level: int | None
+    row_group_byte_size: int | None
+    data_page_size: int | None
+    page_row_limit: int
+    dictionary_page_size_limit: int
+    bloom_filter_options: dict[str, dict[str, float | int]] | None
+    dictionary_by_column: dict[str, bool]
+    object_storage: bool
+    partitioned_paths: bool
+
+
 def _resolve_iceberg_writer_options(
     properties: dict[str, str] | None,
     valid_columns: set[str] | None = None,
-) -> dict[str, Any]:
-    """Translate Iceberg ``write.*`` table properties to ParquetWriter kwargs."""
+) -> _ParquetWriterOptions:
+    """Translate the table's ``write.*`` properties into writer settings."""
+    from pyiceberg.utils.properties import property_as_bool
+
     props = properties or {}
-    fmt = (props.get("write.format-default") or "parquet").lower()
+    fmt = (props.get("write.format.default") or "parquet").lower()
     if fmt != "parquet":
-        raise ValueError(f"IcebergWriter only supports parquet; got write.format-default={fmt!r}")
+        raise ValueError(f"IcebergWriter only supports parquet; got write.format.default={fmt!r}")
 
     codec_raw = (props.get("write.parquet.compression-codec") or "zstd").lower()
-    codec = _ICEBERG_COMPRESSION_TO_PARQUET.get(codec_raw, codec_raw)
-
-    out: dict[str, Any] = {"compression": codec}
     level = props.get("write.parquet.compression-level")
-    if level is not None:
-        out["compression_level"] = int(level)
     row_group_bytes = props.get("write.parquet.row-group-size-bytes")
-    if row_group_bytes is not None:
-        out["row_group_byte_size"] = int(row_group_bytes)
     page_size = props.get("write.parquet.page-size-bytes")
-    if page_size is not None:
-        out["data_page_size"] = int(page_size)
-    dict_size = props.get("write.parquet.dict-size-bytes")
-    if dict_size is not None:
-        out["dictionary_pagesize_limit"] = int(dict_size)
-    bloom_options = _iceberg_bloom_filter_options(props, valid_columns)
-    if bloom_options is not None:
-        out["bloom_filter_options"] = bloom_options
-    return out
+    return _ParquetWriterOptions(
+        compression=_ICEBERG_COMPRESSION_TO_PARQUET.get(codec_raw, codec_raw),
+        compression_level=None if level is None else int(level),
+        row_group_byte_size=None if row_group_bytes is None else int(row_group_bytes),
+        data_page_size=None if page_size is None else int(page_size),
+        page_row_limit=int(props.get("write.parquet.page-row-limit", _DEFAULT_PAGE_ROW_LIMIT)),
+        dictionary_page_size_limit=int(props.get("write.parquet.dict-size-bytes", _DEFAULT_DICT_SIZE_BYTES)),
+        bloom_filter_options=_iceberg_bloom_filter_options(props, valid_columns),
+        dictionary_by_column={
+            key[len(_DICT_ENCODING_COLUMN_PREFIX) :]: property_as_bool(props, key, True)
+            for key in props
+            if key.startswith(_DICT_ENCODING_COLUMN_PREFIX)
+        },
+        object_storage=property_as_bool(props, _OBJECT_STORAGE_KEY, False),
+        partitioned_paths=property_as_bool(props, _PARTITIONED_PATHS_KEY, True),
+    )
+
+
+def _dictionary_columns(sample: pa.Table, explicit: dict[str, bool]) -> list[str] | None:
+    """Return the columns to dictionary-encode, or ``None`` to leave the choice to the writer.
+
+    A column the table names in ``explicit`` follows that flag. Otherwise a
+    dictionary of every value costs more than the values it indexes, so a
+    unique column is written plain.
+    """
+    import pyarrow.compute as pc
+
+    rows = sample.num_rows
+    if rows == 0 or any(pa.types.is_nested(field.type) for field in sample.schema):
+        return None
+    keep: list[str] = []
+    for name in sample.column_names:
+        if name in explicit:
+            if explicit[name]:
+                keep.append(name)
+            continue
+        column = sample.column(name)
+        distinct = int(pc.count_distinct(column).as_py())
+        if distinct == 0:
+            keep.append(name)
+            continue
+        dictionary_bytes = column.nbytes * distinct / rows
+        index_bytes = rows * max(1, (distinct - 1).bit_length()) / 8
+        if dictionary_bytes + index_bytes < column.nbytes:
+            keep.append(name)
+    return keep
 
 
 class IcebergWriter(ParquetFileWriter):
@@ -511,12 +571,12 @@ class IcebergWriter(ParquetFileWriter):
         # schema being written, so a stale or misspelled flag is ignored rather
         # than rejected by the writer.
         valid_columns = set(schema.column_names) if schema is not None else None
-        self._iceberg_writer_opts = _resolve_iceberg_writer_options(dict(properties or {}), valid_columns)
+        self._options = _resolve_iceberg_writer_options(dict(properties or {}), valid_columns)
         super().__init__(
             root_dir=root_dir,
             file_idx=file_idx,
             partition_values=partition_values,
-            compression=self._iceberg_writer_opts["compression"],
+            compression=self._options.compression,
             io_config=io_config,
             version=None,
             default_partition_fallback="null",
@@ -531,19 +591,59 @@ class IcebergWriter(ParquetFileWriter):
         self.partition_spec_id = partition_spec_id
         self.sort_order_id = sort_order_id
         self.properties = properties
+        if self._options.object_storage:
+            self._place_under_hashed_prefix()
         # A Parquet footer records no NaN count, so accumulate it while writing.
         # Empty when no column can hold one, which skips the work.
         self._nan_countable = nan_countable_fields(schema, dict(properties or {}))
         self._nan_counts: dict[int, int] = {}
 
-    def _create_writer(self, schema: pa.Schema) -> pq.ParquetWriter:
-        opts: dict[str, Any] = {}
+    def _place_under_hashed_prefix(self) -> None:
+        """Move the file under the object-store layout, which spreads keys by a hash of the name."""
+        from pyiceberg.table.locations import ObjectStoreLocationProvider
+
+        provider = ObjectStoreLocationProvider(
+            self.resolved_path,
+            {
+                **dict(self.properties or {}),
+                "write.data.path": self.resolved_path,
+                _PARTITIONED_PATHS_KEY: str(self._options.partitioned_paths).lower(),
+            },
+        )
+        partition_path = self.dir_path[len(self.resolved_path) :].strip("/")
+        name = (
+            f"{partition_path}/{self.file_name}"
+            if partition_path and self._options.partitioned_paths
+            else self.file_name
+        )
+        self.full_path = provider.new_data_location(name)
+        self.dir_path = self.full_path.rsplit("/", 1)[0]
+        if isinstance(self.fs, pafs.LocalFileSystem):
+            self.fs.create_dir(self.dir_path, recursive=True)
+
+    def _create_writer(self, schema: pa.Schema, sample: pa.Table | None = None) -> pq.ParquetWriter:
+        import inspect
+
+        opts: dict[str, int | list[str] | dict[str, dict[str, float | int]] | list[pq.FileMetaData]] = {
+            "dictionary_pagesize_limit": self._options.dictionary_page_size_limit,
+        }
         if self.metadata_collector is not None:
             opts["metadata_collector"] = self.metadata_collector
-        for k in ("compression_level", "data_page_size", "dictionary_pagesize_limit", "bloom_filter_options"):
-            v = self._iceberg_writer_opts.get(k)
-            if v is not None:
-                opts[k] = v
+        if self._options.compression_level is not None:
+            opts["compression_level"] = self._options.compression_level
+        if self._options.data_page_size is not None:
+            opts["data_page_size"] = self._options.data_page_size
+        if self._options.bloom_filter_options is not None:
+            opts["bloom_filter_options"] = self._options.bloom_filter_options
+        if "max_rows_per_page" in inspect.signature(pq.ParquetWriter.__init__).parameters:
+            opts["max_rows_per_page"] = self._options.page_row_limit
+        dictionary = (
+            None
+            if sample is None
+            else _dictionary_columns(sample.slice(0, _DICTIONARY_SAMPLE_ROWS), self._options.dictionary_by_column)
+        )
+        if dictionary is not None:
+            opts["use_dictionary"] = dictionary
         return pq.ParquetWriter(
             self.full_path,
             schema,
@@ -558,12 +658,12 @@ class IcebergWriter(ParquetFileWriter):
         assert not self.is_closed, "Cannot write to a closed IcebergFileWriter"
         if len(table) == 0:
             return 0
-        if self.current_writer is None:
-            self.current_writer = self._create_writer(self.file_schema)
         casted = coerce_pyarrow_table_to_schema(table.to_arrow(), self.file_schema)
+        if self.current_writer is None:
+            self.current_writer = self._create_writer(self.file_schema, casted)
         for field_id, count in count_nans(casted, self._nan_countable).items():
             self._nan_counts[field_id] = self._nan_counts.get(field_id, 0) + count
-        row_group_byte_cap = self._iceberg_writer_opts.get("row_group_byte_size")
+        row_group_byte_cap = self._options.row_group_byte_size
         if row_group_byte_cap is not None and len(table) > 0:
             approx_bytes_per_row = max(1, casted.nbytes // max(1, len(table)))
             row_group_size = max(1, int(row_group_byte_cap // approx_bytes_per_row))

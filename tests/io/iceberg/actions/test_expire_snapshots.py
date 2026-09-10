@@ -15,7 +15,7 @@ from pyiceberg.exceptions import CommitFailedException
 
 from daft.catalog import Table
 from daft.io.iceberg import ExpireResult
-from daft.io.iceberg._expire import _resolve_expired_ids  # noqa: internal
+from daft.io.iceberg._expire import plan_expiry  # internal
 from tests.io.iceberg.actions._helpers import (
     scan_paths as _data_file_paths,
 )
@@ -26,6 +26,11 @@ from tests.io.iceberg.actions._helpers import (
 
 def _snapshot_ids(table) -> list[int]:
     return [s.snapshot_id for s in table.metadata.snapshots]
+
+
+def _future() -> int:
+    """A cutoff every existing snapshot is older than, so retention is by count alone."""
+    return int(time.time() * 1000) + 60_000
 
 
 def _all_files_exist(paths) -> bool:
@@ -75,7 +80,7 @@ def test_clean_expired_metadata_deletes_stale_metadata_json(local_catalog, simpl
     assert len(before) >= 3
 
     dt = Table.from_iceberg(table)
-    result = dt.expire_snapshots(retain_last=1, clean_expired_metadata=True)
+    result = dt.expire_snapshots(older_than=_future(), retain_last=1, clean_expired_metadata=True)
 
     table.refresh()
     after = set(_metadata_json_files(table))
@@ -91,7 +96,7 @@ def test_clean_expired_metadata_default_keeps_metadata_json(local_catalog, simpl
     before = set(_metadata_json_files(table))
 
     dt = Table.from_iceberg(table)
-    result = dt.expire_snapshots(retain_last=1)
+    result = dt.expire_snapshots(older_than=_future(), retain_last=1)
 
     table.refresh()
     after = set(_metadata_json_files(table))
@@ -125,7 +130,7 @@ def test_retain_last_keeps_n_most_recent(make_tiny_table):
     assert len(pre_ids) == 6
 
     dt_table = Table.from_iceberg(table)
-    dt_table.expire_snapshots(retain_last=3)
+    dt_table.expire_snapshots(older_than=_future(), retain_last=3)
 
     table.refresh()
     post_ids = _snapshot_ids(table)
@@ -196,18 +201,34 @@ def test_explicit_protected_id_rejected(local_catalog, simple_schema):
         dt_table.expire_snapshots(snapshot_ids=[snap])
 
 
-def test_min_snapshots_to_keep_floors_retain_last(make_tiny_table):
+def test_min_snapshots_to_keep_property_is_the_default_floor(make_tiny_table):
+    # Arrange: the table asks to keep five; the caller names no count.
     table = make_tiny_table(name="default.t_exp_floor", n_files=6, rows_per_file=2)
     with table.transaction() as tx:
         tx.set_properties(**{"history.expire.min-snapshots-to-keep": "5"})
     table.refresh()
 
-    dt_table = Table.from_iceberg(table)
-    dt_table.expire_snapshots(retain_last=2)
+    # Act
+    Table.from_iceberg(table).expire_snapshots(older_than=_future())
 
+    # Assert: the property applies when the argument is absent.
     table.refresh()
-    # Floor wins: 5 (not 2) snapshots must remain.
-    assert len(table.metadata.snapshots) >= 5
+    assert len(table.metadata.snapshots) == 5
+
+
+def test_retain_last_overrides_the_min_snapshots_property(make_tiny_table):
+    # Arrange: the same table property, but the caller names a count.
+    table = make_tiny_table(name="default.t_exp_override", n_files=6, rows_per_file=2)
+    with table.transaction() as tx:
+        tx.set_properties(**{"history.expire.min-snapshots-to-keep": "5"})
+    table.refresh()
+
+    # Act
+    Table.from_iceberg(table).expire_snapshots(older_than=_future(), retain_last=2)
+
+    # Assert: an explicit count replaces the table default rather than being floored by it.
+    table.refresh()
+    assert len(table.metadata.snapshots) == 2
 
 
 def test_gc_enabled_false_refuses(make_tiny_table):
@@ -231,7 +252,7 @@ def test_clean_expired_files_false_is_metadata_only(make_tiny_table):
                 all_paths.add(e.data_file.file_path)
 
     dt_table = Table.from_iceberg(table)
-    result = dt_table.expire_snapshots(retain_last=1, clean_expired_files=False)
+    result = dt_table.expire_snapshots(older_than=_future(), retain_last=1, clean_expired_files=False)
 
     table.refresh()
     assert len(table.metadata.snapshots) == 1
@@ -246,7 +267,7 @@ def test_result_counts_match_actual_deletions(make_tiny_table):
     table = make_tiny_table(name="default.t_exp_counts", n_files=4, rows_per_file=3)
 
     dt_table = Table.from_iceberg(table)
-    result = dt_table.expire_snapshots(retain_last=1)
+    result = dt_table.expire_snapshots(older_than=_future(), retain_last=1)
 
     table.refresh()
     surviving = _data_file_paths(table)
@@ -272,7 +293,7 @@ def test_result_counts_after_overwrite(make_tiny_table):
     table.refresh()
 
     dt_table = Table.from_iceberg(table)
-    result = dt_table.expire_snapshots(retain_last=1)
+    result = dt_table.expire_snapshots(older_than=_future(), retain_last=1)
 
     table.refresh()
     surviving = _data_file_paths(table)
@@ -286,10 +307,10 @@ def test_result_counts_after_overwrite(make_tiny_table):
 def test_idempotent_rerun_is_noop(make_tiny_table):
     table = make_tiny_table(name="default.t_exp_idem", n_files=4, rows_per_file=3)
     dt_table = Table.from_iceberg(table)
-    dt_table.expire_snapshots(retain_last=1)
+    dt_table.expire_snapshots(older_than=_future(), retain_last=1)
 
     table.refresh()
-    result2 = dt_table.expire_snapshots(retain_last=1)
+    result2 = dt_table.expire_snapshots(older_than=_future(), retain_last=1)
     assert result2 == ExpireResult()
 
 
@@ -314,6 +335,7 @@ def test_parallel_delete_observable(make_tiny_table, monkeypatch):
 
     dt_table = Table.from_iceberg(table)
     dt_table.expire_snapshots(
+        older_than=_future(),
         retain_last=1,
         options={"max-concurrent-deletes": 4},
     )
@@ -335,7 +357,7 @@ def test_notfound_during_delete_is_success(make_tiny_table, monkeypatch):
     monkeypatch.setattr(type(table.io), "delete", flaky)
 
     dt_table = Table.from_iceberg(table)
-    result = dt_table.expire_snapshots(retain_last=1)
+    result = dt_table.expire_snapshots(older_than=_future(), retain_last=1)
     # FileNotFoundError on the first delete was suppressed; rest proceeded.
     total = result.deleted_data_files_count + result.deleted_manifest_files_count + result.deleted_manifest_lists_count
     assert total >= 1
@@ -360,7 +382,7 @@ def test_manifest_read_tolerates_aws_resource_not_found(make_tiny_table, monkeyp
     monkeypatch.setattr(ManifestFile, "fetch_manifest_entry", flaky_fetch)
 
     dt_table = Table.from_iceberg(table)
-    result = dt_table.expire_snapshots(retain_last=1)
+    result = dt_table.expire_snapshots(older_than=_future(), retain_last=1)
     assert state["raised"]
     assert isinstance(result, ExpireResult)
 
@@ -381,7 +403,7 @@ def test_collect_paths_tolerates_aws_resource_not_found_on_manifests_list(make_t
     monkeypatch.setattr(Snapshot, "manifests", flaky_manifests)
 
     dt_table = Table.from_iceberg(table)
-    result = dt_table.expire_snapshots(retain_last=1)
+    result = dt_table.expire_snapshots(older_than=_future(), retain_last=1)
     assert state["raised"]
     assert isinstance(result, ExpireResult)
 
@@ -404,7 +426,7 @@ def test_commit_conflict_retries(make_tiny_table, monkeypatch):
     monkeypatch.setattr(_PyExpireSnapshots, "commit", flaky_commit)
 
     dt_table = Table.from_iceberg(table)
-    dt_table.expire_snapshots(retain_last=1)
+    dt_table.expire_snapshots(older_than=_future(), retain_last=1)
 
     table.refresh()
     assert calls["n"] >= 2
@@ -415,7 +437,7 @@ def test_retain_last_below_one_rejected(make_tiny_table):
     table = make_tiny_table(name="default.t_exp_bad", n_files=2, rows_per_file=2)
     dt_table = Table.from_iceberg(table)
     with pytest.raises(ValueError, match="retain_last"):
-        dt_table.expire_snapshots(retain_last=0)
+        dt_table.expire_snapshots(older_than=_future(), retain_last=0)
 
 
 def test_no_args_falls_back_to_max_age_property(make_tiny_table):
@@ -433,19 +455,154 @@ def test_no_args_falls_back_to_max_age_property(make_tiny_table):
     assert len(table.metadata.snapshots) == 1
 
 
-def test_resolve_unit_combination_of_knobs(make_tiny_table):
-    table = make_tiny_table(name="default.t_exp_resolve", n_files=5, rows_per_file=2)
+def _branch_table(local_catalog, simple_schema, name: str, n: int):
+    from pyiceberg.partitioning import UNPARTITIONED_PARTITION_SPEC
+
+    table = local_catalog.create_table(name, schema=simple_schema, partition_spec=UNPARTITIONED_PARTITION_SPEC)
+    for k in range(n):
+        table.append(pa.table({"id": pa.array([k], type=pa.int64()), "label": pa.array([f"r{k}"])}))
+    return table
+
+
+def test_retain_last_alone_keeps_snapshots_younger_than_the_table_age(make_tiny_table):
+    # Arrange: every snapshot is seconds old; the table's maximum age is five days.
+    table = make_tiny_table(name="default.t_exp_young", n_files=4, rows_per_file=2)
+
+    # Act: a count alone sets a floor, not a ceiling.
+    result = Table.from_iceberg(table).expire_snapshots(retain_last=1)
+
+    # Assert
+    table.refresh()
+    assert len(table.metadata.snapshots) == 4
+    assert result == ExpireResult()
+
+
+def test_older_than_and_retain_last_combine_as_cutoff_and_floor(make_tiny_table):
+    # Arrange: a cutoff between snapshots 1 and 2, and a floor of 3.
+    table = make_tiny_table(name="default.t_exp_combined", n_files=5, rows_per_file=2)
     snaps = list(table.metadata.snapshots)
-    older_than = snaps[2].timestamp_ms  # expires 0 and 1
-    explicit = [snaps[3].snapshot_id]  # extra
-    expired = _resolve_expired_ids(
-        table=table,
-        older_than=older_than,
-        retain_last=None,
-        snapshot_ids=explicit,
-        protected_ids={snaps[-1].snapshot_id},
+    cutoff = (snaps[1].timestamp_ms + snaps[2].timestamp_ms) // 2
+
+    # Act
+    Table.from_iceberg(table).expire_snapshots(older_than=cutoff, retain_last=3)
+
+    # Assert: the floor keeps the three most recent; the cutoff alone would have
+    # expired snapshots 0 and 1, and the floor does not expire 2.
+    table.refresh()
+    assert _snapshot_ids(table) == [s.snapshot_id for s in snaps[2:]]
+
+    # A wider floor keeps snapshots the cutoff would expire.
+    table2 = make_tiny_table(name="default.t_exp_combined_floor", n_files=5, rows_per_file=2)
+    snaps2 = list(table2.metadata.snapshots)
+    Table.from_iceberg(table2).expire_snapshots(older_than=_future(), retain_last=4)
+    table2.refresh()
+    assert _snapshot_ids(table2) == [s.snapshot_id for s in snaps2[1:]]
+
+
+def test_plan_walks_each_branch_with_its_own_settings(local_catalog, simple_schema):
+    # Arrange: main has five snapshots; a branch off the second keeps two
+    # regardless of age, and its own snapshots are separate ancestry.
+    table = _branch_table(local_catalog, simple_schema, "default.t_exp_branch_walk", n=5)
+    snaps = list(table.metadata.snapshots)
+    with table.manage_snapshots() as ms:
+        ms.create_branch(snapshot_id=snaps[1].snapshot_id, branch_name="audit", min_snapshots_to_keep=2)
+    table.refresh()
+
+    # Act: expire everything older than now, keeping one on main.
+    plan = plan_expiry(table, older_than=_future(), retain_last=1, snapshot_ids=None, now_ms=int(time.time() * 1000))
+
+    # Assert: main keeps its head; the branch keeps its head and its parent.
+    kept = {s.snapshot_id for s in snaps} - set(plan.snapshot_ids)
+    assert kept == {snaps[4].snapshot_id, snaps[1].snapshot_id, snaps[0].snapshot_id}
+    assert plan.protected_ids == frozenset({snaps[4].snapshot_id, snaps[1].snapshot_id})
+    assert plan.ref_names == ()
+
+
+def test_plan_keeps_an_unreferenced_snapshot_younger_than_the_cutoff(local_catalog, simple_schema):
+    # Arrange: overwrite a branch head so its old snapshot is no longer reachable
+    # from any reference, then plan with a cutoff in the past.
+    table = _branch_table(local_catalog, simple_schema, "default.t_exp_unreferenced", n=3)
+    snaps = list(table.metadata.snapshots)
+    with table.manage_snapshots() as ms:
+        ms.create_tag(snapshot_id=snaps[0].snapshot_id, tag_name="old")
+    table.refresh()
+    with table.manage_snapshots() as ms:
+        ms.remove_tag("old")
+    table.refresh()
+    with table.manage_snapshots() as ms:
+        ms.create_branch(snapshot_id=snaps[2].snapshot_id, branch_name="fork")
+    table.refresh()
+    # Rewrite main's history so snapshot 1 is reachable only from the fork.
+    with table.manage_snapshots() as ms:
+        ms.set_current_snapshot(snapshot_id=snaps[0].snapshot_id)
+    table.refresh()
+    table.append(pa.table({"id": pa.array([99], type=pa.int64()), "label": pa.array(["new"])}))
+    table.refresh()
+    with table.manage_snapshots() as ms:
+        ms.remove_branch("fork")
+    table.refresh()
+    reachable = {
+        s.snapshot_id
+        for s in table.metadata.snapshots
+        if s.snapshot_id in (snaps[0].snapshot_id, table.current_snapshot().snapshot_id)
+    }
+    unreferenced = {s.snapshot_id for s in table.metadata.snapshots} - reachable
+    assert unreferenced
+
+    # Act: cutoff in the past keeps young unreferenced snapshots; a future cutoff drops them.
+    past = plan_expiry(
+        table, older_than=snaps[0].timestamp_ms - 1, retain_last=1, snapshot_ids=None, now_ms=int(time.time() * 1000)
     )
-    assert snaps[0].snapshot_id in expired
-    assert snaps[1].snapshot_id in expired
-    assert snaps[3].snapshot_id in expired
-    assert snaps[-1].snapshot_id not in expired  # protected
+    future = plan_expiry(table, older_than=_future(), retain_last=1, snapshot_ids=None, now_ms=int(time.time() * 1000))
+
+    # Assert
+    assert unreferenced.isdisjoint(past.snapshot_ids)
+    assert unreferenced <= set(future.snapshot_ids)
+
+
+def test_an_aged_tag_is_removed_and_its_snapshot_expires(local_catalog, simple_schema):
+    # Arrange: a tag that ages out after one millisecond.
+    table = _branch_table(local_catalog, simple_schema, "default.t_exp_aged_tag", n=3)
+    snaps = list(table.metadata.snapshots)
+    with table.manage_snapshots() as ms:
+        ms.create_tag(snapshot_id=snaps[0].snapshot_id, tag_name="stale", max_ref_age_ms=1)
+    table.refresh()
+    time.sleep(0.01)
+
+    # Act
+    Table.from_iceberg(table).expire_snapshots(older_than=_future(), retain_last=1)
+
+    # Assert: the tag is gone and the snapshot it held expired with the rest.
+    table.refresh()
+    assert "stale" not in table.metadata.refs
+    assert _snapshot_ids(table) == [snaps[2].snapshot_id]
+
+
+def test_a_live_tag_keeps_its_snapshot(local_catalog, simple_schema):
+    table = _branch_table(local_catalog, simple_schema, "default.t_exp_live_tag", n=3)
+    snaps = list(table.metadata.snapshots)
+    with table.manage_snapshots() as ms:
+        ms.create_tag(snapshot_id=snaps[0].snapshot_id, tag_name="keep")
+    table.refresh()
+
+    Table.from_iceberg(table).expire_snapshots(older_than=_future(), retain_last=1)
+
+    table.refresh()
+    assert "keep" in table.metadata.refs
+    assert set(_snapshot_ids(table)) == {snaps[0].snapshot_id, snaps[2].snapshot_id}
+
+
+def test_explicit_ids_expire_regardless_of_retention(make_tiny_table):
+    table = make_tiny_table(name="default.t_exp_explicit_plan", n_files=5, rows_per_file=2)
+    snaps = list(table.metadata.snapshots)
+
+    plan = plan_expiry(
+        table,
+        older_than=None,
+        retain_last=None,
+        snapshot_ids=[snaps[3].snapshot_id],
+        now_ms=int(time.time() * 1000),
+    )
+
+    assert set(plan.snapshot_ids) == {snaps[3].snapshot_id}
+    assert snaps[-1].snapshot_id in plan.protected_ids

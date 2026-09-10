@@ -10,6 +10,17 @@ use pyo3::{
 
 use crate::{AsyncFileWriter, WriteResult};
 
+/// Table-level identifiers stamped on every file a catalog writer produces.
+///
+/// The partition spec id records which partitioning the file was written
+/// under; the sort order id records the order its rows were written in, or
+/// zero for unsorted.
+#[derive(Debug, Clone, Copy)]
+pub struct IcebergFileLayout {
+    pub partition_spec_id: i64,
+    pub sort_order_id: i64,
+}
+
 pub struct PyArrowWriter {
     py_writer: pyo3::Py<pyo3::PyAny>,
     is_closed: bool,
@@ -128,8 +139,7 @@ impl PyArrowWriter {
         file_idx: usize,
         schema: &pyo3::Py<pyo3::PyAny>,
         properties: &pyo3::Py<pyo3::PyAny>,
-        partition_spec_id: i64,
-        sort_order_id: i64,
+        layout: IcebergFileLayout,
         partition_values: Option<&RecordBatch>,
         io_config: Option<&daft_io::IOConfig>,
     ) -> DaftResult<Self> {
@@ -153,8 +163,8 @@ impl PyArrowWriter {
                 file_idx,
                 schema,
                 properties,
-                partition_spec_id,
-                sort_order_id,
+                layout.partition_spec_id,
+                layout.sort_order_id,
                 partition_values,
                 io_config.map(|cfg| daft_io::python::IOConfig {
                     config: cfg.clone(),

@@ -24,7 +24,7 @@ from daft.io.iceberg._metadata import (
     convert_iceberg_schema,
     convert_iceberg_transform,
 )
-from daft.io.iceberg.schema_field_id_mapping_visitor import SchemaFieldIdMappingVisitor
+from daft.io.iceberg.schema_field_id_mapping_visitor import SchemaFieldIdMappingVisitor, attach_name_mapping
 from daft.io.scan import ScanOperator, make_partition_field
 from daft.logical.schema import Field, Schema
 from daft.recordbatch import RecordBatch
@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Which schema a scan reads its rows under.
+#: Which schema a scan reads its rows under.
 SchemaSource = Literal["snapshot", "current"]
 
 
@@ -96,16 +96,17 @@ class IcebergScanOperator(ScanOperator):
     ) -> None:
         """Scan a table, optionally as of a snapshot.
 
-        Parameters
-        ----------
-        schema_source : SchemaSource
-            Which schema the rows are read under. ``"snapshot"`` reads them as
-            the snapshot recorded them, which is what time travel means.
-            ``"current"`` reads them under the table's current schema, which is
-            what a rewrite needs: schema-only changes such as a rename create no
-            snapshot, so the snapshot's schema can name columns the table no
-            longer uses, and rows read under those names would be written back
-            under the current ones as nulls.
+        Args:
+            iceberg_table (Table): Table to scan.
+            snapshot_id (int, optional): Snapshot to read; the current one when ``None``.
+            storage_config (StorageConfig): Storage access configuration for the data files.
+            ignore_corrupt_files (bool): Skip files that fail to parse instead of raising.
+            schema_source (SchemaSource): Which schema the rows are read under.
+                ``"snapshot"`` reads them as the snapshot recorded them, as time
+                travel requires. ``"current"`` reads them under the table's current
+                schema, as a rewrite requires: a rename creates no snapshot, so rows
+                read under the snapshot's names would be written back under the
+                current names as nulls.
         """
         super().__init__()
         read_as_of = None if schema_source == "current" else snapshot_id
@@ -117,7 +118,9 @@ class IcebergScanOperator(ScanOperator):
         self._snapshot_id = snapshot_id
         self._storage_config = storage_config
 
-        field_id_mapping = visit(iceberg_schema, SchemaFieldIdMappingVisitor())
+        field_id_mapping = attach_name_mapping(
+            visit(iceberg_schema, SchemaFieldIdMappingVisitor()), iceberg_table.properties
+        )
         self._file_format_config = FileFormatConfig.from_parquet_config(
             ParquetSourceConfig(
                 field_id_mapping=field_id_mapping,
@@ -236,11 +239,7 @@ class IcebergScanOperator(ScanOperator):
         return iter(scan_tasks)
 
     def _scan_task_for_file_task(self, task: FileScanTask, pushdowns: PyPushdowns) -> ScanTask | None:
-        """Build one scan task for a planned data file, applying its delete files.
-
-        Resolves the read schema via field-id mapping so schema evolution is honored
-        and threads the file's positional delete files so they are applied during read.
-        """
+        """Build one scan task for a planned data file, applying its delete files."""
         file = task.file
         file_format = file.file_format
         if file_format != "PARQUET":
@@ -350,10 +349,8 @@ class IcebergScanOperator(ScanOperator):
 class IcebergFileGroupScanOperator(IcebergScanOperator):
     """Scan operator over an explicit set of planned data files.
 
-    Unlike the base operator, which plans every file in a snapshot, this reads
-    exactly the supplied files. Compaction uses it to materialize one file group
-    as a lazy frame so the read, transform, and write flow through the streaming
-    engine instead of loading the whole group into memory at once.
+    Reads exactly the supplied files under the table's current schema, so one
+    file group can be read, transformed and written as a lazy frame.
     """
 
     def __init__(
@@ -362,12 +359,15 @@ class IcebergFileGroupScanOperator(IcebergScanOperator):
         snapshot_id: int | None,
         storage_config: StorageConfig,
         tasks: list[FileScanTask],
+        schema_source: SchemaSource = "current",
+        ignore_corrupt_files: bool = False,
     ) -> None:
         super().__init__(
             iceberg_table,
             snapshot_id=snapshot_id,
             storage_config=storage_config,
-            schema_source="current",
+            schema_source=schema_source,
+            ignore_corrupt_files=ignore_corrupt_files,
         )
         self._tasks = tasks
 

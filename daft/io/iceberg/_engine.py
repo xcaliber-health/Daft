@@ -1,15 +1,9 @@
-"""Execution-engine primitives shared by the maintenance file-cleanup paths.
+"""Frame-level primitives shared by snapshot expiry and orphan-file removal.
 
-The expensive stages of snapshot expiry and orphan-file removal — enumerating the
-files a table still references, listing the files physically present under its
-location, and computing the difference — are expressed here as DataFrame
-operations so they distribute on a cluster and stream on a single host with
-bounded memory.
-
-Path canonicalization runs inside the join key: two spellings of the same
-physical location (an aliased scheme such as ``s3a`` for ``s3``, or an aliased
-host) must compare equal, otherwise a live file would be flagged for deletion.
-A pure-Python ``canonical`` mirrors the engine expression for testing.
+Enumerating referenced files, listing the files under the table location, and
+computing their difference are expressed as frame operations so they distribute
+and stream. Paths are canonicalized inside the join key so two spellings of one
+location never flag a live file for deletion.
 """
 
 from __future__ import annotations
@@ -32,6 +26,7 @@ if TYPE_CHECKING:
     from pyiceberg.table import Table as PyIcebergTable
 
     from daft.dataframe import DataFrame
+    from daft.expressions import Expression
     from daft.io import IOConfig
 
 logger = logging.getLogger(__name__)
@@ -48,13 +43,10 @@ KIND_FILE = "file"
 
 _DEFAULT_SCHEME_ALIASES = {"s3a": "s3", "s3n": "s3"}
 _SCHEME_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+\-.]*)://")
-# scheme://authority, capturing everything up to the first path separator.
+# Captures ``scheme://authority``, everything up to the first path separator.
 _PREFIX_PATTERN = r"^([a-zA-Z][a-zA-Z0-9+\-.]*://[^/]*)"
 
 
-# ---------------------------------------------------------------------------
-# Canonicalization
-# ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class CanonSpec:
     """Scheme and authority equivalences used to canonicalize a path.
@@ -109,13 +101,11 @@ def build_canon_spec(
     return CanonSpec(scheme_aliases=scheme_aliases, authority_aliases=authority_aliases)
 
 
-def canon_path_expr(column: str, spec: CanonSpec):
+def canon_path_expr(column: str, spec: CanonSpec) -> Expression:
     """Return an expression that canonicalizes ``column`` the way ``CanonSpec`` does.
 
-    Scheme aliases are rewritten at the leading position; authority aliases are
-    rewritten between the scheme separator and the next path separator. The
-    chain is equivalent to :meth:`CanonSpec.canonical` for flat (non-chained)
-    alias maps, which is the only shape produced by the option parsing.
+    Equivalent to :meth:`CanonSpec.canonical` for flat alias maps, the only
+    shape the option parsing produces.
     """
     from daft import col
 
@@ -129,16 +119,13 @@ def canon_path_expr(column: str, spec: CanonSpec):
     return expr
 
 
-def prefix_expr(column: str):
+def prefix_expr(column: str) -> Expression:
     """Return an expression yielding the ``scheme://authority`` prefix of ``column``."""
     from daft import col
 
     return col(column).regexp_extract(_PREFIX_PATTERN, 1)
 
 
-# ---------------------------------------------------------------------------
-# Reachable / candidate frames
-# ---------------------------------------------------------------------------
 def content_frame(
     arrow_table: pa.Table,
     *,
@@ -194,13 +181,12 @@ def paths_frame(pairs: Iterable[tuple[str, str]]) -> DataFrame | None:
     return daft.from_pydict({"path": paths, "kind": kinds})
 
 
-def union_paths(frames: Iterable[DataFrame | None]) -> DataFrame | None:
-    """Concatenate path frames, ignoring ``None`` entries."""
-    out: DataFrame | None = None
-    for f in frames:
-        if f is None:
-            continue
-        out = f if out is None else out.union_all(f)
+def union_paths(first: DataFrame, *rest: DataFrame | None) -> DataFrame:
+    """Concatenate path frames onto ``first``, ignoring ``None`` entries."""
+    out = first
+    for f in rest:
+        if f is not None:
+            out = out.union_all(f)
     return out
 
 
@@ -209,9 +195,6 @@ def with_uri_parts(df: DataFrame, spec: CanonSpec) -> DataFrame:
     return df.with_column("canon_path", canon_path_expr("path", spec)).with_column("prefix", prefix_expr("canon_path"))
 
 
-# ---------------------------------------------------------------------------
-# Listing
-# ---------------------------------------------------------------------------
 def listed_files_frame(
     location: str,
     *,
@@ -220,9 +203,7 @@ def listed_files_frame(
 ) -> DataFrame:
     """List files under ``location`` modified before ``older_than_ms``.
 
-    The listing is performed by the execution engine so it distributes and
-    streams. Rows whose modification time is unknown are retained and filtered
-    on the driver against the same cutoff during deletion-set assembly.
+    Rows whose modification time is unknown are retained.
     """
     import daft
     from daft import col, lit
@@ -257,9 +238,6 @@ def file_list_view_frame(
     return df.where(col("mtime").is_null() | (col("mtime") < lit(older_than_ms)))
 
 
-# ---------------------------------------------------------------------------
-# Difference
-# ---------------------------------------------------------------------------
 def anti_join_paths(left: DataFrame, right: DataFrame, *, on: str = "path") -> DataFrame:
     """Return rows of ``left`` whose ``on`` key has no match in ``right``."""
     return left.join(right.select(on).distinct(), on=on, how="anti")
@@ -315,9 +293,6 @@ def find_orphans(
     return matched_prefix.select(col("path")), conflicts
 
 
-# ---------------------------------------------------------------------------
-# Deletion
-# ---------------------------------------------------------------------------
 def _iter_path_kind(df: DataFrame, *, has_kind: bool, stream: bool) -> Iterator[tuple[str, str]]:
     """Yield ``(path, kind)`` pairs from a result frame.
 

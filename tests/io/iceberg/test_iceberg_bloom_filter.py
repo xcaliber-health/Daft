@@ -163,13 +163,13 @@ class TestResolveWriterOptions:
     def test_bloom_options_included_when_enabled(self) -> None:
         out = _resolve_iceberg_writer_options({"write.parquet.bloom-filter-enabled.column.id": "true"})
 
-        assert "bloom_filter_options" in out
-        assert "id" in out["bloom_filter_options"]
+        assert out.bloom_filter_options is not None
+        assert "id" in out.bloom_filter_options
 
     def test_bloom_options_absent_when_disabled(self) -> None:
         out = _resolve_iceberg_writer_options({"write.parquet.compression-codec": "zstd"})
 
-        assert "bloom_filter_options" not in out
+        assert out.bloom_filter_options is None
 
 
 import datetime

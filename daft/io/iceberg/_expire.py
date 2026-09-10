@@ -1,10 +1,9 @@
-"""Expire snapshots: resolve the kept set, commit the metadata change, delete unreachable files.
+"""Expire snapshots and delete the files only they referenced.
 
-The set of files that become unreachable is computed by the execution engine.
-The files referenced before the metadata commit (across every snapshot) minus
-the files referenced after it (across the survivors) is exactly the set the
-expired snapshots alone held, and is deleted. This anti-join distributes on a
-cluster and streams on a single host, so it scales to very large tables.
+Every branch keeps its head and its ancestry up to the minimum count or age
+cutoff, a tag keeps its snapshot until the tag ages out, and everything else
+expires. The files to delete are those referenced before the metadata commit
+and no longer referenced after it.
 """
 
 from __future__ import annotations
@@ -13,16 +12,19 @@ import datetime as _dt
 import logging
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from daft.io.iceberg._common import (
     DEFAULT_DELETE_BACKOFF_BASE_SECONDS,
     DEFAULT_DELETE_NUM_RETRIES,
     DEFAULT_MAX_CONCURRENT_DELETES,
     CommitRetryExhausted,
+    MaintenanceOptions,
     commit_with_retry,
     delete_files,
     is_not_found,
+    option_float,
+    option_int,
     validate_gc_enabled,
 )
 from daft.io.iceberg._engine import (
@@ -43,6 +45,7 @@ from daft.io.iceberg._engine import (
 
 if TYPE_CHECKING:
     from pyiceberg.table import Table as PyIcebergTable
+    from pyiceberg.table.refs import SnapshotRef
 
     from daft.dataframe import DataFrame
 
@@ -51,9 +54,12 @@ logger = logging.getLogger(__name__)
 
 MAX_SNAPSHOT_AGE_MS_KEY = "history.expire.max-snapshot-age-ms"
 MIN_SNAPSHOTS_TO_KEEP_KEY = "history.expire.min-snapshots-to-keep"
+MAX_REF_AGE_MS_KEY = "history.expire.max-ref-age-ms"
 
 _DEFAULT_MAX_SNAPSHOT_AGE_MS = 5 * 24 * 60 * 60 * 1000
 _DEFAULT_MIN_SNAPSHOTS_TO_KEEP = 1
+#: A reference never ages out unless the table or the reference sets a maximum age.
+_DEFAULT_MAX_REF_AGE_MS = 2**63 - 1
 
 
 @dataclass(frozen=True)
@@ -100,44 +106,74 @@ def run(
     clean_expired_files: bool = True,
     clean_expired_metadata: bool = False,
     stream_results: bool = False,
-    options: dict[str, Any] | None = None,
+    options: MaintenanceOptions | None = None,
 ) -> ExpireResult:
+    """Expire snapshots by retention and delete the files only they referenced.
+
+    The retention plan is committed with bounded retry; when file cleanup is
+    enabled, the files referenced before the commit and not after it are
+    deleted. Table-metadata files are removed only when
+    ``clean_expired_metadata`` is set, and the current one is always kept.
+
+    Parameters
+    ----------
+    table
+        Table to expire snapshots from.
+    older_than
+        Age cutoff as a datetime or epoch milliseconds; defaults to the table's
+        maximum snapshot age.
+    retain_last
+        Minimum number of ancestors every branch keeps; defaults to the table's
+        minimum.
+    snapshot_ids
+        Snapshots to expire regardless of retention.
+    clean_expired_files
+        Delete the data, delete, manifest, manifest-list and statistics files
+        that become unreachable.
+    clean_expired_metadata
+        Also delete table-metadata files that are no longer referenced.
+    stream_results
+        Pull deletion candidates one partition at a time.
+    options
+        ``max-concurrent-deletes``, ``delete-num-retries`` and
+        ``delete-backoff-base-seconds``.
+
+    Returns:
+    -------
+    ExpireResult
+        Counts of files removed, by kind.
+
+    Raises:
+    ------
+    ValueError
+        If ``gc.enabled`` is false, ``retain_last`` is below one, or a named
+        snapshot is unknown or protected.
+    ExpireSnapshotsFailedException
+        If the metadata commit cannot land within the retry budget.
+    """
     opts = options or {}
-    max_concurrent_deletes = int(opts.get("max-concurrent-deletes", DEFAULT_MAX_CONCURRENT_DELETES))
-    delete_num_retries = int(opts.get("delete-num-retries", DEFAULT_DELETE_NUM_RETRIES))
-    delete_backoff_base = float(opts.get("delete-backoff-base-seconds", DEFAULT_DELETE_BACKOFF_BASE_SECONDS))
+    max_concurrent_deletes = option_int(opts, "max-concurrent-deletes", DEFAULT_MAX_CONCURRENT_DELETES)
+    delete_num_retries = option_int(opts, "delete-num-retries", DEFAULT_DELETE_NUM_RETRIES)
+    delete_backoff_base = option_float(opts, "delete-backoff-base-seconds", DEFAULT_DELETE_BACKOFF_BASE_SECONDS)
 
     validate_gc_enabled(table)
-
-    if older_than is None and retain_last is None and not snapshot_ids:
-        max_age_ms = int(table.properties.get(MAX_SNAPSHOT_AGE_MS_KEY, _DEFAULT_MAX_SNAPSHOT_AGE_MS))
-        older_than = int(time.time() * 1000) - max_age_ms
 
     if retain_last is not None and retain_last < 1:
         raise ValueError(f"retain_last must be >= 1, got {retain_last!r}")
 
-    protected_ids = _protected_snapshot_ids(table)
-
-    if snapshot_ids:
-        _validate_explicit_snapshot_ids(table, snapshot_ids, protected_ids)
-
-    expired_ids = _resolve_expired_ids(
-        table=table,
+    plan = plan_expiry(
+        table,
         older_than=older_than,
         retain_last=retain_last,
         snapshot_ids=snapshot_ids,
-        protected_ids=protected_ids,
+        now_ms=int(time.time() * 1000),
     )
+    expired_ids = set(plan.snapshot_ids)
 
-    if not expired_ids:
+    if not expired_ids and not plan.ref_names:
         return ExpireResult()
 
-    # Capture what the table references now, while the expired snapshots still
-    # exist; the post-commit set is subtracted from this to find what only they
-    # held. Frames built from the inspected tables retain the pre-commit data.
-    # If a referenced manifest or manifest list is already gone, the candidate
-    # set cannot be enumerated; file cleanup is skipped (never deleting data —
-    # any leftover is reclaimed by a later run) while the expiry still commits.
+    # Only files no retained snapshot reaches may go.
     pre_frame: DataFrame | None = None
     if clean_expired_files:
         try:
@@ -145,6 +181,7 @@ def run(
         except Exception as exc:
             if not is_not_found(exc):
                 raise
+            # An unreadable manifest leaves the candidate set unknown, so nothing is deleted.
             logger.warning(
                 "expire_snapshots: cannot enumerate referenced files (%r); expiring snapshots without file cleanup",
                 exc,
@@ -153,7 +190,7 @@ def run(
     if clean_expired_metadata:
         pre_metadata = set(_metadata_file_paths(table))
 
-    _commit_expire(table, expired_ids)
+    _commit_expire(table, expired_ids, plan.ref_names)
 
     if not clean_expired_files and not clean_expired_metadata:
         return ExpireResult()
@@ -199,13 +236,7 @@ def run(
 
 
 def _expire_file_frame(table: PyIcebergTable) -> DataFrame:
-    """Build a ``(path, kind)`` frame of every file the table currently references.
-
-    Spans the data and delete files, manifests, manifest lists, and statistics
-    files reachable from all snapshots. Table-metadata files are excluded; they
-    are handled separately so that retiring an old metadata pointer is not
-    mistaken for a data-file deletion.
-    """
+    """Build a ``(path, kind)`` frame of every file reachable from any snapshot."""
     content = content_frame(table.inspect.all_files(), path_col="file_path", content_col="content")
     manifests = manifest_frame(table.inspect.all_manifests(), path_col="path")
     extra: list[tuple[str, str]] = []
@@ -218,7 +249,7 @@ def _expire_file_frame(table: PyIcebergTable) -> DataFrame:
         extra.append((s.statistics_path, KIND_STATS))
     for s in getattr(md, "partition_statistics", []) or []:
         extra.append((s.statistics_path, KIND_STATS))
-    return union_paths([content, manifests, paths_frame(extra)])
+    return union_paths(content, manifests, paths_frame(extra))
 
 
 def _metadata_file_paths(table: PyIcebergTable) -> list[str]:
@@ -258,17 +289,124 @@ def _clean_metadata(
     return md_counts.get(KIND_METADATA, 0)
 
 
-def _protected_snapshot_ids(table: PyIcebergTable) -> set[int]:
-    from pyiceberg.table.refs import SnapshotRefType
+@dataclass(frozen=True)
+class ExpiryPlan:
+    """What one expiry will remove.
 
-    return {
-        ref.snapshot_id
-        for ref in table.metadata.refs.values()
-        if ref.snapshot_ref_type in (SnapshotRefType.BRANCH, SnapshotRefType.TAG)
-    }
+    Parameters
+    ----------
+    snapshot_ids
+        Snapshots to expire.
+    ref_names
+        Tags and branches whose age exceeds their maximum, removed first so the
+        snapshots they held can expire.
+    protected_ids
+        Snapshots that remain the head of a retained tag or branch and can
+        never be expired.
+    """
+
+    snapshot_ids: frozenset[int]
+    ref_names: tuple[str, ...]
+    protected_ids: frozenset[int]
+
+
+def plan_expiry(
+    table: PyIcebergTable,
+    *,
+    older_than: _dt.datetime | int | None,
+    retain_last: int | None,
+    snapshot_ids: list[int] | None,
+    now_ms: int,
+) -> ExpiryPlan:
+    """Resolve which snapshots and references an expiry removes.
+
+    Each branch keeps its head and its ancestors while fewer than the minimum
+    have been kept or the ancestor is at or after the cutoff, stopping at the
+    first that is neither; a branch's own settings override ``retain_last`` and
+    ``older_than``. A tag or branch older than its maximum reference age is
+    removed, and a snapshot no retained reference reaches is kept only while it
+    is at or after the cutoff. Snapshots in ``snapshot_ids`` expire regardless
+    of retention.
+
+    Raises:
+    ------
+    ValueError
+        If a named snapshot does not exist or heads a retained reference.
+    """
+    from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRefType
+    from pyiceberg.table.snapshots import ancestors_of
+
+    metadata = table.metadata
+    properties = table.properties
+    default_cutoff = (
+        _to_epoch_millis(older_than)
+        if older_than is not None
+        else now_ms - int(properties.get(MAX_SNAPSHOT_AGE_MS_KEY, _DEFAULT_MAX_SNAPSHOT_AGE_MS))
+    )
+    default_min_keep = (
+        retain_last
+        if retain_last is not None
+        else int(properties.get(MIN_SNAPSHOTS_TO_KEEP_KEY, _DEFAULT_MIN_SNAPSHOTS_TO_KEEP))
+    )
+    default_max_ref_age = int(properties.get(MAX_REF_AGE_MS_KEY, _DEFAULT_MAX_REF_AGE_MS))
+
+    retained_refs: dict[str, SnapshotRef] = {}
+    expired_refs: list[str] = []
+    for name, ref in metadata.refs.items():
+        if name == MAIN_BRANCH:
+            retained_refs[name] = ref
+            continue
+        head = metadata.snapshot_by_id(ref.snapshot_id)
+        if head is None:
+            expired_refs.append(name)
+            continue
+        max_ref_age = ref.max_ref_age_ms if ref.max_ref_age_ms is not None else default_max_ref_age
+        if now_ms - head.timestamp_ms <= max_ref_age:
+            retained_refs[name] = ref
+        else:
+            expired_refs.append(name)
+
+    protected = {ref.snapshot_id for ref in retained_refs.values()}
+    explicit = set(snapshot_ids or [])
+    _validate_explicit_snapshot_ids(table, sorted(explicit), protected)
+
+    retained = set(protected)
+    referenced: set[int] = set()
+    for ref in retained_refs.values():
+        head = metadata.snapshot_by_id(ref.snapshot_id)
+        if head is None:
+            continue
+        if ref.snapshot_ref_type != SnapshotRefType.BRANCH:
+            referenced.add(head.snapshot_id)
+            continue
+        cutoff = now_ms - ref.max_snapshot_age_ms if ref.max_snapshot_age_ms is not None else default_cutoff
+        min_keep = ref.min_snapshots_to_keep if ref.min_snapshots_to_keep is not None else default_min_keep
+        kept = 0
+        keeping = True
+        for ancestor in ancestors_of(head, metadata):
+            referenced.add(ancestor.snapshot_id)
+            if keeping and (kept < min_keep or ancestor.timestamp_ms >= cutoff):
+                retained.add(ancestor.snapshot_id)
+                kept += 1
+            else:
+                keeping = False
+
+    for snapshot in metadata.snapshots:
+        if snapshot.snapshot_id not in referenced and snapshot.timestamp_ms >= default_cutoff:
+            retained.add(snapshot.snapshot_id)
+
+    expired = {s.snapshot_id for s in metadata.snapshots if s.snapshot_id not in retained} | explicit
+    return ExpiryPlan(
+        snapshot_ids=frozenset(expired),
+        ref_names=tuple(expired_refs),
+        protected_ids=frozenset(protected),
+    )
 
 
 def _validate_explicit_snapshot_ids(table: PyIcebergTable, snapshot_ids: list[int], protected_ids: set[int]) -> None:
+    """Reject explicit snapshot ids that are unknown or head a retained reference."""
+    if not snapshot_ids:
+        return
     known = {s.snapshot_id for s in table.metadata.snapshots}
     missing = [sid for sid in snapshot_ids if sid not in known]
     if missing:
@@ -278,61 +416,8 @@ def _validate_explicit_snapshot_ids(table: PyIcebergTable, snapshot_ids: list[in
         raise ValueError(f"snapshot_ids are protected by a branch/tag ref and cannot be expired: {illegal!r}")
 
 
-def _resolve_expired_ids(
-    *,
-    table: PyIcebergTable,
-    older_than: _dt.datetime | int | None,
-    retain_last: int | None,
-    snapshot_ids: list[int] | None,
-    protected_ids: set[int],
-) -> set[int]:
-    """Combine all three knobs into a final expiry set, honoring table-property floors."""
-    candidates: set[int] = set()
-
-    if snapshot_ids:
-        candidates.update(snapshot_ids)
-
-    if older_than is not None:
-        older_than_ms = _to_epoch_millis(older_than)
-        for s in table.metadata.snapshots:
-            if s.timestamp_ms < older_than_ms:
-                candidates.add(s.snapshot_id)
-
-    if retain_last is not None:
-        min_keep = max(
-            retain_last,
-            int(table.properties.get(MIN_SNAPSHOTS_TO_KEEP_KEY, _DEFAULT_MIN_SNAPSHOTS_TO_KEEP)),
-        )
-        kept = _most_recent_main_snapshot_ids(table, min_keep)
-        for s in table.metadata.snapshots:
-            if s.snapshot_id not in kept:
-                candidates.add(s.snapshot_id)
-    else:
-        min_keep = int(table.properties.get(MIN_SNAPSHOTS_TO_KEEP_KEY, _DEFAULT_MIN_SNAPSHOTS_TO_KEEP))
-        if min_keep > 0:
-            kept = _most_recent_main_snapshot_ids(table, min_keep)
-            candidates -= kept
-
-    candidates -= protected_ids
-    return candidates
-
-
-def _most_recent_main_snapshot_ids(table: PyIcebergTable, n: int) -> set[int]:
-    """Return the IDs of the N most-recent snapshots on the table's current ref chain."""
-    from pyiceberg.table.snapshots import ancestors_of
-
-    current = table.metadata.current_snapshot()
-    if current is None:
-        return set()
-    out: list[int] = []
-    for snap in ancestors_of(current, table.metadata):
-        out.append(snap.snapshot_id)
-        if len(out) >= n:
-            break
-    return set(out)
-
-
 def _to_epoch_millis(value: _dt.datetime | int) -> int:
+    """Return ``value`` as epoch milliseconds, treating a naive datetime as UTC."""
     if isinstance(value, _dt.datetime):
         if value.tzinfo is None:
             value = value.replace(tzinfo=_dt.timezone.utc)
@@ -340,22 +425,45 @@ def _to_epoch_millis(value: _dt.datetime | int) -> int:
     return int(value)
 
 
-def _commit_expire(table: PyIcebergTable, expired_ids: set[int]) -> None:
-    """Commit the snapshot-expiry metadata change with bounded OCC retry."""
-    state = {"ids": sorted(expired_ids)}
+def _commit_expire(table: PyIcebergTable, expired_ids: set[int], ref_names: tuple[str, ...]) -> None:
+    """Commit the reference removals and the snapshot expiry with bounded OCC retry.
+
+    References go first, because a snapshot a tag or branch points at cannot expire.
+    """
+    from pyiceberg.table.refs import SnapshotRefType
+
+    pending_ids = sorted(expired_ids)
+    pending_refs = list(ref_names)
     sentinel = object()
 
     def _attempt(_: int) -> object:
-        if not state["ids"]:
-            return sentinel
-        table.maintenance.expire_snapshots().by_ids(state["ids"]).commit()
+        nonlocal pending_ids, pending_refs
+        if pending_refs:
+            with table.manage_snapshots() as manage:
+                for name in pending_refs:
+                    ref = table.metadata.refs.get(name)
+                    if ref is None:
+                        continue
+                    if ref.snapshot_ref_type == SnapshotRefType.TAG:
+                        manage.remove_tag(name)
+                    else:
+                        manage.remove_branch(name)
+            pending_refs = []
+            table.refresh()
+        if pending_ids:
+            expire = table.maintenance.expire_snapshots()
+            # The library re-validates the whole metadata per id; the plan already did.
+            expire._snapshot_ids_to_expire.update(pending_ids)
+            expire.commit()
         return sentinel
 
     def _on_conflict(t: PyIcebergTable) -> object | None:
+        nonlocal pending_ids, pending_refs
         known = {s.snapshot_id for s in t.metadata.snapshots}
-        protected = _protected_snapshot_ids(t)
-        state["ids"] = [sid for sid in state["ids"] if sid in known and sid not in protected]
-        if not state["ids"]:
+        protected = {ref.snapshot_id for ref in t.metadata.refs.values()}
+        pending_refs = [name for name in pending_refs if name in t.metadata.refs]
+        pending_ids = [sid for sid in pending_ids if sid in known and sid not in protected]
+        if not pending_ids and not pending_refs:
             return sentinel
         return None
 

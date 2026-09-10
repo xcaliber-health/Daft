@@ -1,4 +1,8 @@
-use arrow::buffer::{NullBuffer, OffsetBuffer};
+use arrow::{
+    array::ArrayData,
+    buffer::{NullBuffer, OffsetBuffer},
+    datatypes::{ArrowNativeType, DataType as ArrowDataType},
+};
 
 #[cfg(feature = "python")]
 use crate::prelude::PythonArray;
@@ -14,10 +18,24 @@ where
 {
     pub fn size_bytes(&self) -> usize {
         let data = self.to_data();
-        let buffers: usize = data.buffers().iter().map(|b| b.len()).sum();
         let nulls = data.nulls().map(|n| n.buffer().len()).unwrap_or(0);
+        // A slice narrows the offsets but not the values buffer they index.
+        let buffers = match data.data_type() {
+            ArrowDataType::Utf8 | ArrowDataType::Binary => variable_width_bytes::<i32>(&data),
+            ArrowDataType::LargeUtf8 | ArrowDataType::LargeBinary => {
+                variable_width_bytes::<i64>(&data)
+            }
+            _ => data.buffers().iter().map(|b| b.len()).sum(),
+        };
         buffers + nulls
     }
+}
+
+/// Bytes of the offsets and of the values they span, for a possibly sliced array.
+fn variable_width_bytes<O: ArrowNativeType + Into<i64>>(data: &ArrayData) -> usize {
+    let offsets = &data.buffers()[0].typed_data::<O>()[data.offset()..=data.offset() + data.len()];
+    let values: i64 = offsets[data.len()].into() - offsets[0].into();
+    std::mem::size_of_val(offsets) + usize::try_from(values).unwrap_or(0)
 }
 
 #[cfg(feature = "python")]
@@ -131,5 +149,31 @@ where
 {
     pub fn size_bytes(&self) -> usize {
         self.physical.size_bytes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        datatypes::{DataType, Field, Int64Array, Utf8Array},
+        series::IntoSeries,
+    };
+
+    #[test]
+    fn a_sliced_string_array_reports_only_its_own_bytes() {
+        let values: Vec<String> = (0..1000).map(|i| format!("value-{i:04}")).collect();
+        let array = Utf8Array::from_iter("s", values.iter().map(|v| Some(v.as_str()))).into_series();
+        let whole = array.size_bytes();
+        let part = array.slice(10, 20).unwrap().size_bytes();
+        // ten offsets plus one, and ten values of ten bytes
+        assert_eq!(part, 11 * 8 + 100);
+        assert!(part * 50 < whole);
+    }
+
+    #[test]
+    fn a_sliced_primitive_array_reports_only_its_own_bytes() {
+        let array = Int64Array::from_iter(Field::new("i", DataType::Int64), (0..1000).map(Some))
+            .into_series();
+        assert_eq!(array.slice(0, 10).unwrap().size_bytes(), 80);
     }
 }

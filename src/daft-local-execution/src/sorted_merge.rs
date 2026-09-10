@@ -275,7 +275,7 @@ pub(crate) async fn merge_sorted_runs_streaming(
 #[cfg(test)]
 mod tests {
     use daft_core::{
-        datatypes::{DataType, Field, Int64Array},
+        datatypes::{DataType, Field, Int64Array, Utf8Array},
         prelude::Schema,
         series::IntoSeries,
     };
@@ -298,8 +298,10 @@ mod tests {
     }
 
     fn spill_ctx(dir: &tempfile::TempDir) -> SpillContext {
-        let mut cfg = common_daft_config::DaftExecutionConfig::default();
-        cfg.spill_dirs = vec![dir.path().to_str().unwrap().to_string()];
+        let cfg = common_daft_config::DaftExecutionConfig {
+            spill_dirs: vec![dir.path().to_str().unwrap().to_string()],
+            ..Default::default()
+        };
         SpillContext::from_config(&cfg).unwrap()
     }
 
@@ -390,6 +392,43 @@ mod tests {
         ])]))];
         let merged = merge_and_collect(one, &ordering(false, false), &spill_ctx(&dir)).await;
         assert_eq!(collect_values(&merged), vec![Some(1), Some(2)]);
+    }
+
+    #[tokio::test]
+    async fn cascade_writes_whole_files_for_the_tail_of_a_batch() {
+        // The tail a merge emits is a slice; its size must not be the parent's.
+        let rows: Vec<Option<i64>> = (0..20_000).map(Some).collect();
+        let strings: Vec<Option<String>> = rows.iter().map(|v| v.map(|v| format!("row-{v:08}"))).collect();
+        let make = |values: &[Option<i64>], text: &[Option<String>]| {
+            let v = Int64Array::from_iter(Field::new("v", DataType::Int64), values.iter().copied()).into_series();
+            let s = Utf8Array::from_iter("s", text.iter().map(|t| t.as_deref())).into_series();
+            RecordBatch::from_nonempty_columns(vec![v, s]).unwrap()
+        };
+        let runs = vec![
+            MergeSource::Memory(VecDeque::from(vec![make(&rows[..10], &strings[..10])])),
+            MergeSource::Memory(VecDeque::from(vec![make(&rows[10..], &strings[10..])])),
+            MergeSource::Memory(VecDeque::from(vec![make(&rows[..1], &strings[..1])])),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let spill = spill_ctx(&dir);
+        let reduced = reduce_to_two(runs, &ordering(false, false), &spill).await.unwrap();
+        assert_eq!(reduced.len(), 2);
+        let files = walkdir(dir.path());
+        assert_eq!(files, 1, "one merged run of 20000 short rows fits one spill file");
+    }
+
+    fn walkdir(path: &std::path::Path) -> usize {
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    walkdir(&entry.path())
+                } else {
+                    1
+                }
+            })
+            .sum()
     }
 
     #[tokio::test]

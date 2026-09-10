@@ -9,7 +9,9 @@ than ``time.sleep`` so behavior is deterministic on slow CI.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
+import pyarrow as pa
 import pytest
 
 pytest.importorskip("pyiceberg")
@@ -19,33 +21,52 @@ from daft.io.iceberg import RewriteConflict
 from tests.io.iceberg.actions._helpers import (
     Appender,
     _row_count,
+    inject_once_around_rewrite,
     make_seeded_table,
 )
+
+if TYPE_CHECKING:
+    from pyiceberg.table import Table as PyIcebergTable
 
 # Internal symbol: the rewrite uses this synthetic column name during a
 # z-order pass and projects it away before commit. The test confirms it
 # never appears in any committed data-file path.
-_ZORDER_KEY_COL = "__daft_zorder_key__"  # noqa: internal
+_ZORDER_KEY_COL = "__daft_zorder_key__"  # internal
 
 
 def _await_first_append(appender: Appender) -> None:
     assert appender.wait_for_first_commit(timeout=10.0), "appender did not commit within 10s"
 
 
-def test_atomic_rewrite_raises_conflict_on_same_partition_append(local_catalog):
+def test_atomic_rewrite_raises_conflict_on_same_partition_append(local_catalog, monkeypatch):
+    # Arrange: a foreign append lands between the plan and the commit.
     table = make_seeded_table(local_catalog, "default.t_atomic_conflict", n_files=6)
-    appender = Appender(table, interval_s=0.05, batch_rows=20)
-    appender.start()
-    try:
-        _await_first_append(appender)
-        dt = Table.from_iceberg(table)
-        with pytest.raises(Exception) as exc_info:
-            dt.compact_files(options={"rewrite-all": True, "min-input-files": 2})
-        assert isinstance(exc_info.value, RewriteConflict) or (
-            "partition" in str(exc_info.value).lower() or "vanished" in str(exc_info.value).lower()
-        ), f"unexpected error: {exc_info.value!r}"
-    finally:
-        appender.stop()
+
+    def append_foreign(live: PyIcebergTable) -> None:
+        live.refresh()
+        live.append(
+            pa.table(
+                {
+                    "id": pa.array(list(range(5_000_000, 5_000_020)), type=pa.int64()),
+                    "label": pa.array(["foreign"] * 20, type=pa.string()),
+                }
+            )
+        )
+
+    state = inject_once_around_rewrite(monkeypatch, append_foreign, before=True)
+    dt = Table.from_iceberg(table)
+
+    # Act / Assert: the strict level refuses; the default tolerates it
+    # (covered by the isolation tests).
+    with pytest.raises(RewriteConflict, match="partition"):
+        dt.compact_files(
+            options={
+                "rewrite-all": True,
+                "min-input-files": 2,
+                "conflict-isolation": "serializable",
+            }
+        )
+    assert state["fired"] == 1
 
 
 _REWRITE_STRATEGIES = [

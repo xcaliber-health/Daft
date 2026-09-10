@@ -1,10 +1,7 @@
-"""Shared primitives for the Iceberg maintenance surface.
+"""Shared primitives for table maintenance.
 
-Centralizes the ``gc.enabled`` gate, the object-store NotFound detector, the
-chunked parallel file-delete loop, and the optimistic-concurrency commit
-retry helper. Each maintenance operation reads its retry policy from table
-properties through :func:`commit_with_retry` so the four APIs behave
-uniformly under contention.
+Option parsing, the ``gc.enabled`` gate, not-found detection, the chunked
+parallel delete loop, and the optimistic-concurrency commit retry helper.
 """
 
 from __future__ import annotations
@@ -12,12 +9,16 @@ from __future__ import annotations
 import logging
 import random
 import time
-from collections.abc import Callable, Hashable, Iterable
+from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, TypeAlias, TypeVar
 
 if TYPE_CHECKING:
+    from pyiceberg.manifest import ManifestContent, ManifestWriter
+    from pyiceberg.partitioning import PartitionSpec
     from pyiceberg.table import Table as PyIcebergTable
+    from pyiceberg.table.snapshots import Snapshot
+    from pyiceberg.table.update.snapshot import _SnapshotProducer
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +41,7 @@ COMMIT_DEFAULT_MIN_WAIT_MS = 100
 COMMIT_DEFAULT_MAX_WAIT_MS = 60_000
 COMMIT_DEFAULT_TOTAL_TIMEOUT_MS = 1_800_000
 
-# Retained for callers still importing the legacy names; behavior matches the
-# new helper's defaults when no table property overrides them.
+# Legacy names retained for existing importers.
 COMMIT_MAX_ATTEMPTS = COMMIT_DEFAULT_NUM_RETRIES
 COMMIT_BACKOFF_BASE_SECONDS = COMMIT_DEFAULT_MIN_WAIT_MS / 1000.0
 
@@ -57,17 +57,228 @@ _NOT_FOUND_MESSAGE_SUBSTRINGS = (
 )
 
 
-def is_not_found(exc: BaseException) -> bool:
-    """Return True if ``exc`` represents an object-store NotFound result.
+#: One tuning knob's value: a scalar, a list of names, or a map of aliases.
+OptionValue: TypeAlias = str | int | float | bool | Sequence[str] | Mapping[str, str]
+#: Tuning knobs for the maintenance operations, by option name.
+MaintenanceOptions: TypeAlias = Mapping[str, OptionValue]
 
-    Matches by exception class name and by case-insensitive substring of
-    ``str(exc)``. Covers ``FileNotFoundError`` and the wrapped ``OSError``
-    that pyarrow raises for S3 ``AWS Error RESOURCE_NOT_FOUND``.
+
+def option_int(options: Mapping[str, OptionValue], key: str, default: int) -> int:
+    """Return the integer option ``key``, or ``default`` when it is absent.
+
+    Raises:
+    ------
+    ValueError
+        If the value is present but is not a whole number or its text.
+    """
+    value = options.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(f"{key} must be an integer, got {value!r}")
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"{key} must be an integer, got {value!r}") from exc
+
+
+def option_float(options: Mapping[str, OptionValue], key: str, default: float) -> float:
+    """Return the numeric option ``key``, or ``default`` when it is absent.
+
+    Raises:
+    ------
+    ValueError
+        If the value is present but is not a number or its text.
+    """
+    value = options.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{key} must be a number, got {value!r}")
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise ValueError(f"{key} must be a number, got {value!r}") from exc
+
+
+def option_bool(options: Mapping[str, OptionValue], key: str, default: bool) -> bool:
+    """Return the boolean option ``key``, or ``default`` when it is absent.
+
+    Text values ``true`` and ``false`` are accepted in any case.
+
+    Raises:
+    ------
+    ValueError
+        If the value is present but is neither a boolean nor such text.
+    """
+    value = options.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    raise ValueError(f"{key} must be true or false, got {value!r}")
+
+
+def option_names(options: Mapping[str, OptionValue], key: str) -> list[str] | None:
+    """Return the option ``key`` as a list of names, or ``None`` when absent.
+
+    Accepts a sequence of names or one comma-separated string.
+
+    Raises:
+    ------
+    ValueError
+        If the value is present but is neither.
+    """
+    value = options.get(key)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, Sequence):
+        return [str(part) for part in value]
+    raise ValueError(f"{key} must be a list of names, got {value!r}")
+
+
+def option_mapping(options: Mapping[str, OptionValue], key: str) -> dict[str, str] | None:
+    """Return the option ``key`` as a mapping of text to text, or ``None`` when absent.
+
+    Raises:
+    ------
+    ValueError
+        If the value is present but is not a mapping.
+    """
+    value = options.get(key)
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        return {str(k): str(v) for k, v in value.items()}
+    raise ValueError(f"{key} must be a mapping, got {value!r}")
+
+
+def scalar_options(options: Mapping[str, OptionValue] | None) -> dict[str, str | int | float | bool]:
+    """Return ``options`` restricted to scalar values, for operations that take no other kind.
+
+    Raises:
+    ------
+    ValueError
+        Naming the first option whose value is a list or a mapping.
+    """
+    out: dict[str, str | int | float | bool] = {}
+    for key, value in (options or {}).items():
+        if isinstance(value, (str, int, float, bool)):
+            out[key] = value
+        else:
+            raise ValueError(f"{key} must be a scalar, got {value!r}")
+    return out
+
+
+def branch_ancestry(table: PyIcebergTable, branch: str | None) -> list[Snapshot]:
+    """Return the snapshots on ``branch`` from its head back to the root, newest first.
+
+    ``None`` names the table's current reference. A reference that does not
+    exist, or a table with no snapshot yet, yields an empty list.
+    """
+    from pyiceberg.table.snapshots import ancestors_of
+
+    head = table.snapshot_by_name(branch) if branch is not None else table.current_snapshot()
+    if head is None:
+        return []
+    return list(ancestors_of(head, table.metadata))
+
+
+def is_not_found(exc: BaseException) -> bool:
+    """Return True if ``exc`` represents an object-store not-found result.
+
+    Matches by exception class name and by case-insensitive substring of the
+    message, which covers the wrapped errors object-store clients raise for a
+    missing key.
     """
     if type(exc).__name__ in _NOT_FOUND_EXCEPTION_NAMES:
         return True
     msg = str(exc).lower()
     return any(s in msg for s in _NOT_FOUND_MESSAGE_SUBSTRINGS)
+
+
+#: Field id and element id of ``equality_ids`` in a manifest's data-file struct.
+_EQUALITY_IDS_FIELD_ID = 135
+_EQUALITY_IDS_ELEMENT_ID = 136
+
+
+def declare_equality_ids_as_ints() -> None:
+    """Make written manifests type ``equality_ids`` as a list of ints, as the specification requires.
+
+    The catalog library declares the element as a long. A manifest written
+    that way is refused by readers that decode the field into an int array,
+    so any commit recording an equality delete file, removed or kept, would
+    be unreadable by them. Only the struct the library's writers build is
+    corrected; its read schema keeps the long, which resolves manifests of
+    either encoding.
+    """
+    from pyiceberg import manifest
+    from pyiceberg.types import IntegerType, ListType, NestedField, StructType
+
+    original = manifest.data_file_with_partition
+    if getattr(original, "__name__", "") == "_data_file_with_int_equality_ids":
+        return
+
+    def _data_file_with_int_equality_ids(partition_type: StructType, format_version: int) -> StructType:
+        struct = original(partition_type, format_version)
+        fields = []
+        for field in struct.fields:
+            if field.field_id == _EQUALITY_IDS_FIELD_ID:
+                field = NestedField(
+                    field_id=field.field_id,
+                    name=field.name,
+                    field_type=ListType(
+                        element_id=_EQUALITY_IDS_ELEMENT_ID, element_type=IntegerType(), element_required=True
+                    ),
+                    required=field.required,
+                    doc=field.doc,
+                )
+            fields.append(field)
+        return StructType(*fields)
+
+    manifest.data_file_with_partition = _data_file_with_int_equality_ids
+
+
+declare_equality_ids_as_ints()
+
+
+def manifest_writer_for(producer: _SnapshotProducer, content: ManifestContent, spec: PartitionSpec) -> ManifestWriter:
+    """Return a manifest writer of ``content`` for the snapshot ``producer`` is building.
+
+    A manifest declares whether it lists data files or delete files, and
+    readers trust the declaration, so a manifest of delete files must be
+    written by a writer that declares delete content.
+    """
+    from pyiceberg.manifest import ManifestContent, ManifestWriterV2, write_manifest
+
+    metadata = producer._transaction.table_metadata
+    if content != ManifestContent.DELETES:
+        return write_manifest(
+            format_version=metadata.format_version,
+            spec=spec,
+            schema=metadata.schema(),
+            output_file=producer.new_manifest_output(),
+            snapshot_id=producer._snapshot_id,
+            avro_compression=producer._compression,
+        )
+
+    class _DeleteManifestWriter(ManifestWriterV2):  # type: ignore[misc]
+        """A manifest whose entries are delete files."""
+
+        def content(self) -> ManifestContent:
+            return ManifestContent.DELETES
+
+        @property
+        def _meta(self) -> dict[str, str]:
+            return {**super()._meta, "content": "deletes"}
+
+    return _DeleteManifestWriter(
+        spec, metadata.schema(), producer.new_manifest_output(), producer._snapshot_id, producer._compression
+    )
 
 
 def validate_gc_enabled(table: PyIcebergTable) -> None:
@@ -207,14 +418,7 @@ class CommitRetryExhausted(RuntimeError):
 
 
 def _read_retry_policy(table: PyIcebergTable) -> tuple[int, float, float, float]:
-    """Resolve commit-retry parameters from table properties.
-
-    Returns:
-    -------
-    tuple
-        ``(num_retries, min_wait_s, max_wait_s, total_timeout_s)`` with bounds
-        clamped to non-negative values.
-    """
+    """Read the commit-retry policy from table properties."""
     props = table.properties
     num_retries = max(
         0,

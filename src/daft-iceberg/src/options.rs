@@ -1,3 +1,5 @@
+//! Options, size arithmetic and strategy types for a data-file rewrite.
+
 use serde::{Deserialize, Serialize};
 
 use crate::errors::IcebergRewriteError;
@@ -5,35 +7,59 @@ use crate::errors::IcebergRewriteError;
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 
+/// Default size, in bytes, that each rewritten file is sized towards.
 pub const DEFAULT_TARGET_FILE_SIZE_BYTES: u64 = 512 * MIB;
+/// Smallest target file size, in bytes, that `RewriteOptions::validate` accepts.
 pub const MIN_TARGET_FILE_SIZE_BYTES: u64 = MIB;
+/// Largest target file size, in bytes, that `RewriteOptions::validate` accepts.
 pub const MAX_TARGET_FILE_SIZE_BYTES: u64 = 5 * GIB;
+/// Default number of files a group must hold before it is worth rewriting.
 pub const DEFAULT_MIN_INPUT_FILES: u32 = 5;
+/// Default cap, in bytes, on the input a single file group may hold.
 pub const DEFAULT_MAX_GROUP_BYTES: u64 = 100 * GIB;
-pub const DEFAULT_DELETE_FILE_THRESHOLD: u32 = u32::MAX;
+/// Delete-file count at which a data file is rewritten on that ground alone.
+///
+/// The default is the largest accepted threshold, which disables the rule.
+pub const DEFAULT_DELETE_FILE_THRESHOLD: u32 = i32::MAX as u32;
+/// Largest delete-file threshold that `RewriteOptions::validate` accepts.
+pub const MAX_DELETE_FILE_THRESHOLD: u32 = i32::MAX as u32;
 /// Deleted fraction of a file at which it is rewritten on that ground alone.
 pub const DEFAULT_DELETE_RATIO_THRESHOLD: f64 = 0.3;
-/// Per-file open cost allowed for when sizing a split.
+/// Per-file open cost, in bytes, allowed for when sizing a split.
 pub const SPLIT_OVERHEAD: u64 = 5 * 1024;
+/// Default number of commits a partial-progress rewrite may make.
 pub const DEFAULT_MAX_COMMITS: u32 = 10;
+/// Default number of file groups rewritten concurrently.
 pub const DEFAULT_MAX_CONCURRENT: u32 = 5;
+/// Default number of bytes a text or binary column contributes to a z-order key.
 pub const DEFAULT_ZORDER_VAR_LEN_CONTRIBUTION: u32 = 8;
-// Per-row interleaved key cap. Primitive columns contribute 8 bytes each and
-// string columns contribute up to `var_length_contribution`; 4096 is generous
-// enough for ~hundreds of columns and keeps the per-row allocation bounded.
-pub const DEFAULT_ZORDER_MAX_OUTPUT_SIZE: u64 = 4096;
-pub const MAX_ZORDER_MAX_OUTPUT_SIZE: u64 = MIB;
+/// Cap on the interleaved key's byte length.
+///
+/// The key is as long as the clustering columns' encodings together, up to
+/// this cap; the default leaves every byte interleaved.
+pub const DEFAULT_ZORDER_MAX_OUTPUT_SIZE: u64 = i32::MAX as u64;
 
+/// Order in which planned file groups are rewritten.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobOrder {
+    /// Smallest group by bytes first.
     BytesAsc,
+    /// Largest group by bytes first.
     BytesDesc,
+    /// Group with the fewest files first.
     FilesAsc,
+    /// Group with the most files first.
     FilesDesc,
+    /// Planning order, unchanged.
     None,
 }
 
 impl JobOrder {
+    /// Parse the kebab-case option value for `rewrite-job-order`.
+    ///
+    /// # Errors
+    /// Returns `IcebergRewriteError::InvalidOption` when `s` is not one of the
+    /// accepted values.
     pub fn parse(s: &str) -> Result<Self, IcebergRewriteError> {
         match s {
             "bytes-asc" => Ok(Self::BytesAsc),
@@ -51,31 +77,53 @@ impl JobOrder {
     }
 }
 
+/// Options that govern which files are rewritten and how the output is shaped.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RewriteOptions {
+    /// Size, in bytes, that each rewritten file is sized towards.
     pub target_file_size_bytes: u64,
+    /// Number of files a group must hold before it is worth rewriting.
     pub min_input_files: u32,
+    /// Cap, in bytes, on the input a single file group may hold.
     pub max_file_group_size_bytes: u64,
+    /// Delete-file count at which a data file is rewritten on that ground alone.
     pub delete_file_threshold: u32,
+    /// Deleted fraction of a file at which it is rewritten on that ground alone.
     pub delete_ratio_threshold: f64,
+    /// Whether every candidate file is rewritten regardless of size or deletes.
     pub rewrite_all: bool,
+    /// Whether each file group is committed as it completes rather than all at once.
     pub partial_progress_enabled: bool,
+    /// Number of commits a partial-progress rewrite may make.
     pub partial_progress_max_commits: u32,
+    /// Number of failed commits tolerated under partial progress; defaults to the commit budget.
     pub partial_progress_max_failed_commits: Option<u32>,
+    /// Number of file groups rewritten concurrently.
     pub max_concurrent_file_group_rewrites: u32,
+    /// Partition spec the output is written under; defaults to the current spec.
     pub output_spec_id: Option<i32>,
+    /// Whether new files take the sequence number of the snapshot the rewrite started from.
     pub use_starting_sequence_number: bool,
+    /// Whether delete files left with no live data file are removed on commit.
     pub remove_dangling_deletes: bool,
+    /// Cap on the number of files rewritten in one run.
     pub max_files_to_rewrite: Option<u32>,
+    /// Size, in bytes, below which a file is undersized; defaults to 75% of target.
     pub min_file_size_bytes: Option<u64>,
+    /// Size, in bytes, above which a file is oversized; defaults to 180% of target.
     pub max_file_size_bytes: Option<u64>,
+    /// Order in which planned groups are rewritten.
     pub job_order: JobOrder,
+    /// Ratio of on-disk bytes to in-memory bytes assumed when sizing output.
     pub compression_factor: f64,
+    /// Cap on the interleaved z-order key's byte length.
     pub zorder_max_output_size: u64,
+    /// Bytes a text or binary column contributes to the z-order key.
     pub zorder_var_length_contribution: u32,
-    /// Number of sorted output partitions per target file for the sort and
-    /// z-order strategies. Higher values produce more, smaller, contiguously
-    /// ordered files; `1` produces one file per target size.
+    /// Number of sorted output partitions per target file for the ordered strategies.
+    ///
+    /// Higher values produce more, smaller, contiguously ordered files; `1`
+    /// produces one file per target size.
     pub shuffle_partitions_per_file: u32,
 }
 
@@ -98,7 +146,7 @@ impl Default for RewriteOptions {
             max_files_to_rewrite: None,
             min_file_size_bytes: None,
             max_file_size_bytes: None,
-            job_order: JobOrder::BytesDesc,
+            job_order: JobOrder::None,
             compression_factor: 1.0,
             zorder_max_output_size: DEFAULT_ZORDER_MAX_OUTPUT_SIZE,
             zorder_var_length_contribution: DEFAULT_ZORDER_VAR_LEN_CONTRIBUTION,
@@ -108,7 +156,9 @@ impl Default for RewriteOptions {
 }
 
 impl RewriteOptions {
-    /// Lower size threshold for rewrite eligibility. Defaults to 75% of target.
+    /// Lower size threshold, in bytes, for rewrite eligibility.
+    ///
+    /// Defaults to 75% of the target file size.
     pub fn effective_min_file_size_bytes(&self) -> u64 {
         match self.min_file_size_bytes {
             Some(v) => v,
@@ -116,7 +166,9 @@ impl RewriteOptions {
         }
     }
 
-    /// Upper size threshold for rewrite eligibility. Defaults to 180% of target.
+    /// Upper size threshold, in bytes, for rewrite eligibility.
+    ///
+    /// Defaults to 180% of the target file size.
     pub fn effective_max_file_size_bytes(&self) -> u64 {
         match self.max_file_size_bytes {
             Some(v) => v,
@@ -124,8 +176,10 @@ impl RewriteOptions {
         }
     }
 
-    /// Upper size a file may reach while writing. Halfway between target and
-    /// max, so an uneven remainder is absorbed rather than left undersized.
+    /// Upper size, in bytes, a file may reach while being written.
+    ///
+    /// Halfway between target and max, so an uneven remainder is absorbed
+    /// rather than left undersized.
     #[must_use]
     pub fn write_max_file_size_bytes(&self) -> u64 {
         let target = self.target_file_size_bytes;
@@ -133,8 +187,10 @@ impl RewriteOptions {
         target + (max.saturating_sub(target)) / 2
     }
 
-    /// Number of files a group of `input_bytes` is written as. Rounds down when
-    /// spreading the remainder keeps the average within 10% of target, else up.
+    /// Number of files a group of `input_bytes` is written as.
+    ///
+    /// Rounds down when spreading the remainder keeps the average within 10% of
+    /// the target, and up otherwise.
     #[must_use]
     pub fn expected_output_files(&self, input_bytes: u64) -> u64 {
         let target = self.target_file_size_bytes;
@@ -155,8 +211,9 @@ impl RewriteOptions {
         }
     }
 
-    /// How much input each output file is read from. Floored at the target and
-    /// capped at [`Self::write_max_file_size_bytes`].
+    /// Bytes of input each output file is read from.
+    ///
+    /// Floored at the target and capped at [`Self::write_max_file_size_bytes`].
     #[must_use]
     pub fn input_split_size(&self, input_bytes: u64) -> u64 {
         let estimated = input_bytes / self.expected_output_files(input_bytes) + SPLIT_OVERHEAD;
@@ -166,7 +223,9 @@ impl RewriteOptions {
         estimated.min(self.write_max_file_size_bytes())
     }
 
-    /// Failed-commit budget under partial-progress. Defaults to `partial_progress_max_commits`.
+    /// Failed-commit budget under partial progress.
+    ///
+    /// Defaults to `partial_progress_max_commits`.
     pub fn effective_max_failed_commits(&self) -> u32 {
         self.partial_progress_max_failed_commits
             .unwrap_or(self.partial_progress_max_commits)
@@ -174,6 +233,11 @@ impl RewriteOptions {
 }
 
 impl RewriteOptions {
+    /// Check every option against the range the planner accepts.
+    ///
+    /// # Errors
+    /// Returns `IcebergRewriteError::InvalidOption` naming the first option
+    /// found outside its accepted range.
     pub fn validate(&self) -> Result<(), IcebergRewriteError> {
         let invalid = |name: &str, reason: String| IcebergRewriteError::InvalidOption {
             name: name.into(),
@@ -206,6 +270,15 @@ impl RewriteOptions {
                 "must be >= 1 when partial-progress.enabled = true".into(),
             ));
         }
+        if self.delete_file_threshold > MAX_DELETE_FILE_THRESHOLD {
+            return Err(invalid(
+                "delete-file-threshold",
+                format!(
+                    "must be <= {MAX_DELETE_FILE_THRESHOLD}, got {}",
+                    self.delete_file_threshold
+                ),
+            ));
+        }
         if self.max_concurrent_file_group_rewrites == 0 {
             return Err(invalid(
                 "max-concurrent-file-group-rewrites",
@@ -230,13 +303,10 @@ impl RewriteOptions {
                 format!("must be > 0 and finite, got {}", self.compression_factor),
             ));
         }
-        if !(8..=MAX_ZORDER_MAX_OUTPUT_SIZE).contains(&self.zorder_max_output_size) {
+        if self.zorder_max_output_size == 0 {
             return Err(invalid(
                 "max-output-size",
-                format!(
-                    "must be in [8, {MAX_ZORDER_MAX_OUTPUT_SIZE}] (per-row key cap), got {}",
-                    self.zorder_max_output_size
-                ),
+                "must be >= 1 (the interleaved key cannot use less than one byte)".into(),
             ));
         }
         if !(1..=64).contains(&self.zorder_var_length_contribution) {
@@ -292,46 +362,67 @@ impl RewriteOptions {
     }
 }
 
+/// Direction a sort column is ordered in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SortDirection {
+    /// Smallest value first.
     Asc,
+    /// Largest value first.
     Desc,
 }
 
+/// Position of null values within a sorted column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NullOrder {
+    /// Nulls precede every concrete value.
     NullsFirst,
+    /// Nulls follow every concrete value.
     NullsLast,
 }
 
+/// One column of a sort order, with its direction and null placement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SortColumn {
+    /// Name of the column in the table schema.
     pub name: String,
+    /// Direction the column is ordered in.
     pub direction: SortDirection,
+    /// Where nulls are placed within the column's order.
     pub null_order: NullOrder,
 }
 
+/// Clustering columns and encoding limits for a z-order rewrite.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZOrderKey {
+    /// Names of the columns interleaved into the key, in order.
     pub columns: Vec<String>,
+    /// Bytes a text or binary column contributes to the key.
     pub var_length_contribution: u32,
+    /// Cap on the interleaved key's byte length.
     pub max_output_size: u64,
 }
 
+/// How the rows of a file group are laid out across its output files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Strategy {
+    /// Concatenate input files up to the target size with no reordering.
     BinPack,
-    Sort { columns: Vec<SortColumn> },
+    /// Sort rows by the given columns before writing.
+    Sort {
+        /// Sort order applied to the group's rows.
+        columns: Vec<SortColumn>,
+    },
+    /// Cluster rows along a z-order curve over the given columns.
     ZOrder(ZOrderKey),
 }
 
 #[cfg(test)]
 mod tests {
 
-    /// Cross-checked against Iceberg's `SizeBasedFileRewritePlanner`.
+    /// Expected values were produced by an independent size-based planner for the same inputs.
     #[test]
     fn size_arithmetic_matches_the_reference() {
-        // (target, input bytes, write max, expected output files, input split size)
+        // Columns: target, input bytes, write max, expected output files, input split size.
         let cases: &[(u64, u64, u64, u64, u64)] = &[
             (2097152, 1048576, 2936012, 1, 2097152),
             (2097152, 1887436, 2936012, 1, 2097152),

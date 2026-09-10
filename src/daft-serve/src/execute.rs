@@ -157,13 +157,23 @@ pub fn resolve_exec_config(request: &QueryRequest) -> ServeResult<Arc<DaftExecut
     }
 }
 
+/// Bounds one query's execution: wall-clock time and memory.
+///
+/// A zero `timeout_secs` leaves execution unbounded in time; `None` for the
+/// memory cap leaves it to the shared pool.
+#[derive(Debug, Clone, Copy)]
+pub struct QueryBounds {
+    pub timeout_secs: u64,
+    pub memory_cap_bytes: Option<u64>,
+}
+
 /// Runs one admitted query, sending encoded messages into `tx`.
 ///
 /// The admission permit and registry guard are held for the duration of the
 /// send loop and released on return, whether the query completes, fails,
-/// times out, or is cancelled. A nonzero `query_timeout_secs` bounds
-/// execution wall-clock time: on expiry the execution future is dropped,
-/// which cancels the running pipeline and frees the admission slot.
+/// times out, or is cancelled. A nonzero timeout in `bounds` limits execution
+/// wall-clock time: on expiry the execution future is dropped, which cancels
+/// the running pipeline and frees the admission slot.
 pub async fn run_query(
     request: QueryRequest,
     sql_session: Option<Arc<Py<PyAny>>>,
@@ -171,18 +181,17 @@ pub async fn run_query(
     permit: AdmissionPermit,
     guard: QueryGuard,
     tx: async_channel::Sender<Result<FlightData, Status>>,
-    query_timeout_secs: u64,
-    memory_cap_bytes: Option<u64>,
+    bounds: QueryBounds,
 ) {
     let query_id = request.query_id.clone();
-    let inner = run_query_inner(request, sql_session, &cancel, &tx, memory_cap_bytes);
-    let result = if query_timeout_secs > 0 {
-        match tokio::time::timeout(std::time::Duration::from_secs(query_timeout_secs), inner).await
+    let inner = run_query_inner(request, sql_session, &cancel, &tx, bounds.memory_cap_bytes);
+    let result = if bounds.timeout_secs > 0 {
+        match tokio::time::timeout(std::time::Duration::from_secs(bounds.timeout_secs), inner).await
         {
             Ok(result) => result,
             Err(_) => Err(ServeError::Timeout {
                 query_id: query_id.clone(),
-                limit_secs: query_timeout_secs,
+                limit_secs: bounds.timeout_secs,
             }),
         }
     } else {

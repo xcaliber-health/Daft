@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, TypeVar, overload
 
 from pyiceberg.catalog import Catalog as InnerCatalog
 from pyiceberg.catalog import load_catalog
@@ -35,7 +35,7 @@ from daft.catalog import (
 from daft.io.iceberg._iceberg import read_iceberg
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
     from datetime import datetime
 
     from pyiceberg.schema import Schema as PyIcebergSchema
@@ -47,6 +47,7 @@ if TYPE_CHECKING:
         IcebergMaintenanceOptions,
         RemoveOrphanResult,
         RewriteManifestsResult,
+        RewritePositionDeletesResult,
         RewriteResult,
     )
     from daft.io.partitioning import PartitionField
@@ -160,7 +161,7 @@ class IcebergCatalog(Catalog):
     # create_*
     ###
 
-    def _create_function(self, ident: Identifier, function: Function | Callable[..., Any]) -> None:
+    def _create_function(self, ident: Identifier, function: Function | Callable[..., Expression]) -> None:
         raise NotImplementedError("Iceberg does not support function registration.")
 
     def _get_function(self, ident: Identifier) -> Function:
@@ -286,14 +287,14 @@ class IcebergTable(Table):
             return t
         raise ValueError(f"Unsupported iceberg table type: {type(obj)}")
 
-    def read(self, **options: Any) -> DataFrame:
+    def read(self, **options: str | int | bool | None) -> DataFrame:
         Table._validate_options("Iceberg read", options, IcebergTable._read_options)
-        ignore_corrupt_files: bool = options.get("ignore_corrupt_files", False)
+        ignore_corrupt_files = _read_option(options, "ignore_corrupt_files", bool, False)
         return read_iceberg(
             self._inner,
-            snapshot_id=options.get("snapshot_id"),
-            branch=options.get("branch"),
-            tag=options.get("tag"),
+            snapshot_id=_read_option(options, "snapshot_id", int, None),
+            branch=_read_option(options, "branch", str, None),
+            tag=_read_option(options, "tag", str, None),
             ignore_corrupt_files=ignore_corrupt_files,
         )
 
@@ -319,19 +320,15 @@ class IcebergTable(Table):
     ) -> RewriteResult:
         """Compact or re-cluster the data files of this table.
 
-        Reads matching data files, writes new files sized close to
-        ``target-file-size-bytes``, and commits an atomic snapshot that
-        replaces the inputs with the outputs. Tolerates concurrent appends to
-        partitions outside the rewrite scope; raises ``RewriteConflict`` when
-        another writer modifies an affected partition between plan and commit.
-
-        The commit-time conflict check defaults to serializable isolation, which
-        rejects the commit if any concurrent writer added a file to a partition
-        being rewritten. Set ``options={"conflict-isolation": "snapshot"}`` to
-        permit concurrent appends of new files into the same partition, rejecting
-        only when one of this call's own input files was removed. Snapshot
-        isolation is safe only when no concurrent process deletes data from the
-        touched partitions, such as an append-only writer.
+        Reads the matching data files, writes new files sized close to
+        ``target-file-size-bytes``, and commits one snapshot replacing the
+        inputs with the outputs; concurrent appends coexist with the rewrite.
+        Without partial progress any failure removes every output written so
+        far before raising. With partial progress each batch commits as soon as
+        its groups are rewritten, a group or batch that fails is dropped with
+        its outputs removed and counted in ``failed_groups``, and the run
+        raises only once more than ``partial-progress.max-failed-commits``
+        batches have failed.
 
         Parameters
         ----------
@@ -351,20 +348,33 @@ class IcebergTable(Table):
         branch : str, optional
             Branch to commit to. Defaults to ``main``.
         options : dict, optional
-            Tuning knobs: ``target-file-size-bytes``, ``min-input-files``,
+            Tuning knobs: ``target-file-size-bytes`` (defaults to the table's
+            ``write.target-file-size-bytes``), ``min-input-files``,
             ``min-file-size-bytes``, ``max-file-size-bytes``,
-            ``max-file-group-size-bytes``, ``rewrite-all``,
+            ``max-file-group-size-bytes``, ``max-files-to-rewrite`` (cap on
+            the files one call rewrites; the group straddling it is cut, not
+            dropped), ``rewrite-all``, ``output-spec-id`` (partition spec the
+            outputs are written under; defaults to the table's current one),
+            ``rewrite-id`` (caller-chosen identity for an idempotent replay;
+            derived from the plan when unset),
             ``rewrite-job-order``, ``max-concurrent-file-group-rewrites``
-            (groups rewritten in parallel, default 5),
+            (groups rewritten at once on any runner, default 5),
             ``shuffle-partitions-per-file`` (sort/zorder only; >1 yields more,
             smaller, ordered files), ``use-starting-sequence-number``
             (default true), ``delete-file-threshold``,
-            ``partial-progress.enabled``, ``partial-progress.max-commits``,
-            ``partial-progress.max-failed-commits``, ``compression-factor``,
-            ``remove-dangling-deletes``, ``max-output-size`` and
+            ``partial-progress.enabled``, ``partial-progress.max-commits``
+            (a batch whose commit fails for a reason other than a conflict keeps
+            its files, since it may have landed; orphan cleanup reclaims them),
+            ``partial-progress.max-failed-commits``, ``compression-factor``
+            (how much sorted or z-ordered rows expand from disk into memory,
+            seeding the writer's file rolling; unset, the ratio is measured
+            on the input files), ``remove-dangling-deletes``,
+            ``max-output-size`` (cap on the z-order key's byte length; by
+            default every byte of the clustering columns is interleaved) and
             ``var-length-contribution`` (zorder only), ``delete-ratio-threshold``,
-            ``conflict-isolation`` (``"serializable"`` default or ``"snapshot"``).
-            Commit retry is tuned via
+            ``conflict-isolation`` (``"snapshot"`` by default; ``"serializable"``
+            also refuses the commit when a concurrent writer added a file to a
+            partition being rewritten). Commit retry is tuned via
             table properties ``commit.retry.num-retries``,
             ``commit.retry.min-wait-ms``, ``commit.retry.max-wait-ms``,
             ``commit.retry.total-timeout-ms``.
@@ -379,12 +389,14 @@ class IcebergTable(Table):
         ------
         ValueError
             On unknown ``strategy`` or invalid ``sort_order`` / ``zorder_by``.
-        EqualityDeletesPresentError
-            When the scanned scope contains equality-delete files; apply them
-            before retrying.
+        ValueError
+            When an equality delete file matches on a column that is nested or
+            no longer in the table schema.
         RewriteConflict
-            When a concurrent writer modified a partition this call is
-            rewriting, or removed one of its input files.
+            When a concurrent writer removed one of this call's input files or
+            committed a row-level delete covering one (committing over it would
+            bring the removed rows back), or, under ``serializable`` isolation,
+            added a file to a partition this call is rewriting.
 
         Examples:
         --------
@@ -424,20 +436,29 @@ class IcebergTable(Table):
     ) -> ExpireResult:
         """Expire old snapshots and reclaim their files.
 
+        Every branch keeps its head and its ancestors while fewer than
+        ``retain_last`` have been kept or the ancestor is at or after the
+        ``older_than`` cutoff; a branch's own ``max-snapshot-age-ms`` and
+        ``min-snapshots-to-keep`` take precedence. A tag keeps its snapshot
+        until it ages past its ``max-ref-age-ms``, and a snapshot no branch or
+        tag reaches is kept only while it is at or after the cutoff. Everything
+        else expires, and the files only expired snapshots referenced are
+        deleted.
+
         Parameters
         ----------
         older_than : datetime.datetime or int, optional
-            Expire snapshots with a timestamp strictly older than this value.
-            ``int`` is treated as epoch milliseconds. If no retention argument is
-            supplied at all, the table property ``history.expire.max-snapshot-age-ms``
-            (default 5 days) is used to compute a default ``older_than``.
+            The age cutoff. ``int`` is treated as epoch milliseconds. Defaults
+            to now less the table property ``history.expire.max-snapshot-age-ms``
+            (5 days), so on its own ``retain_last`` only floors what that
+            cutoff would expire.
         retain_last : int, optional
-            Always retain the N most-recent snapshots reachable from the current
-            ref. The table property ``history.expire.min-snapshots-to-keep`` acts
-            as a floor — the effective retention is ``max(retain_last, floor)``.
+            Minimum number of ancestors every branch keeps whatever their
+            age. Defaults to the table property
+            ``history.expire.min-snapshots-to-keep`` (1).
         snapshot_ids : list of int, optional
-            Explicit IDs to expire. Branch and tag heads are always protected and
-            raise ``ValueError`` if listed here.
+            Explicit IDs to expire regardless of retention. Branch and tag
+            heads are always protected and raise ``ValueError`` if listed here.
         clean_expired_files : bool, default True
             When ``True``, physically delete files (data, position deletes,
             equality deletes, manifests, manifest lists, statistics) that become
@@ -453,7 +474,6 @@ class IcebergTable(Table):
             Tuning knobs:
 
             - ``max-concurrent-deletes`` (int, default 4)
-            - ``max-concurrent-manifest-reads`` (int, default 4)
             - ``delete-num-retries`` (int, default 3)
             - ``delete-backoff-base-seconds`` (float, default 0.1)
 
@@ -536,8 +556,9 @@ class IcebergTable(Table):
             ``last_modified`` column (timestamp or epoch milliseconds). Rows
             outside ``location`` or newer than the cutoff are dropped.
         prefix_listing : bool, default False
-            Use flat prefix listing rather than directory-by-directory walking.
-            Raises ``ValueError`` if the underlying store cannot prefix-list.
+            Accepted for interface compatibility. Listing already walks the
+            table location by prefix on every store, so the flag changes
+            nothing.
         stream_results : bool, default False
             Stream the listing through the reachability filter rather than
             materializing it. Bounds memory at the per-partition size; the
@@ -545,13 +566,14 @@ class IcebergTable(Table):
         options : dict, optional
             Tuning knobs:
 
-            - ``max-concurrent-list`` (int, default 4)
             - ``max-concurrent-deletes`` (int, default 4)
             - ``delete-num-retries`` (int, default 3)
             - ``delete-backoff-base-seconds`` (float, default 0.1)
-            - ``sample-limit`` (int, default 1000) — cap on ``sample_paths``.
-            - ``allow-recent`` (bool, default False) — disables the 24-hour
+            - ``sample-limit`` (int, default 1000): cap on ``sample_paths``.
+            - ``allow-recent`` (bool, default False): disables the 24-hour
               floor; for tests only.
+            - ``equal-schemes`` and ``equal-authorities`` (mapping): extra
+              scheme and host spellings to treat as equal.
 
         Returns:
         -------
@@ -603,9 +625,9 @@ class IcebergTable(Table):
         Reads the manifests of the target branch's current snapshot, keeps
         only live entries, and writes a fresh manifest set sized to
         ``manifest-target-size-bytes``. Output entries cluster by partition
-        so a partition-scoped query reads at most one manifest per partition.
-        Commits a single REPLACE snapshot in place of the rewritten manifests;
-        data and delete files are unchanged.
+        so a partition-scoped query reads fewer manifests. Commits a single
+        REPLACE snapshot in place of the rewritten manifests; data and delete
+        files are unchanged.
 
         Parameters
         ----------
@@ -616,15 +638,13 @@ class IcebergTable(Table):
         branch : str, optional
             Branch to rewrite. Defaults to ``main``.
         use_caching : bool, default False
-            Reserved for signature stability; ignored — entries stream into the
-            writers as each manifest is read, so there is no shared intermediate.
+            Accepted for interface compatibility and ignored; entries stream
+            into the writers as each manifest is read.
         options : dict, optional
             Tuning knobs (fall back to table properties where noted):
 
             - ``manifest-target-size-bytes`` (int, default 8 MiB, falls back
               to ``commit.manifest.target-size-bytes``)
-            - ``manifest-min-count-to-merge`` (int, default 100, falls back to
-              ``commit.manifest.min-count-to-merge``)
             - ``manifest-read-concurrency`` (int, default 1) — read input
               manifests in parallel; output order stays deterministic.
             - ``sort-by`` (list of str) — restrict the manifest clustering key
@@ -661,6 +681,57 @@ class IcebergTable(Table):
             options=options,
         )
 
+    def rewrite_position_delete_files(
+        self,
+        *,
+        where: str | None = None,
+        branch: str | None = None,
+        options: IcebergMaintenanceOptions | None = None,
+    ) -> RewritePositionDeletesResult:
+        """Pack position delete files into target-sized files.
+
+        The live position delete files of each partition are read, rows naming
+        a data file no longer live are dropped, and the survivors are written
+        sorted by data file and position into files of
+        ``write.delete.target-file-size-bytes``. The packed files replace the
+        old ones at the sequence number the old ones carried, so the same rows
+        stay deleted. Sizing follows the same thresholds as ``rewrite_data_files``.
+
+        Parameters
+        ----------
+        where : str, optional
+            Row filter; its partition projection selects the partitions to work on.
+        branch : str, optional
+            Branch to rewrite. Defaults to ``main``.
+        options : dict, optional
+            ``target-file-size-bytes`` (default ``write.delete.target-file-size-bytes``,
+            else 64 MiB), ``min-file-size-bytes``, ``max-file-size-bytes``,
+            ``min-input-files`` (default 5), ``rewrite-all``,
+            ``max-file-group-size-bytes``, ``rewrite-job-order``,
+            ``partial-progress.enabled``, ``partial-progress.max-commits``,
+            ``max-concurrent-file-group-rewrites`` and ``rewrite-id``.
+
+        Returns:
+        -------
+        RewritePositionDeletesResult
+            Files and bytes replaced and written, with the snapshots committed.
+
+        Raises:
+        ------
+        ValueError
+            If an option is unknown or out of range.
+        RewritePositionDeletesFailedException
+            If a group cannot be rewritten or committed without partial progress.
+
+        Examples:
+        --------
+        >>> table.rewrite_position_delete_files()  # doctest: +SKIP
+        >>> table.rewrite_position_delete_files(options={"rewrite-all": True})  # doctest: +SKIP
+        """
+        from daft.io.iceberg._rewrite_position_deletes import run as _rewrite_position_deletes_run
+
+        return _rewrite_position_deletes_run(self._inner, where=where, branch=branch, options=options)
+
     def compact_files(
         self,
         *,
@@ -685,3 +756,31 @@ class IcebergTable(Table):
 
 def _to_pyiceberg_ident(ident: Identifier | str) -> tuple[str, ...] | str:
     return tuple(ident) if isinstance(ident, Identifier) else ident
+
+
+_ReadOption = TypeVar("_ReadOption", int, str, bool)
+
+
+@overload
+def _read_option(
+    options: Mapping[str, str | int | bool | None], name: str, kind: type[_ReadOption], default: None
+) -> _ReadOption | None: ...
+
+
+@overload
+def _read_option(
+    options: Mapping[str, str | int | bool | None], name: str, kind: type[_ReadOption], default: _ReadOption
+) -> _ReadOption: ...
+
+
+def _read_option(
+    options: Mapping[str, str | int | bool | None],
+    name: str,
+    kind: type[_ReadOption],
+    default: _ReadOption | None,
+) -> _ReadOption | None:
+    """Return read option ``name`` checked against ``kind``, or ``default`` when absent."""
+    value = options.get(name, default)
+    if value is None or isinstance(value, kind):
+        return value
+    raise TypeError(f"Iceberg read option {name!r} must be {kind.__name__}, got {type(value).__name__}")

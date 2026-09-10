@@ -162,6 +162,7 @@ def read_iceberg(
     """
     from pyiceberg.table import StaticTable
 
+    from daft.io.iceberg._deletes import plan_files, read_with_deletes, snapshot_has_equality_deletes
     from daft.io.iceberg.iceberg_scan import IcebergScanOperator
 
     # support for read_iceberg('path/to/metadata.json')
@@ -176,6 +177,20 @@ def read_iceberg(
         else io_config
     )
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
+
+    if snapshot_has_equality_deletes(table, snapshot_id):
+        # Equality deletes are applied by joins, which the scan cannot express.
+        plan = plan_files(table, table.scan(snapshot_id=snapshot_id))
+        df = read_with_deletes(
+            table=table,
+            plan=plan,
+            paths=list(plan.tasks),
+            snapshot_id=snapshot_id,
+            io_config=io_config,
+            schema_source="snapshot",
+            ignore_corrupt_files=ignore_corrupt_files,
+        )
+        return DataFrame(attach_checkpoint(df._builder, checkpoint))
 
     multithreaded_io = runners.get_or_create_runner().name != "ray"
     storage_config = StorageConfig(multithreaded_io, io_config)

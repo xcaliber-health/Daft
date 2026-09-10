@@ -1,3 +1,8 @@
+//! File-group planning for a data-file rewrite.
+//!
+//! Buckets candidate files by partition, packs them into groups bounded by
+//! size, and keeps only the groups worth rewriting.
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -5,39 +10,46 @@ use crate::{
     options::{JobOrder, RewriteOptions},
 };
 
-/// One Iceberg data file considered for rewrite.
+/// One data file considered for rewrite.
 ///
-/// `partition_key` is a canonical JSON encoding of the partition record; rows with
-/// equal `partition_key` and `partition_spec_id` are grouped together.
+/// Files with equal `partition_key` and `partition_spec_id` are grouped together.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandidateFile {
+    /// Location of the data file.
     pub path: String,
+    /// Size of the data file in bytes.
     pub size_bytes: u64,
+    /// Canonical JSON encoding of the file's partition record.
     pub partition_key: String,
+    /// Identifier of the partition spec the file was written under.
     pub partition_spec_id: i32,
+    /// Locations of the position delete files that name this file.
     pub positional_delete_paths: Vec<String>,
-    pub has_equality_deletes: bool,
+    /// Locations of the equality delete files that apply to this file.
+    #[serde(default)]
+    pub equality_delete_paths: Vec<String>,
     /// Rows the data file holds, before deletes are applied.
     #[serde(default)]
     pub record_count: u64,
-    /// Rows removed by delete files naming this one. A delete naming no data
-    /// file cannot be attributed, so it counts for nothing here.
+    /// Rows removed by delete files naming this one.
+    ///
+    /// A delete naming no data file cannot be attributed, so it counts for
+    /// nothing here.
     #[serde(default)]
     pub deleted_record_count: u64,
 }
 
 impl CandidateFile {
-    fn positional_delete_count(&self) -> u32 {
-        self.positional_delete_paths.len() as u32
-    }
-
-    /// Whether the file carries at least `threshold` delete files.
+    /// Whether at least `threshold` delete files of either kind apply to the file.
     fn too_many_deletes(&self, threshold: u32) -> bool {
-        self.positional_delete_count() >= threshold
+        let deletes = self.positional_delete_paths.len() + self.equality_delete_paths.len();
+        deletes >= threshold as usize
     }
 
-    /// Whether the deleted fraction reaches `threshold`. Clamped to the file's
-    /// own row count, so a shared delete cannot push the ratio above one.
+    /// Whether the deleted fraction reaches `threshold`.
+    ///
+    /// Clamped to the file's own row count, so a shared delete cannot push the
+    /// ratio above one.
     fn too_high_delete_ratio(&self, threshold: f64) -> bool {
         if self.positional_delete_paths.is_empty() || self.record_count == 0 {
             return false;
@@ -47,15 +59,20 @@ impl CandidateFile {
     }
 }
 
+/// A set of files from one partition that are rewritten together.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileGroup {
+    /// Canonical JSON encoding of the partition record shared by every file.
     pub partition_key: String,
+    /// Identifier of the partition spec the output is written under.
     pub output_spec_id: i32,
+    /// Files rewritten by this group, in planning order.
     pub files: Vec<CandidateFile>,
+    /// Sum of `size_bytes` over `files`.
     pub total_bytes: u64,
-    /// How many files this group is written as, decided before writing.
+    /// Number of files this group is written as, decided before writing.
     pub expected_output_files: u64,
-    /// How much input each of those files is read from.
+    /// Bytes of input each of those files is read from.
     pub input_split_size: u64,
 }
 
@@ -77,8 +94,10 @@ impl FileGroup {
         self.input_split_size = opts.input_split_size(self.total_bytes);
     }
 
-    /// Whether the group is worth rewriting. Any one reason suffices: enough
-    /// files, enough content, too much content, or a heavily deleted file.
+    /// Whether the group is worth rewriting.
+    ///
+    /// Any one reason suffices: enough files, enough content, too much
+    /// content, or a heavily deleted file.
     fn is_worth_rewriting(&self, opts: &RewriteOptions) -> bool {
         let enough_input_files =
             self.files.len() > 1 && self.files.len() as u32 >= opts.min_input_files;
@@ -103,15 +122,16 @@ impl FileGroup {
     }
 }
 
-/// Group candidate files for rewrite.
+/// Group candidate files into rewrite units.
 ///
-/// Steps: bucket by `(partition_key, partition_spec_id)`; keep files outside the
-/// desired size range or carrying too many deletes; bin-pack each bucket into
-/// groups capped by `max_file_group_size_bytes`; discard packed groups not worth
-/// rewriting; sort by `job_order`; and cut to `max_files_to_rewrite`.
+/// Files are bucketed by `(partition_key, partition_spec_id)`, filtered to those
+/// outside the desired size range or carrying too many deletes, bin-packed into
+/// groups capped by `max_file_group_size_bytes`, kept only where the packed
+/// group is worth rewriting, sorted by `job_order`, and cut to
+/// `max_files_to_rewrite`. `candidates` is consumed.
 ///
-/// The two filters are separate on purpose: what decides a rewrite is the shape
-/// of each packed group, not of the bucket it came from.
+/// # Errors
+/// Returns `IcebergRewriteError::InvalidOption` when `opts` fails validation.
 pub fn plan_file_groups(
     candidates: Vec<CandidateFile>,
     opts: &RewriteOptions,
@@ -123,12 +143,6 @@ pub fn plan_file_groups(
     let mut buckets: std::collections::BTreeMap<(String, i32), Vec<CandidateFile>> =
         std::collections::BTreeMap::new();
     for c in candidates {
-        if c.has_equality_deletes {
-            return Err(IcebergRewriteError::EqualityDeletesPresent {
-                n: 1,
-                sample: vec![c.path],
-            });
-        }
         buckets
             .entry((c.partition_key.clone(), c.partition_spec_id))
             .or_default()
@@ -173,8 +187,10 @@ pub fn plan_file_groups(
     Ok(groups)
 }
 
-/// Cut the selection down to `max_files_to_rewrite`. A group that does not fit
-/// whole is taken in part, so a cap below the first group still does that work.
+/// Cut the selection down to `max_files_to_rewrite`.
+///
+/// A group that does not fit whole is taken in part, so a cap below the first
+/// group still does that much work.
 fn apply_file_cap(groups: &mut Vec<FileGroup>, opts: &RewriteOptions) {
     let Some(cap) = opts.max_files_to_rewrite else {
         return;
@@ -196,10 +212,11 @@ fn apply_file_cap(groups: &mut Vec<FileGroup>, opts: &RewriteOptions) {
     *groups = kept;
 }
 
-/// Pack files into groups of at most `cap` bytes, in the order they were
-/// scanned. Files arrive roughly ordered by the data they hold, so packing in
-/// that order keeps each group's rows contiguous and its bounds narrow; sorting
-/// by size first packs tighter but scatters the rows across every output file.
+/// Pack files into groups of at most `cap` bytes, in scan order.
+///
+/// Files arrive roughly ordered by the data they hold, so packing in that
+/// order keeps each group's rows contiguous; sorting by size first would pack
+/// tighter but scatter rows across every output file.
 fn pack(
     files: Vec<CandidateFile>,
     partition_key: &str,
@@ -244,7 +261,7 @@ mod tests {
             partition_key: part.into(),
             partition_spec_id: spec,
             positional_delete_paths: vec![],
-            has_equality_deletes: false,
+            equality_delete_paths: vec![],
             record_count: 1,
             deleted_record_count: 0,
         }
@@ -298,7 +315,6 @@ mod tests {
     fn already_sized_files_excluded() {
         let target = 64 * 1024 * 1024;
         let o = opts(target, 2, 5 * target);
-        // Five files near target size — survivor filter drops them all.
         let candidates = (0..5)
             .map(|i| cf(&format!("/f{i}.parquet"), target, "{}", 0))
             .collect();
@@ -319,7 +335,7 @@ mod tests {
         ];
         let groups = plan_file_groups(candidates, &o, 0).unwrap();
         assert!(!groups.is_empty());
-        // The biggest file must land alone or with a small tail, never exceeding cap.
+        // An oversized file may share a group only with a tail that fits under the cap.
         for g in &groups {
             assert!(g.total_bytes <= cap);
         }
@@ -341,16 +357,15 @@ mod tests {
     }
 
     #[test]
-    fn equality_delete_short_circuits() {
+    fn equality_deletes_count_toward_the_delete_file_threshold() {
         let target = 64 * 1024 * 1024;
-        let o = opts(target, 2, 5 * target);
-        let mut c = cf("/f0.parquet", 1024, "{}", 0);
-        c.has_equality_deletes = true;
-        let err = plan_file_groups(vec![c], &o, 0).unwrap_err();
-        assert!(matches!(
-            err,
-            IcebergRewriteError::EqualityDeletesPresent { .. }
-        ));
+        let mut o = opts(target, 2, 5 * target);
+        o.delete_file_threshold = 2;
+        let mut c = cf("/f0.parquet", target, "{}", 0);
+        c.positional_delete_paths = vec!["/p.parquet".into()];
+        c.equality_delete_paths = vec!["/e.parquet".into()];
+        let groups = plan_file_groups(vec![c], &o, 0).unwrap();
+        assert_eq!(groups.len(), 1, "one file at the target is rewritten only for its deletes");
     }
 
     #[test]
@@ -523,8 +538,8 @@ mod tests {
     #[test]
     fn configurable_min_max_file_size_changes_survivors() {
         let target: u64 = 100 * 1024 * 1024;
-        // Defaults: lower=75MiB, upper=180MiB → a 60MiB file is undersized → planned.
-        // Override: lower=50MiB, upper=200MiB → 60MiB is well-sized → skipped.
+        // Under the default 75% lower bound a 60 MiB file is undersized; with the
+        // bound lowered to 50 MiB it is well-sized and must be skipped.
         let custom = RewriteOptions {
             target_file_size_bytes: target,
             max_file_group_size_bytes: 5 * target,
@@ -589,7 +604,6 @@ mod tests {
             job_order: JobOrder::BytesDesc,
             ..opts(target, 2, 5 * target)
         };
-        // Two partitions: one large, one small.
         let candidates = vec![
             cf("/big0.parquet", 10_000_000, "p=a", 0),
             cf("/big1.parquet", 10_000_000, "p=a", 0),

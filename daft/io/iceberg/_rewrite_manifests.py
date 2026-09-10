@@ -1,53 +1,57 @@
 """Repack live manifest entries into target-sized manifests.
 
-Reads the target branch's current snapshot manifests, retains only live
-entries, and writes a fresh manifest set sized to ``manifest-target-size-bytes``.
-Output entries are clustered by partition (optionally restricted to a subset of
-partition fields) so a partition-scoped query reads fewer manifests. Commits a
-single REPLACE snapshot whose existing-manifests set is the new manifests plus
-any untouched manifests; data and delete files are unchanged.
-
-Only data manifests for the chosen spec are repacked. Delete manifests and
-manifests for other specs are carried through unchanged.
+Only the data manifests of the chosen partition spec are repacked; delete
+manifests and other specs' manifests are carried through unchanged. The result
+is one REPLACE snapshot whose data and delete files are unchanged.
 """
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import logging
 import uuid as _uuid
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from decimal import Decimal
+from typing import TYPE_CHECKING, TypeAlias, TypeVar
 
 from daft.io.iceberg._common import (
     CommitRetryExhausted,
+    MaintenanceOptions,
+    branch_ancestry,
     commit_with_retry,
-    validate_gc_enabled,
+    manifest_writer_for,
+    option_int,
+    option_names,
 )
 
 if TYPE_CHECKING:
-    from pyiceberg.manifest import ManifestEntry, ManifestFile, ManifestWriter
+    from pyiceberg.io import FileIO
+    from pyiceberg.manifest import DataFile, ManifestContent, ManifestEntry, ManifestFile, ManifestWriter
     from pyiceberg.partitioning import PartitionSpec
     from pyiceberg.table import Table as PyIcebergTable
+    from pyiceberg.table import Transaction
+    from pyiceberg.table.snapshots import Operation, Summary
+    from pyiceberg.typedef import Record
+
+_T = TypeVar("_T")
+
+#: One partition field's value as stored in a manifest entry: a primitive in its Python form, or null.
+PartitionValue: TypeAlias = (
+    str | int | float | bool | bytes | Decimal | datetime.date | datetime.datetime | datetime.time | _uuid.UUID | None
+)
 
 
-class _ManifestWriterFactory(Protocol):
-    """Supplies a fresh manifest writer bound to a partition spec.
-
-    Implemented by the snapshot producer; the rolling writer depends only on
-    this method, so it is typed against the capability rather than the producer.
-    """
-
-    def new_manifest_writer(self, spec: PartitionSpec) -> ManifestWriter: ...
+#: Opens a manifest writer of a given content under a partition spec.
+ManifestWriterFactory: TypeAlias = "Callable[[ManifestContent, PartitionSpec], ManifestWriter]"
 
 
 logger = logging.getLogger(__name__)
 
 
 MANIFEST_TARGET_SIZE_KEY = "commit.manifest.target-size-bytes"
-MANIFEST_MIN_COUNT_TO_MERGE_KEY = "commit.manifest.min-count-to-merge"
 _DEFAULT_MANIFEST_TARGET_SIZE_BYTES = 8 * 1024 * 1024
-_DEFAULT_MIN_COUNT_TO_MERGE = 100
 _ROLL_FACTOR = 1.2
 
 SNAPSHOT_PROP_REWRITE_ID = "daft.rewrite-id"
@@ -61,8 +65,7 @@ SNAPSHOT_PROP_OUTPUT_MANIFESTS = "daft.output-manifests"
 SNAPSHOT_PROP_INPUT_BYTES = "daft.input-manifest-bytes"
 SNAPSHOT_PROP_OUTPUT_BYTES = "daft.output-manifest-bytes"
 
-# Standard snapshot summary keys for a manifest rewrite. The keys above stay:
-# they carry byte counts these have no place for.
+# Summary keys the table format defines for a manifest rewrite.
 SUMMARY_MANIFESTS_CREATED = "manifests-created"
 SUMMARY_MANIFESTS_KEPT = "manifests-kept"
 SUMMARY_MANIFESTS_REPLACED = "manifests-replaced"
@@ -108,40 +111,64 @@ def run(
     spec_id: int | None = None,
     branch: str | None = None,
     use_caching: bool = False,
-    options: dict[str, Any] | None = None,
+    options: MaintenanceOptions | None = None,
 ) -> RewriteManifestsResult:
+    """Repack the live manifest entries of one partition spec on a branch.
+
+    Data manifests and delete manifests are repacked separately, each into
+    as many manifests as its bytes fill at ``manifest-target-size-bytes``. A
+    layout already balanced against that size is left alone, and a rewrite
+    whose identity is already recorded on the branch returns the recorded
+    result instead of committing again.
+
+    Parameters
+    ----------
+    table
+        Table whose manifests are rewritten.
+    spec_id
+        Partition spec whose manifests are repacked; defaults to the current
+        spec.
+    branch
+        Branch to commit to; defaults to the main branch.
+    use_caching
+        Accepted for interface compatibility and ignored.
+    options
+        ``manifest-target-size-bytes``,
+        ``manifest-read-concurrency`` and ``sort-by``.
+
+    Returns:
+    -------
+    RewriteManifestsResult
+        Manifest and byte counts, the rewrite identity, and the new snapshot id
+        (``None`` when nothing was rewritten).
+
+    Raises:
+    ------
+    ValueError
+        If an option is out of range, ``spec_id`` is unknown, ``branch`` is
+        missing or is a tag, or ``sort-by`` names a non-partition field.
+    RewriteManifestsFailedException
+        If the commit cannot land within the retry budget.
+    """
     from pyiceberg.table.snapshots import Operation
 
     opts = options or {}
-    target_size_bytes = int(
-        opts.get(
-            "manifest-target-size-bytes",
-            table.properties.get(MANIFEST_TARGET_SIZE_KEY, _DEFAULT_MANIFEST_TARGET_SIZE_BYTES),
-        )
-    )
-    min_count_to_merge = int(
-        opts.get(
-            "manifest-min-count-to-merge",
-            table.properties.get(MANIFEST_MIN_COUNT_TO_MERGE_KEY, _DEFAULT_MIN_COUNT_TO_MERGE),
-        )
+    target_size_bytes = option_int(
+        opts,
+        "manifest-target-size-bytes",
+        int(table.properties.get(MANIFEST_TARGET_SIZE_KEY, _DEFAULT_MANIFEST_TARGET_SIZE_BYTES)),
     )
     if target_size_bytes <= 0:
         raise ValueError(f"manifest-target-size-bytes must be > 0, got {target_size_bytes!r}")
 
-    read_concurrency = int(opts.get("manifest-read-concurrency", 1))
+    read_concurrency = option_int(opts, "manifest-read-concurrency", 1)
     if read_concurrency < 1:
         raise ValueError(f"manifest-read-concurrency must be >= 1, got {read_concurrency!r}")
 
-    sort_by = opts.get("sort-by")
-    if sort_by is not None:
-        sort_by = [str(c) for c in sort_by]
+    sort_by = option_names(opts, "sort-by")
 
-    # Accepted for interface compatibility. Entries stream into the rollers as
-    # each input manifest is read, so there is no shared intermediate to cache;
-    # the flag has no effect on the result.
+    # Entries stream into the writers, so there is nothing to cache.
     del use_caching
-
-    validate_gc_enabled(table)
 
     resolved_spec_id = _resolve_spec_id(table, spec_id)
     target_branch = _resolve_branch(table, branch)
@@ -152,11 +179,10 @@ def run(
         spec_id=resolved_spec_id,
         target_branch=target_branch,
         target_size_bytes=target_size_bytes,
-        min_count_to_merge=min_count_to_merge,
     )
 
     if plan.rewrite_id:
-        cached = _lookup_idempotent_result(table, plan.rewrite_id)
+        cached = _lookup_idempotent_result(table, plan.rewrite_id, target_branch)
         if cached is not None:
             return cached
 
@@ -184,7 +210,7 @@ def run(
         )
 
     def _on_conflict(t: PyIcebergTable) -> RewriteManifestsResult | None:
-        cached = _lookup_idempotent_result(t, plan_box["plan"].rewrite_id)
+        cached = _lookup_idempotent_result(t, plan_box["plan"].rewrite_id, target_branch)
         if cached is not None:
             return cached
         new_plan = _plan(
@@ -192,7 +218,6 @@ def run(
             spec_id=resolved_spec_id,
             target_branch=target_branch,
             target_size_bytes=target_size_bytes,
-            min_count_to_merge=min_count_to_merge,
         )
         if not new_plan.matching_manifests or new_plan.no_op_reason is not None:
             return RewriteManifestsResult(
@@ -215,14 +240,54 @@ def run(
         ) from exc
 
 
+@dataclass(frozen=True)
+class _ContentGroup:
+    """The manifests of one content kind that a rewrite repacks together."""
+
+    content: ManifestContent
+    manifests: list[ManifestFile]
+    bytes_rewritten: int
+    live_entries: int
+
+
 @dataclass
 class _Plan:
+    """Manifests one rewrite repacks or carries through, with its replay identity."""
+
     rewrite_id: str
-    matching_manifests: list[ManifestFile]
+    groups: list[_ContentGroup]
     untouched_manifests: list[ManifestFile]
-    bytes_rewritten: int
-    total_live_entries: int
     no_op_reason: str | None = None
+
+    @property
+    def matching_manifests(self) -> list[ManifestFile]:
+        """Every manifest being repacked, data manifests first."""
+        return [manifest for group in self.groups for manifest in group.manifests]
+
+    @property
+    def bytes_rewritten(self) -> int:
+        return sum(group.bytes_rewritten for group in self.groups)
+
+    @property
+    def total_live_entries(self) -> int:
+        return sum(group.live_entries for group in self.groups)
+
+
+def _balanced(manifests: list[ManifestFile], bytes_rewritten: int, target_size_bytes: int) -> bool:
+    """Return whether a set of manifests is already as many as the target size calls for.
+
+    A manifest without a live entry is never balanced: every scan still opens it.
+    """
+    roll = int(target_size_bytes * _ROLL_FACTOR)
+    expected_count = max(1, (bytes_rewritten + target_size_bytes - 1) // target_size_bytes)
+    if len(manifests) != expected_count:
+        return False
+    for manifest in manifests:
+        if int(manifest.manifest_length) > roll:
+            return False
+        if int(manifest.added_files_count or 0) + int(manifest.existing_files_count or 0) == 0:
+            return False
+    return True
 
 
 def _plan(
@@ -231,68 +296,60 @@ def _plan(
     spec_id: int,
     target_branch: str,
     target_size_bytes: int,
-    min_count_to_merge: int,
 ) -> _Plan:
+    """Partition the branch head's manifests into repacked and carried-through sets."""
     snapshot = table.metadata.snapshot_by_name(target_branch)
     if snapshot is None:
         return _Plan(
             rewrite_id="",
-            matching_manifests=[],
+            groups=[],
             untouched_manifests=[],
-            bytes_rewritten=0,
-            total_live_entries=0,
             no_op_reason=f"branch {target_branch!r} has no current snapshot",
         )
 
     from pyiceberg.manifest import ManifestContent
 
     manifests = list(snapshot.manifests(table.io))
-    matching: list[ManifestFile] = []
-    untouched: list[ManifestFile] = []
-    for m in manifests:
-        # Repack only data manifests for the chosen spec. Delete manifests (and
-        # manifests for other specs) are carried through untouched: their entries
-        # are written through a different content path and must not be folded into
-        # data manifests.
-        if int(m.partition_spec_id) == int(spec_id) and m.content == ManifestContent.DATA:
-            matching.append(m)
-        else:
-            untouched.append(m)
-
-    bytes_rewritten = sum(int(m.manifest_length) for m in matching)
-    total_live_entries = sum(int(m.added_files_count or 0) + int(m.existing_files_count or 0) for m in matching)
+    of_spec = [m for m in manifests if int(m.partition_spec_id) == int(spec_id)]
+    # Entries of one content kind must never land in manifests of the other.
+    groups: list[_ContentGroup] = []
+    balanced_count = 0
+    for content in (ManifestContent.DATA, ManifestContent.DELETES):
+        matching = [m for m in of_spec if m.content == content]
+        if not matching:
+            continue
+        bytes_rewritten = sum(int(m.manifest_length) for m in matching)
+        if _balanced(matching, bytes_rewritten, target_size_bytes):
+            balanced_count += 1
+            continue
+        groups.append(
+            _ContentGroup(
+                content=content,
+                manifests=matching,
+                bytes_rewritten=bytes_rewritten,
+                live_entries=sum(int(m.added_files_count or 0) + int(m.existing_files_count or 0) for m in matching),
+            )
+        )
+    repacked = {m.manifest_path for group in groups for m in group.manifests}
+    untouched = [m for m in manifests if m.manifest_path not in repacked]
 
     rewrite_id = _resolve_rewrite_id(
         table=table,
         target_branch=target_branch,
         spec_id=spec_id,
         target_size_bytes=target_size_bytes,
-        matching_manifest_paths=[m.manifest_path for m in matching],
+        matching_manifest_paths=sorted(repacked),
     )
 
     no_op_reason: str | None = None
-    if not matching:
+    if not of_spec:
         no_op_reason = "no manifests for spec_id"
-    else:
-        roll = int(target_size_bytes * _ROLL_FACTOR)
-        max_size = max(int(m.manifest_length) for m in matching)
-        expected_count = max(1, (bytes_rewritten + target_size_bytes - 1) // target_size_bytes)
-        already_balanced = abs(len(matching) - expected_count) <= 1 and max_size <= roll
-        below_min_count = len(matching) < min_count_to_merge and already_balanced
-        if already_balanced and (below_min_count or len(matching) == expected_count):
-            no_op_reason = (
-                f"manifest layout already balanced "
-                f"(count={len(matching)}, expected={expected_count}, max_size={max_size}, target={target_size_bytes})"
-            )
+    elif not groups:
+        no_op_reason = (
+            f"manifest layout already balanced ({balanced_count} content kind(s), target={target_size_bytes})"
+        )
 
-    return _Plan(
-        rewrite_id=rewrite_id,
-        matching_manifests=matching,
-        untouched_manifests=untouched,
-        bytes_rewritten=bytes_rewritten,
-        total_live_entries=total_live_entries,
-        no_op_reason=no_op_reason,
-    )
+    return _Plan(rewrite_id=rewrite_id, groups=groups, untouched_manifests=untouched, no_op_reason=no_op_reason)
 
 
 def _commit_attempt(
@@ -300,11 +357,12 @@ def _commit_attempt(
     table: PyIcebergTable,
     plan: _Plan,
     target_branch: str,
-    operation: Any,
+    operation: Operation,
     target_size_bytes: int,
     sort_by: list[str] | None,
     read_concurrency: int,
 ) -> RewriteManifestsResult:
+    """Write the new manifests and commit one REPLACE snapshot for ``plan``."""
     snapshot_props = {
         SNAPSHOT_PROP_MAINTENANCE_OP: SNAPSHOT_PROP_MAINTENANCE_OP_VALUE,
         SNAPSHOT_PROP_REWRITE_ID: plan.rewrite_id,
@@ -352,6 +410,7 @@ def _commit_attempt(
 
 
 def _spec_id_of_plan(plan: _Plan) -> int:
+    """Return the partition spec id shared by the manifests being repacked."""
     return int(plan.matching_manifests[0].partition_spec_id)
 
 
@@ -359,26 +418,22 @@ _PRODUCER_CLASS: type | None = None
 
 
 def _producer_class() -> type:
-    """Lazily build and cache the snapshot producer used for manifest rewrite.
-
-    The producer keeps the data and delete files unchanged: the new snapshot's
-    existing-manifest set is the untouched manifests plus the freshly written
-    ones, and no entries are marked deleted, which is what repacking manifests
-    requires.
-    """
+    """Build and cache the snapshot producer that commits a manifest rewrite."""
     global _PRODUCER_CLASS
     if _PRODUCER_CLASS is not None:
         return _PRODUCER_CLASS
 
     from pyiceberg.table.update.snapshot import _SnapshotProducer
 
-    class _RewriteManifestsProducer(_SnapshotProducer):  # type: ignore[misc, valid-type]
+    class _RewriteManifestsProducer(_SnapshotProducer):  # type: ignore[misc]
+        """Commit a REPLACE snapshot listing the untouched manifests plus the repacked ones."""
+
         def __init__(
             self,
             *,
-            operation: Any,
-            transaction: Any,
-            io: Any,
+            operation: Operation,
+            transaction: Transaction,
+            io: FileIO,
             branch: str,
             snapshot_properties: dict[str, str],
             commit_uuid: _uuid.UUID,
@@ -399,18 +454,20 @@ def _producer_class() -> type:
             self._target_size_bytes = target_size_bytes
             self._sort_by = sort_by
             self._read_concurrency = max(1, int(read_concurrency))
-            self._untouched_manifests: list[Any] = list(plan.untouched_manifests)
-            self._new_manifests: list[Any] = []
+            self._untouched_manifests: list[ManifestFile] = list(plan.untouched_manifests)
+            self._new_manifests: list[ManifestFile] = []
             self._bytes_added = 0
             self._entries_processed = 0
-            self._changed_partitions: set[tuple[int, tuple[Any, ...]]] = set()
+            self._changed_partitions: set[tuple[int, tuple[PartitionValue, ...]]] = set()
 
         @property
-        def new_manifests(self) -> list[Any]:
+        def new_manifests(self) -> list[ManifestFile]:
+            """Manifests written by this producer."""
             return self._new_manifests
 
         @property
         def bytes_added(self) -> int:
+            """Total length of the manifests written."""
             return self._bytes_added
 
         @property
@@ -423,15 +480,16 @@ def _producer_class() -> type:
             """Number of distinct partitions whose entries moved to a new manifest."""
             return len(self._changed_partitions)
 
-        def _existing_manifests(self) -> list[Any]:
+        def _existing_manifests(self) -> list[ManifestFile]:
+            """Return the untouched manifests followed by the new ones."""
             return list(self._untouched_manifests) + list(self._new_manifests)
 
-        def _deleted_entries(self) -> list[Any]:
+        def _deleted_entries(self) -> list[ManifestEntry]:
+            """Return no entries; a manifest rewrite deletes nothing."""
             return []
 
-        def _summary(self, snapshot_properties: dict[str, str]) -> Any:
-            # Manifest reshuffle leaves data totals unchanged, so carry them
-            # forward verbatim from the parent snapshot.
+        def _summary(self, snapshot_properties: dict[str, str]) -> Summary:
+            """Build the snapshot summary, carrying the parent's data totals forward unchanged."""
             from pyiceberg.table.snapshots import (
                 TOTAL_DATA_FILES,
                 TOTAL_DELETE_FILES,
@@ -465,47 +523,51 @@ def _producer_class() -> type:
             }
             return Summary(operation=Operation.REPLACE, **carry, **snapshot_properties)
 
-        def build_new_manifests(self) -> None:
-            """Read live entries from each matching manifest and write target-sized output.
+        def new_manifest_writer_for(self, content: ManifestContent, spec: PartitionSpec) -> ManifestWriter:
+            """Return a writer for a manifest of ``content`` under ``spec``."""
+            return manifest_writer_for(self, content, spec)
 
-            Entries cluster by ``(partition_spec_id, partition_key_tuple)`` so a
-            partition-scoped query reads one manifest per partition instead of
-            scanning across the rewritten set.
+        def build_new_manifests(self) -> None:
+            """Read live entries of each content kind and write target-sized manifests of that kind.
+
+            Entries are ordered by partition (or by the ``sort-by`` fields) and cut
+            into as many contiguous runs as the repacked bytes fill at the target
+            size, so a partition-scoped read touches few manifests.
             """
+            for group in self._plan.groups:
+                self._repack(group)
+
+        def _repack(self, group: _ContentGroup) -> None:
             from pyiceberg.manifest import ManifestEntry, ManifestEntryStatus
 
-            if not self._plan.matching_manifests:
-                return
-
             roll_at_bytes = int(self._target_size_bytes * _ROLL_FACTOR)
-            # Entry-count budget used only when the writer cannot report a running
-            # byte size; derived from the average entry size across the input set.
-            avg_bytes = max(
-                1,
-                self._plan.bytes_rewritten // max(1, self._plan.total_live_entries),
-            )
+            # The entry-count budget applies only when the writer cannot report a running byte size.
+            avg_bytes = max(1, group.bytes_rewritten // max(1, group.live_entries))
             fallback_roll_at_entries = max(1, int(roll_at_bytes / avg_bytes))
-
-            rollers: dict[tuple[int, tuple[Any, ...]], _RollingManifestWriter] = {}
             specs = self._transaction.table_metadata.specs()
 
-            for manifest, entries in self._read_entries():
+            ordered: list[tuple[int, ManifestEntry]] = []
+            for manifest, entries in self._read_entries(group.manifests):
                 spec_id = manifest.partition_spec_id
-                spec = specs[spec_id]
                 for entry in entries:
                     self._entries_processed += 1
                     self._changed_partitions.add((spec_id, tuple(entry.data_file.partition)))
-                    cluster_key = _cluster_key(entry.data_file, spec, self._sort_by)
-                    key = (spec_id, cluster_key)
-                    roller = rollers.get(key)
-                    if roller is None:
-                        roller = _RollingManifestWriter(
-                            producer=self,
-                            spec=spec,
-                            roll_at_bytes=roll_at_bytes,
-                            fallback_roll_at_entries=fallback_roll_at_entries,
-                        )
-                        rollers[key] = roller
+                    ordered.append((spec_id, entry))
+            if ordered and specs[ordered[0][0]].fields:
+                ordered.sort(
+                    key=lambda item: _ordering_key(_cluster_key(item[1].data_file, specs[item[0]], self._sort_by))
+                )
+
+            target_count = max(1, (group.bytes_rewritten + self._target_size_bytes - 1) // self._target_size_bytes)
+            for run in _even_runs(ordered, target_count):
+                roller = _RollingManifestWriter(
+                    open_writer=self.new_manifest_writer_for,
+                    content=group.content,
+                    spec=specs[run[0][0]],
+                    roll_at_bytes=roll_at_bytes,
+                    fallback_roll_at_entries=fallback_roll_at_entries,
+                )
+                for _, entry in run:
                     roller.add(
                         ManifestEntry.from_args(
                             status=ManifestEntryStatus.EXISTING,
@@ -515,25 +577,17 @@ def _producer_class() -> type:
                             data_file=entry.data_file,
                         )
                     )
-
-            for roller in rollers.values():
                 for mf in roller.finish():
                     self._new_manifests.append(mf)
                     self._bytes_added += int(mf.manifest_length)
 
-        def _read_entries(self) -> list[tuple[Any, list[Any]]]:
-            """Read live entries from each matching manifest, preserving input order.
-
-            With a read concurrency above one, manifests are fetched in parallel
-            and returned in their original order so the written output — and the
-            replay identity that depends on it — stays deterministic.
-            """
-            manifests = self._plan.matching_manifests
+        def _read_entries(self, manifests: list[ManifestFile]) -> list[tuple[ManifestFile, list[ManifestEntry]]]:
+            """Read live entries from each manifest, preserving input order."""
             if self._read_concurrency == 1 or len(manifests) <= 1:
                 return [(m, list(m.fetch_manifest_entry(self._io, discard_deleted=True))) for m in manifests]
             from concurrent.futures import ThreadPoolExecutor
 
-            def _read(m: Any) -> list[Any]:
+            def _read(m: ManifestFile) -> list[ManifestEntry]:
                 return list(m.fetch_manifest_entry(self._io, discard_deleted=True))
 
             workers = min(self._read_concurrency, len(manifests))
@@ -546,24 +600,19 @@ def _producer_class() -> type:
 
 
 class _RollingManifestWriter:
-    """Roll to a new manifest once the bytes written reach the target size.
-
-    Each added entry is serialized immediately, so the writer's running output
-    size is tracked and a new manifest is started when it reaches the byte
-    target. When the writer cannot report a running size, an entry-count budget
-    derived from the average entry size is used instead, keeping output bounded
-    either way.
-    """
+    """Roll to a new manifest once the bytes written reach the target size."""
 
     def __init__(
         self,
         *,
-        producer: _ManifestWriterFactory,
+        open_writer: ManifestWriterFactory,
+        content: ManifestContent,
         spec: PartitionSpec,
         roll_at_bytes: int,
         fallback_roll_at_entries: int,
     ):
-        self._producer = producer
+        self._open_writer = open_writer
+        self._content = content
         self._spec = spec
         self._roll_at_bytes = max(1, roll_at_bytes)
         self._fallback_roll_at_entries = max(1, fallback_roll_at_entries)
@@ -572,20 +621,23 @@ class _RollingManifestWriter:
         self._finished: list[ManifestFile] = []
 
     def add(self, entry: ManifestEntry) -> None:
+        """Add ``entry``, starting a new manifest first if the current one is full."""
         if self._writer is None or self._should_roll():
             self._close_writer()
-            self._writer = self._producer.new_manifest_writer(self._spec).__enter__()  # type: ignore[attr-defined]
+            self._writer = self._open_writer(self._content, self._spec).__enter__()
             self._count = 0
         self._writer.add_entry(entry)
         self._count += 1
 
     def _should_roll(self) -> bool:
+        """Return whether the open manifest has reached its size budget."""
         written = _manifest_writer_bytes(self._writer)
         if written is not None:
             return written >= self._roll_at_bytes
         return self._count >= self._fallback_roll_at_entries
 
     def _close_writer(self) -> None:
+        """Close the open manifest, if any, and record its manifest file."""
         if self._writer is None:
             return
         self._writer.__exit__(None, None, None)
@@ -593,16 +645,13 @@ class _RollingManifestWriter:
         self._writer = None
 
     def finish(self) -> list[ManifestFile]:
+        """Close the open manifest and return every manifest written."""
         self._close_writer()
         return self._finished
 
 
 def _manifest_writer_bytes(writer: ManifestWriter | None) -> int | None:
-    """Return the bytes written so far by an open manifest writer, or ``None``.
-
-    Reads the position of the underlying output stream, which advances as each
-    entry is serialized. Returns ``None`` when no running position is available.
-    """
+    """Return the bytes written so far by an open manifest writer, or ``None`` when unknown."""
     output_stream = getattr(getattr(writer, "_writer", None), "output_stream", None)
     tell = getattr(output_stream, "tell", None)
     if tell is None:
@@ -613,7 +662,7 @@ def _manifest_writer_bytes(writer: ManifestWriter | None) -> int | None:
         return None
 
 
-def _partition_values_in_order(partition: Any, n: int) -> list[Any]:
+def _partition_values_in_order(partition: Record, n: int) -> list[PartitionValue]:
     """Return a partition record's values aligned to its spec's field order."""
     try:
         return [partition[i] for i in range(n)]
@@ -625,14 +674,10 @@ def _partition_values_in_order(partition: Any, n: int) -> list[Any]:
         return list((getattr(partition, "__dict__", None) or {}).values())[:n]
 
 
-def _cluster_key(data_file: Any, spec: PartitionSpec, sort_by: list[str] | None) -> tuple[Any, ...]:
-    """Stable clustering key for a data file's partition.
-
-    Output entries that share this key are grouped into the same manifest, so a
-    query filtered on the corresponding partition fields reads fewer manifests.
-    By default the full partition tuple is used; ``sort_by`` restricts the key
-    to the named partition fields.
-    """
+def _cluster_key(
+    data_file: DataFile, spec: PartitionSpec, sort_by: list[str] | None
+) -> tuple[tuple[str, PartitionValue], ...]:
+    """Return the partition values that cluster a data file's entry into a manifest."""
     partition = getattr(data_file, "partition", None)
     if partition is None:
         return ()
@@ -643,6 +688,26 @@ def _cluster_key(data_file: Any, spec: PartitionSpec, sort_by: list[str] | None)
         wanted = set(sort_by)
         pairs = [(n, v) for n, v in pairs if n in wanted]
     return tuple(pairs)
+
+
+def _ordering_key(cluster_key: tuple[tuple[str, PartitionValue], ...]) -> tuple[tuple[int, PartitionValue], ...]:
+    """Return a total order over a clustering key that places a missing value first."""
+    return tuple((0, None) if value is None else (1, value) for _, value in cluster_key)
+
+
+def _even_runs(items: list[_T], count: int) -> list[list[_T]]:
+    """Cut ``items`` into up to ``count`` contiguous runs of near-equal length, dropping empty ones."""
+    if not items:
+        return []
+    count = max(1, min(count, len(items)))
+    size, remainder = divmod(len(items), count)
+    runs: list[list[_T]] = []
+    start = 0
+    for index in range(count):
+        end = start + size + (1 if index < remainder else 0)
+        runs.append(items[start:end])
+        start = end
+    return runs
 
 
 def _validate_sort_by(table: PyIcebergTable, spec_id: int, sort_by: list[str] | None) -> None:
@@ -659,6 +724,7 @@ def _validate_sort_by(table: PyIcebergTable, spec_id: int, sort_by: list[str] | 
 
 
 def _resolve_spec_id(table: PyIcebergTable, spec_id: int | None) -> int:
+    """Return ``spec_id`` validated against the table's specs, or the current spec id."""
     if spec_id is None:
         return int(table.spec().spec_id)
     if int(spec_id) not in {int(s) for s in table.specs().keys()}:
@@ -669,6 +735,7 @@ def _resolve_spec_id(table: PyIcebergTable, spec_id: int | None) -> int:
 
 
 def _resolve_branch(table: PyIcebergTable, branch: str | None) -> str:
+    """Return the branch to commit to, rejecting unknown names and tags."""
     from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRefType
 
     if branch is None:
@@ -689,6 +756,7 @@ def _resolve_rewrite_id(
     target_size_bytes: int,
     matching_manifest_paths: list[str],
 ) -> str:
+    """Derive a stable rewrite identity from the table, branch, spec, target and inputs."""
     payload = {
         "table_uuid": str(table.metadata.table_uuid),
         "branch": target_branch,
@@ -701,10 +769,13 @@ def _resolve_rewrite_id(
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
-def _lookup_idempotent_result(table: PyIcebergTable, rewrite_id: str) -> RewriteManifestsResult | None:
+def _lookup_idempotent_result(
+    table: PyIcebergTable, rewrite_id: str, target_branch: str | None
+) -> RewriteManifestsResult | None:
+    """Return the result recorded by an earlier run of this rewrite on the branch, if any."""
     if not rewrite_id:
         return None
-    for snap in list(table.metadata.snapshots or [])[-50:]:
+    for snap in branch_ancestry(table, target_branch):
         summary = _summary_as_dict(snap.summary)
         if (
             summary.get(SNAPSHOT_PROP_REWRITE_ID) == rewrite_id
@@ -721,7 +792,8 @@ def _lookup_idempotent_result(table: PyIcebergTable, rewrite_id: str) -> Rewrite
     return None
 
 
-def _summary_as_dict(summary: Any) -> dict[str, str]:
+def _summary_as_dict(summary: Summary | None) -> dict[str, str]:
+    """Return a snapshot summary's operation and properties as a flat string mapping."""
     if summary is None:
         return {}
     out: dict[str, str] = {}

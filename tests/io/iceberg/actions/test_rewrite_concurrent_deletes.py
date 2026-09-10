@@ -11,7 +11,7 @@ so the outcome is deterministic.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, ParamSpec, TypeVar, cast
 
 import pytest
 
@@ -19,16 +19,24 @@ pytest.importorskip("pyiceberg")
 
 from daft.catalog import Table
 from daft.io.iceberg import (
+    IcebergMaintenanceOptions,
     RewriteConflict,
-    _compact,  # noqa: internal — monkeypatching internal helper
+    _compact,  # internal helper, monkeypatched below
 )
 from tests.io.iceberg.actions._helpers import commit_positional_deletes, make_seeded_table
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from pyiceberg.table import Table as PyIcebergTable
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 _ROWS_PER_FILE = 100
 _DELETED_POSITIONS = list(range(10))
 
 
-def _rewrite_options(isolation: str) -> dict[str, Any]:
+def _rewrite_options(isolation: str) -> IcebergMaintenanceOptions:
     return {
         "rewrite-all": True,
         "min-input-files": 2,
@@ -36,29 +44,33 @@ def _rewrite_options(isolation: str) -> dict[str, Any]:
     }
 
 
-def _delete_from_the_first_input_file(table: Any) -> None:
+def _delete_from_the_first_input_file(table: PyIcebergTable) -> None:
     table.refresh()
     first = sorted(task.file.file_path for task in table.scan().plan_files())[0]
     commit_positional_deletes(table, {first: _DELETED_POSITIONS})
 
 
-def _inject_after_the_group_is_read(monkeypatch, action) -> dict[str, int]:
+def _inject_after_the_group_is_read(
+    monkeypatch: pytest.MonkeyPatch, action: Callable[[PyIcebergTable], None]
+) -> dict[str, int]:
     """Run ``action`` once, after the first group is read but before it commits."""
     state = {"fired": 0}
-    real_rewrite_group = _compact._rewrite_group
 
-    def instrumented(*args: Any, **kwargs: Any):
-        out = real_rewrite_group(*args, **kwargs)
-        if state["fired"] == 0:
-            state["fired"] = 1
-            action(kwargs["table"])
-        return out
+    def instrument(real_rewrite_group: Callable[_P, _R]) -> Callable[_P, _R]:
+        def instrumented(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+            out = real_rewrite_group(*args, **kwargs)
+            if state["fired"] == 0:
+                state["fired"] = 1
+                action(cast("PyIcebergTable", kwargs["table"]))
+            return out
 
-    monkeypatch.setattr(_compact, "_rewrite_group", instrumented)
+        return instrumented
+
+    monkeypatch.setattr(_compact, "_rewrite_group", instrument(_compact._rewrite_group))
     return state
 
 
-def _live_ids(table: Any) -> set[int]:
+def _live_ids(table: PyIcebergTable) -> set[int]:
     table.refresh()
     return {int(v) for v in table.scan().to_arrow().column("id").to_pylist()}
 

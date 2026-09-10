@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
 
 pytest.importorskip("pyiceberg")
+
 
 from daft.catalog import Table
 from tests.io.iceberg.actions._helpers import (
@@ -21,6 +23,11 @@ from tests.io.iceberg.actions._helpers import (
 from tests.io.iceberg.actions._helpers import (
     strip_scheme as _strip_scheme,
 )
+
+
+def _future() -> int:
+    """A cutoff every existing snapshot is older than, so retention is by count alone."""
+    return int(time.time() * 1000) + 60_000
 
 
 def test_rewrite_then_expire_cleans_orphan_data_files(make_tiny_table):
@@ -46,7 +53,7 @@ def test_rewrite_then_expire_cleans_orphan_data_files(make_tiny_table):
         assert os.path.exists(_strip_scheme(p))
     assert pre_paths.isdisjoint(post_rewrite_paths)
 
-    expire_result = dt.expire_snapshots(retain_last=1)
+    expire_result = dt.expire_snapshots(older_than=_future(), retain_last=1)
 
     table.refresh()
     assert _read_ids(table) == pre_ids
@@ -104,7 +111,7 @@ def test_full_maintenance_cycle(make_tiny_table):
     assert r2.snapshot_id is not None
     table.refresh()
 
-    r3 = dt.expire_snapshots(retain_last=1)
+    r3 = dt.expire_snapshots(older_than=_future(), retain_last=1)
     assert r3.deleted_data_files_count >= 8
     table.refresh()
 

@@ -22,7 +22,7 @@ from pyiceberg.transforms import IdentityTransform
 from pyiceberg.types import LongType, NestedField, StringType
 
 from daft.catalog import Table
-from daft.io.iceberg import _compact  # noqa: internal — monkeypatching internal helper
+from daft.io.iceberg import _compact  # internal helper, monkeypatched below
 
 
 def _make_partitioned(local_catalog, name: str):

@@ -1,13 +1,7 @@
-//! Z-order curve primitives.
+//! Z-order key encoding.
 //!
-//! Two-step pipeline:
-//!   1. `normalize_to_ordered_bytes` — encode each column's values as fixed-width byte
-//!      arrays whose lexicographic order matches the value's natural order.
-//!   2. `interleave_bits` — bit-interleave the per-column byte arrays into a single
-//!      binary key. Sorting rows by that key produces a Z-order (Morton) curve.
-//!
-//! Nulls normalize to a zero-filled slice of the column's encoded width and sort
-//! before any concrete value (nulls-first semantics).
+//! Each clustering column is encoded as fixed-width bytes whose lexicographic order
+//! matches value order, and the columns' bits are interleaved into one sortable key.
 
 use arrow::{
     array::{
@@ -22,14 +16,16 @@ use arrow::{
 
 use crate::errors::IcebergRewriteError;
 
-/// Column name used for the synthetic interleaved key during a z-order rewrite. The
-/// column is appended just long enough to sort, then projected away before write.
+/// Column name of the synthetic interleaved key during a z-order rewrite.
+///
+/// The column is appended just long enough to sort, then projected away before
+/// the write.
 pub const ZORDER_KEY_COL: &str = "__daft_zorder_key__";
 
 /// Fixed-width ordered encodings for one column, laid out end to end.
 ///
-/// One allocation per column rather than one per row, which matters because a
-/// rewrite encodes every row of every clustering column.
+/// Every row occupies exactly `width` bytes, so the column is one allocation
+/// rather than one per row.
 pub struct OrderedColumn {
     bytes: Vec<u8>,
     width: usize,
@@ -44,6 +40,9 @@ impl OrderedColumn {
     }
 
     /// Encoded bytes for one row.
+    ///
+    /// # Panics
+    /// Panics when `row` is not less than the number of rows encoded.
     #[must_use]
     pub fn row(&self, row: usize) -> &[u8] {
         &self.bytes[row * self.width..(row + 1) * self.width]
@@ -61,14 +60,10 @@ impl OrderedColumn {
     }
 }
 
-/// Bytes every whole number, floating point value, and date or timestamp is
-/// encoded into, matching the reference.
+/// Bytes every whole number, floating point value, date and timestamp is encoded into.
 ///
-/// The width is what keeps the clustering balanced. A column encoded at its
-/// natural width carries its significant bits at a lower offset than a wider
-/// one, so it reaches the high order bits of the interleaved key first and the
-/// wider column stops contributing. Encoding every number at one width puts
-/// their significant bits at the same offset, so neither dominates.
+/// Encoding every number at one width puts their significant bits at the same
+/// offset in the interleaved key, so no column dominates the clustering.
 const PRIMITIVE_WIDTH: usize = 8;
 
 /// Bytes a 128-bit decimal is encoded into, which is its natural width.
@@ -93,6 +88,10 @@ fn downcast<'a, T: 'static>(
 /// [`PRIMITIVE_WIDTH`] bytes, decimals to sixteen, and text and binary to
 /// `var_length_contribution` bytes by truncating or padding. Nulls encode to
 /// zeroes, which sorts them first.
+///
+/// # Errors
+/// Returns `IcebergRewriteError::UnsupportedZOrderType` when the array's type
+/// has no ordered encoding.
 pub fn normalize_to_ordered_bytes(
     array: &dyn Array,
     var_length_contribution: u32,
@@ -278,6 +277,9 @@ fn encode_float64(v: f64) -> [u8; 8] {
 /// zero, so the columns still carrying information keep the whole of the
 /// remaining key. Output shorter than the interleave is truncated, and output
 /// longer is left zero padded.
+///
+/// # Panics
+/// Panics when the columns do not all hold the same number of rows.
 pub fn interleave_bits(columns: &[OrderedColumn], output_size: u64) -> Vec<u8> {
     let output_bytes = output_size as usize;
     if columns.is_empty() || output_bytes == 0 {
@@ -315,8 +317,14 @@ pub fn interleave_bits(columns: &[OrderedColumn], output_size: u64) -> Vec<u8> {
 
 /// Build the z-order key as a `BinaryArray` for a set of input arrays.
 ///
-/// Each row's key is the bit-interleave of per-column ordered byte encodings, truncated
-/// to `max_output_size` bytes. The returned array length equals `arrays[0].len()`.
+/// Each row's key is the bit-interleave of the per-column ordered byte
+/// encodings, as long as those encodings together or `max_output_size` bytes,
+/// whichever is smaller. The returned array has `arrays[0].len()` rows.
+///
+/// # Errors
+/// Returns `IcebergRewriteError::InvalidOption` when `arrays` is empty or the
+/// arrays differ in length, and `IcebergRewriteError::UnsupportedZOrderType`
+/// when a column has no ordered encoding.
 pub fn build_zorder_key_array(
     arrays: &[ArrayRef],
     var_length_contribution: u32,
@@ -344,8 +352,11 @@ pub fn build_zorder_key_array(
             var_length_contribution,
         )?);
     }
-    let width = max_output_size as usize;
-    let keys = interleave_bits(&per_column, max_output_size);
+    // Sizing the key to the encodings together, up to the cap, interleaves every
+    // bit the columns carry and leaves no padding.
+    let total_width: usize = per_column.iter().map(OrderedColumn::width).sum();
+    let width = total_width.min(usize::try_from(max_output_size).unwrap_or(usize::MAX));
+    let keys = interleave_bits(&per_column, width as u64);
     let arr = BinaryArray::from_iter_values((0..n_rows).map(|r| &keys[r * width..(r + 1) * width]));
     Ok(arr.into_data())
 }
@@ -543,11 +554,8 @@ mod tests {
 
     #[test]
     fn interleave_two_columns_known_fixture() {
-        // Two columns, one byte each: 0xAA and 0xFF.
-        // Bits of A = 1010_1010, bits of B = 1111_1111.
-        // Interleaved (A bit then B bit) gives: 11 11 11 11 11 11 11 11 starting with A=1,B=1.
-        // Sequence: A0=1,B0=1, A1=0,B1=1, A2=1,B2=1, A3=0,B3=1, A4=1,B4=1, A5=0,B5=1, A6=1,B6=1, A7=0,B7=1
-        // → 11 01 11 01 11 01 11 01 = 0xDD 0xDD
+        // One byte each: A = 1010_1010 and B = 1111_1111 interleave, A bit first,
+        // into 1101_1101 1101_1101, which is 0xDD 0xDD.
         let cols = vec![column(&[&[0xAAu8]]), column(&[&[0xFFu8]])];
         let out = interleave_bits(&cols, 2);
         assert_eq!(out, vec![0xDDu8, 0xDDu8]);
@@ -575,7 +583,6 @@ mod tests {
         let data = build_zorder_key_array(&[a, b], 8, 16).unwrap();
         let arr = BinaryArray::from(data);
         assert_eq!(arr.len(), 3);
-        // Keys must differ pairwise.
         assert_ne!(arr.value(0), arr.value(1));
         assert_ne!(arr.value(1), arr.value(2));
     }

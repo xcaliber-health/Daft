@@ -164,7 +164,7 @@ The [user guide's Recovery section](../use-case/checkpointing.md#recovery) walks
 
 - **Marker recognition.** When a run crashes after the snapshot commits but before the store is marked done — or when the user deliberately re-runs with the same key — Daft walks `table.metadata.snapshots`, finds the marker, marks the store, and exits. No second snapshot. Returned DataFrame is empty.
 
-**Orphan files on crash.** A worker that crashed mid-task may leave parquet files unreferenced by any snapshot. Daft doesn't auto-clean these — use your Iceberg engine's orphan-file cleanup procedures.
+**Orphan files on crash.** A worker that crashed mid-task may leave parquet files unreferenced by any snapshot. Daft doesn't clean these up as part of the write — reclaim them with [`remove_orphan_files`](#table-maintenance) once they are older than any write that could still be in flight.
 
 ### Iceberg-Specific Notes
 
@@ -175,6 +175,97 @@ The [user guide's Recovery section](../use-case/checkpointing.md#recovery) walks
 - **Partitioned tables include a `partitioning` struct column in the result.** Whether `checkpoint=` is set or not — callers don't see schema drift when they toggle the flag.
 
 - **Transient retry on `CommitFailedException`.** Daft retries up to twice on this exception (concurrent-writer conflicts, lock contention). Other exceptions — REST 5xx, network errors, auth — propagate immediately. Wrap the call in your own retry policy if you need broader coverage.
+
+## Table Maintenance
+
+An Iceberg table accumulates small files, manifests, and history as it is written. Daft maintains a table through five operations on a catalog table handle, each following the semantics of Apache Iceberg's own maintenance actions so that a table maintained by Daft looks the same to every reader as one maintained by Spark.
+
+```python
+import daft
+from daft.catalog import Table
+
+table = Table.from_iceberg(pyiceberg_table)
+
+table.rewrite_data_files("binpack", where="region = 'us'")
+table.rewrite_position_delete_files()
+table.rewrite_manifests()
+table.expire_snapshots(older_than=cutoff, retain_last=100)
+table.remove_orphan_files(older_than=three_days_ago, dry_run=True)
+```
+
+Every operation (`rewrite_data_files`, `rewrite_position_delete_files`, `rewrite_manifests`, `expire_snapshots`, `remove_orphan_files`) retries its commit on conflict with exponential backoff bounded by the table's `commit.retry.*` properties, refuses to run when `gc.enabled` is `false` where it would delete files, and returns a result dataclass with the counts it changed.
+
+### `rewrite_data_files`
+
+Reads the data files that match `where`, groups them by partition, and rewrites each group into files close to the target size, committing a `replace` snapshot that swaps the inputs for the outputs. Rows are never changed; only their layout is.
+
+| Strategy  | What it does                                                                                       |
+|-----------|----------------------------------------------------------------------------------------------------|
+| `binpack` | Merges small files and splits oversized ones. The default.                                          |
+| `sort`    | Also orders each output by `sort_order`, recording the table's matching sort order id on the files. |
+| `zorder`  | Also clusters each output along an interleaved-bits curve over `zorder_by`.                         |
+
+Which files are selected follows Iceberg's size-based planner: a file is a candidate when it is smaller than `min-file-size-bytes` (75% of target), larger than `max-file-size-bytes` (180% of target), carries at least `delete-file-threshold` delete files, or has at least `delete-ratio-threshold` of its rows deleted. Candidates are packed into groups of at most `max-file-group-size-bytes`, and a group is rewritten when it holds at least `min-input-files` files, more than a target's worth of content, or a file selected for its deletes. `rewrite-all` rewrites everything.
+
+| Option                                | Default                     | Meaning                                                                                                                                       |
+|---------------------------------------|-----------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------|
+| `target-file-size-bytes`              | table `write.target-file-size-bytes`, else 512 MiB | Size each output aims at.                                                                                              |
+| `min-input-files`                     | 5                           | Files a group needs before it is worth rewriting on count alone.                                                                              |
+| `max-file-group-size-bytes`           | 100 GiB                     | Largest working set one group may hold.                                                                                                       |
+| `max-files-to-rewrite`                | unset                       | Cap on the files one call rewrites; the group straddling it is cut rather than dropped.                                                       |
+| `rewrite-job-order`                   | `none`                      | Order groups are committed in: `none`, `bytes-asc`, `bytes-desc`, `files-asc`, `files-desc`.                                                   |
+| `partial-progress.enabled`            | `false`                     | Commit batches of groups as they finish rather than the whole plan at once.                                                                   |
+| `partial-progress.max-commits`        | 10                          | Most commits one call makes; groups are cut into that many batches by plan position.                                                          |
+| `partial-progress.max-failed-commits` | `max-commits`               | Failed batches tolerated before the call raises.                                                                                              |
+| `max-concurrent-file-group-rewrites`  | 5                           | Groups rewritten at once, on any runner; the single-node engine shares one memory pool among them.                                              |
+| `use-starting-sequence-number`        | `true`                      | Stamp outputs with the plan snapshot's sequence number so existing row-level deletes keep applying.                                           |
+| `remove-dangling-deletes`             | `false`                     | After the rewrite, drop delete files that no live data file in their partition can be covered by, in a snapshot of their own.                   |
+| `conflict-isolation`                  | `snapshot`                  | `snapshot` refuses only when an input file was removed or a new row-level delete covers one; `serializable` also refuses any file added to a touched partition. |
+| `output-spec-id`                      | current spec                | Partition spec the outputs are written under.                                                                                                 |
+| `rewrite-id`                          | derived from the plan       | Identity for an idempotent replay: a call that finds its own snapshots returns their result without rewriting.                                |
+| `compression-factor`                  | measured                    | Expansion of sorted or z-ordered rows from disk into memory, seeding how the writer rolls files.                                              |
+| `shuffle-partitions-per-file`         | 1                           | Sort and z-order only: ordered output partitions per target file.                                                                             |
+| `max-output-size`, `var-length-contribution` | all bytes, 8         | Z-order only: cap on the key length, and bytes each string or binary column contributes.                                                      |
+
+What the commit guarantees:
+
+- **Existing deletes keep applying.** Outputs carry the plan snapshot's sequence number, so a position delete written before the rewrite still covers the rows it named, and a delete that no live data file can be covered by is dropped in the same commit, as any Iceberg commit drops it.
+- **Concurrent writers are tolerated, not trusted.** A commit is refused when one of its inputs is no longer live or when another writer landed a row-level delete on a file being replaced; committing over such a delete would bring the removed rows back. Appends to the same partition coexist with the rewrite under the default isolation.
+- **Nothing is left behind.** A batch whose commit is refused or exhausts its retries has its outputs deleted before the call goes on. Without partial progress any failure removes every output written so far before raising. Only a commit that fails for a reason other than a conflict keeps its files, because it may in fact have landed; orphan cleanup reclaims them.
+- **Replays are recognized.** Every snapshot carries the rewrite's identity, so the same call again returns the committed result rather than repeating the work.
+
+The returned `RewriteResult` reports `rewritten_files`, `added_files`, `bytes_rewritten`, `bytes_added`, `removed_delete_files`, `failed_groups`, `failed_data_files`, `commits`, `snapshot_ids`, and `rewrite_id`. Position and equality deletes are both applied while the inputs are read, following the specification's scope rules (an equality delete covers strictly older data files in its partition, or every partition when written under an unpartitioned spec), so a rewritten file carries no rows a delete had removed. Equality deletes count toward `delete-file-threshold` like position deletes.
+
+### `rewrite_position_delete_files`
+
+Packs the live position delete files of each partition into files of `write.delete.target-file-size-bytes` (64 MiB when absent) under the same size thresholds and options as `rewrite_data_files`: `target-file-size-bytes`, `min-file-size-bytes`, `max-file-size-bytes`, `min-input-files`, `rewrite-all`, `max-file-group-size-bytes`, `rewrite-job-order`, `partial-progress.enabled`, `partial-progress.max-commits`, `max-concurrent-file-group-rewrites` and `rewrite-id`. Rows naming a data file no longer live are dropped, the rest are written sorted by file and position, one packed file per data file (`write.delete.granularity=file`, the default) or per partition (`partition`), and the packed files replace the old ones at the highest sequence number of the files they replace, so the same rows stay deleted. A merge-on-read table that receives row-level deletes every commit needs this beside the data rewrite, which only removes the deletes of the files it rewrites.
+
+```python
+result = table.rewrite_position_delete_files()
+result.rewritten_delete_files, result.added_delete_files
+```
+
+### `rewrite_manifests`
+
+Repacks the current snapshot's data manifests and delete manifests for one partition spec, each kind on its own, into manifests close to `manifest-target-size-bytes` (table `commit.manifest.target-size-bytes`, else 8 MiB), clustered by partition or by the fields named in `sort-by`, and commits a `replace` snapshot that keeps every data file and delete file exactly as it was. A kind whose manifests are already as many as the target size calls for, none larger than the roll size and none without a live entry, is left alone. The result reports `rewritten_manifests_count`, `added_manifests_count`, `bytes_rewritten`, `bytes_added`, `rewrite_id`, and `snapshot_id`.
+
+### `expire_snapshots`
+
+Removes history following Iceberg's retention rules. Every branch keeps its head and walks its ancestry, keeping each snapshot while fewer than `retain_last` have been kept or the snapshot is at or after the `older_than` cutoff, and stopping at the first that is neither; a branch's own `max-snapshot-age-ms` and `min-snapshots-to-keep` take precedence. A tag keeps its snapshot until the tag ages past its `max-ref-age-ms`. A snapshot no branch or tag reaches is kept only while it is newer than the cutoff. `older_than` defaults to now less the table's `history.expire.max-snapshot-age-ms` (5 days), so `retain_last` on its own only floors what age would expire. Snapshots named in `snapshot_ids` expire regardless.
+
+Files that only the expired snapshots referenced are deleted when `clean_expired_files` is set, computed as the difference between the files reachable before and after the commit; `clean_expired_metadata` also deletes superseded table-metadata files. The result counts the data, delete, manifest, manifest-list, statistics, and metadata files removed.
+
+### `remove_orphan_files`
+
+Lists the table location and deletes every file that no snapshot, manifest, manifest list, statistics file, or metadata-log entry references and that is older than `older_than`. The cutoff must be at least 24 hours in the past unless `options={"allow-recent": True}`, because a file a running write has not yet committed looks exactly like an orphan. `location` narrows the listing to a subpath of the table, `dry_run` reports without deleting, and `prefix_mismatch_mode` decides what happens to files whose location has an unexpected scheme or authority (`error`, `delete`, or `ignore`). The result reports `orphan_files_count` and `deleted_files_count`.
+
+### Memory, spilling and the two runners
+
+Every operation streams. A bin-pack rewrite reads each file group through the scan and writes through a size-rolling writer. A sort or z-order holds the rows it orders under the runtime's memory budget, which is the machine or cgroup limit unless `DAFT_MEMORY_LIMIT` pins it; under pressure the sort spills sorted runs to `spill_dirs` and merges them back. The maintenance operations set no execution configuration of their own, so the runtime uses every core and all the memory it is given.
+
+The budget bounds the rows a sort buffers; the rest of a process's peak is the scan tasks in flight (one decoded input file each, up to `scantask_max_parallel`), the chunk being sorted for a spill (about twice the budget while it is concatenated and sorted), and the writer's open row group (`parquet_target_row_group_size`). Size a container from that sum rather than by lowering the runtime's defaults: a pod limit of about four times `DAFT_MEMORY_LIMIT` plus the scan parallelism times the largest decoded input leaves the defaults intact, and `spill_dirs` should point at a volume. Only where a pod cannot be sized that way does lowering `scantask_max_parallel` or the row-group size trade throughput for a lower peak.
+
+On the distributed runner each file group is one plan and groups run one at a time; within a plan the scan, the range shuffle and the writes are spread across workers, and per-task memory is bounded by the object store, which spills on its own. A clustering rewrite sorts over every input partition and then joins adjacent sorted ranges into as many partitions as the planner expects output files, so the files are even and a range query opens few of them.
 
 ## Type System
 
@@ -243,6 +334,8 @@ writers.
 
 Finally, we update the Iceberg table's metadata to include these new data files,
 and use a transaction to update the latest metadata pointer.
+
+The writer reads the table's `write.*` properties: `write.target-file-size-bytes`, `write.parquet.compression-codec` (zstd when absent) and `compression-level`, `row-group-size-bytes`, `page-size-bytes`, `page-row-limit` (20 000 rows when absent), `dict-size-bytes` (2 MiB when absent), `dict-encoding-enabled.column.<name>`, the bloom-filter settings, `write.data.path`, and `write.object-storage.enabled` with `write.object-storage.partitioned-paths`, which places each file under a hashed prefix so an object store spreads a hot table's requests. A column whose dictionary would cost more than the values it indexes, such as a unique key, is written plain unless the table says otherwise. Packed delete files follow `write.delete.parquet.*` where set, else the data settings. A `write.format.default` other than parquet is refused.
 
 ### Iceberg Architecture
 
@@ -382,7 +475,7 @@ column's value (identity) or use a *partition transform* to derive a partition v
 
 5. **How does Daft handle positional deletes vs equality deletes?**
 
-    *Daft currently only supports positional deletes, but V2 equality deletes are on the roadmap.*
+    *Table reads apply positional deletes; equality deletes are applied by the maintenance operations (`rewrite_data_files`), and support for them in reads is on the roadmap.*
 
 6. **Can Daft leverage Iceberg's metadata for predicate pushdown?**
 

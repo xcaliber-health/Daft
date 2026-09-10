@@ -22,7 +22,7 @@ def _current_manifest_count(table) -> int:
 
 
 def _small_target_opts():
-    return {"manifest-target-size-bytes": 64 * 1024 * 1024, "manifest-min-count-to-merge": 2}
+    return {"manifest-target-size-bytes": 64 * 1024 * 1024}
 
 
 def test_many_small_manifests_merge_into_one(make_tiny_table):
@@ -100,14 +100,20 @@ def test_invalid_branch_rejected(make_tiny_table):
         dt.rewrite_manifests(branch="nonexistent")
 
 
-def test_gc_enabled_false_rejected(make_tiny_table):
-    table = make_tiny_table(name="default.t_rm_gc", n_files=2, rows_per_file=2)
+def test_gc_disabled_does_not_block_a_manifest_rewrite(make_tiny_table):
+    # Arrange: the table forbids file deletion; a manifest rewrite deletes none.
+    table = make_tiny_table(name="default.t_rm_gc", n_files=6, rows_per_file=2)
     with table.transaction() as tx:
         tx.set_properties(**{"gc.enabled": "false"})
     table.refresh()
-    dt = Table.from_iceberg(table)
-    with pytest.raises(ValueError, match="gc.enabled=false"):
-        dt.rewrite_manifests(options=_small_target_opts())
+    live_before = {t.file.file_path for t in table.scan().plan_files()}
+
+    # Act
+    result = Table.from_iceberg(table).rewrite_manifests()
+
+    # Assert: it committed and every data file is still reachable.
+    assert result.snapshot_id is not None
+    assert {t.file.file_path for t in table.refresh().scan().plan_files()} == live_before
 
 
 def test_invalid_target_size_rejected(make_tiny_table):
@@ -267,3 +273,39 @@ def test_manifest_rewrite_records_the_standard_summary_counts(make_tiny_table):
     assert int(summary["manifests-kept"]) == 0
     assert int(summary["entries-processed"]) == 8
     assert int(summary["changed-partition-count"]) == 1
+
+
+def test_delete_manifests_are_repacked_as_delete_manifests(local_catalog):
+    """Each content kind is repacked on its own and keeps its declared content."""
+    from pyiceberg.manifest import ManifestContent
+
+    from tests.io.iceberg.actions._helpers import commit_equality_upsert, make_seeded_table
+
+    # Arrange: five upserts leave five single-entry delete manifests.
+    table = make_seeded_table(local_catalog, "default.t_manifests_deletes", n_files=3, rows_per_file=10)
+    for key in range(5):
+        commit_equality_upsert(
+            table, pa.table({"id": pa.array([key], type=pa.int64()), "label": pa.array([f"new-{key}"])}), ["id"]
+        )
+
+    table.refresh()
+    manifests_before = len(list(table.current_snapshot().manifests(table.io)))
+
+    # Act
+    result = Table.from_iceberg(table).rewrite_manifests()
+
+    # Assert: one delete manifest holding the five deletes, still declared as deletes.
+    table.refresh()
+    manifests = list(table.current_snapshot().manifests(table.io))
+    delete_manifests = [m for m in manifests if m.content == ManifestContent.DELETES]
+    assert len(delete_manifests) == 1
+    entries = delete_manifests[0].fetch_manifest_entry(table.io, discard_deleted=True)
+    assert sorted(int(e.data_file.content) for e in entries) == [2] * 5
+    assert all(
+        int(e.data_file.content) == 0
+        for m in manifests
+        if m.content == ManifestContent.DATA
+        for e in m.fetch_manifest_entry(table.io)
+    )
+    assert result.rewritten_manifests_count == manifests_before, "every manifest of both kinds went in"
+    assert result.added_manifests_count == 2

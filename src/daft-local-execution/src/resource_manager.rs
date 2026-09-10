@@ -385,7 +385,7 @@ mod tests {
     #[test]
     fn per_query_cap_denies_before_the_global_pool() {
         let manager = Arc::new(MemoryManager::new());
-        let capped = QueryMemoryScope::new(manager.clone(), Some(100));
+        let capped = QueryMemoryScope::new(manager, Some(100));
 
         let mut budget = SpillBudget::new(capped.clone());
         assert!(budget.try_grow(80));
@@ -413,7 +413,7 @@ mod tests {
     #[test]
     fn dropped_budget_releases_its_group_charge() {
         let manager = Arc::new(MemoryManager::new());
-        let capped = QueryMemoryScope::new(manager.clone(), Some(100));
+        let capped = QueryMemoryScope::new(manager, Some(100));
         {
             let mut budget = SpillBudget::new(capped.clone());
             assert!(budget.try_grow(90));

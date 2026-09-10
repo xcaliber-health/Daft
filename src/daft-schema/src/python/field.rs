@@ -46,6 +46,16 @@ impl PyField {
     pub fn eq(&self, other: &Self) -> PyResult<bool> {
         Ok(self.field.eq(&other.field))
     }
+
+    /// Return a copy of the field's metadata.
+    pub fn metadata(&self) -> PyResult<HashMap<String, String>> {
+        Ok(self
+            .field
+            .metadata
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect())
+    }
 }
 
 impl_bincode_py_state_serialization!(PyField);

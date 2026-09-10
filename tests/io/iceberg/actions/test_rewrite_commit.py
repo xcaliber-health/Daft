@@ -133,43 +133,24 @@ def test_occ_retry_exhausts_and_raises(make_tiny_table, monkeypatch):
     assert _snapshot_count(table) == pre_snaps, "no snapshot must land on full failure"
 
 
-def test_occ_aborts_when_input_files_vanish(make_tiny_table, monkeypatch):
+def test_occ_aborts_when_input_files_vanish(local_catalog, make_tiny_table, monkeypatch):
+    # Arrange: the first commit attempt fails, and before the retry another
+    # writer removes one of the rewrite's inputs by deleting its rows.
     table = make_tiny_table(name="default.t_occ_conflict", n_files=4, rows_per_file=3)
-    table_type = type(table)
-    original_scan = table_type.scan
-
-    # After the first commit attempt fails, hide one input file from subsequent
-    # `table.scan().plan_files()` calls — simulating a concurrent rewrite that
-    # already consumed it.
-    state = {"failed_once": False, "vanished_path": None}
+    competitor = local_catalog.load_table("default.t_occ_conflict")
 
     def behavior(n, real, tx):
         if n == 1:
-            # Capture a path we want to "vanish" from the table.
-            files = [t.file.file_path for t in original_scan(table).plan_files()]
-            state["vanished_path"] = files[0]
-            state["failed_once"] = True
+            competitor.refresh()
+            competitor.delete("id < 3")
             raise CommitFailedException("first attempt")
         return real(tx)
 
     _patch_commit(monkeypatch, behavior)
 
-    def filtering_scan(self, **kwargs):
-        scan = original_scan(self, **kwargs)
-        if state["failed_once"]:
-            real_plan = scan.plan_files
-            vanished = state["vanished_path"]
-
-            def filtered():
-                return [t for t in real_plan() if t.file.file_path != vanished]
-
-            scan.plan_files = filtered  # type: ignore[method-assign]
-        return scan
-
-    monkeypatch.setattr(table_type, "scan", filtering_scan)
-
+    # Act / Assert: the retry sees the removal in the history since the plan.
     dt = Table.from_iceberg(table)
-    with pytest.raises(RewriteConflict, match="input files vanished"):
+    with pytest.raises(RewriteConflict, match="removed input files"):
         dt.compact_files(options={"rewrite-all": True, "min-input-files": 2})
 
 
@@ -193,9 +174,17 @@ def test_partial_progress_creates_n_commits(local_catalog):
     assert result.failed_groups == 0
 
 
+def _data_files_on_disk(table) -> set[str]:
+    from pathlib import Path
+
+    location = table.location().replace("file://", "")
+    return {p.name for p in Path(location, "data").glob("*.parquet")}
+
+
 def test_partial_progress_failed_batch_aggregated(local_catalog, monkeypatch, caplog):
     table = _make_multifile_table(local_catalog, "default.t_pp_fail", n_files=4)
     pre_snaps = _snapshot_count(table)
+    originals = _data_files_on_disk(table)
 
     def behavior(n, real, tx):
         # First batch (call 1) succeeds. Second batch (calls 2..5) all raise → exhaust.
@@ -215,12 +204,115 @@ def test_partial_progress_failed_batch_aggregated(local_catalog, monkeypatch, ca
             }
         )
 
+    # The first batch landed; the second was refused and its outputs removed.
+    # On disk that leaves the originals (replaced inputs are reclaimed later by
+    # snapshot expiry) plus the first batch's outputs, and nothing else.
     assert result.commits == 1, "only the first batch should have committed"
-    assert result.failed_groups > 0
+    assert result.failed_groups == 2
+    assert result.failed_data_files == 2
     assert _snapshot_count(table) == pre_snaps + 1
-    assert any("orphan outputs" in rec.message for rec in caplog.records), (
-        f"expected an orphan-outputs WARNING; got: {[r.message for r in caplog.records]}"
+    table.refresh()
+    referenced = {t.file.file_path.rsplit("/", 1)[-1] for t in table.scan().plan_files()}
+    assert _data_files_on_disk(table) == originals | referenced, "the failed batch's outputs should be gone"
+    assert any("outputs are removed" in rec.message for rec in caplog.records)
+
+
+def test_partial_progress_commits_a_batch_before_later_groups_are_rewritten(local_catalog, monkeypatch):
+    # 4 singleton groups, 2 commits: the first batch must land while the
+    # second is still being written.
+    table = _make_multifile_table(local_catalog, "default.t_pp_streaming", n_files=4)
+    pre_snaps = _snapshot_count(table)
+    from daft.io.iceberg import _compact
+
+    real = _compact._rewrite_group
+    snapshots_seen: list[int] = []
+
+    def observing(*args, **kwargs):
+        kwargs["table"].refresh()
+        snapshots_seen.append(len(kwargs["table"].metadata.snapshots))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(_compact, "_rewrite_group", observing)
+    dt = Table.from_iceberg(table)
+    # One group at a time makes the moment of each commit observable.
+    result = dt.compact_files(
+        options={
+            **_MULTI_OPTS,
+            "partial-progress.enabled": True,
+            "partial-progress.max-commits": 2,
+            "max-concurrent-file-group-rewrites": 1,
+        }
     )
+
+    assert result.commits == 2
+    # The third and fourth groups saw the first batch's snapshot already committed.
+    assert snapshots_seen[:2] == [pre_snaps, pre_snaps]
+    assert snapshots_seen[2:] == [pre_snaps + 1, pre_snaps + 1]
+
+
+def test_partial_progress_skips_a_group_that_fails_to_rewrite(local_catalog, monkeypatch):
+    table = _make_multifile_table(local_catalog, "default.t_pp_group_fail", n_files=4)
+    pre_snaps = _snapshot_count(table)
+    from daft.io.iceberg import _compact
+
+    real = _compact._rewrite_group
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("injected rewrite failure")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(_compact, "_rewrite_group", flaky)
+    dt = Table.from_iceberg(table)
+    result = dt.compact_files(
+        options={**_MULTI_OPTS, "partial-progress.enabled": True, "partial-progress.max-commits": 2}
+    )
+
+    # Three groups landed across two commits; the failed one is reported.
+    assert result.commits == 2
+    assert result.rewritten_files == 3
+    assert result.failed_groups == 1
+    assert result.failed_data_files == 1
+    assert _snapshot_count(table) == pre_snaps + 2
+
+
+def test_atomic_rewrite_removes_its_outputs_when_the_commit_cannot_land(local_catalog, monkeypatch):
+    table = _make_multifile_table(local_catalog, "default.t_atomic_abort", n_files=4)
+    before = _data_files_on_disk(table)
+
+    def behavior(n, real, tx):
+        raise CommitFailedException(f"always fails (attempt {n})")
+
+    _patch_commit(monkeypatch, behavior)
+    dt = Table.from_iceberg(table)
+    with pytest.raises(Exception):
+        dt.compact_files(options=_MULTI_OPTS)
+
+    assert _data_files_on_disk(table) == before, "an aborted rewrite leaves nothing behind"
+
+
+def test_atomic_rewrite_removes_its_outputs_when_a_group_fails(local_catalog, monkeypatch):
+    table = _make_multifile_table(local_catalog, "default.t_atomic_group_abort", n_files=4)
+    before = _data_files_on_disk(table)
+    from daft.io.iceberg import _compact
+
+    real = _compact._rewrite_group
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise RuntimeError("injected rewrite failure")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(_compact, "_rewrite_group", flaky)
+    dt = Table.from_iceberg(table)
+    with pytest.raises(RuntimeError, match="injected"):
+        dt.compact_files(options=_MULTI_OPTS)
+
+    assert _data_files_on_disk(table) == before, "the groups written before the failure are removed"
 
 
 def test_idempotent_replay_across_partial_progress(local_catalog):
@@ -243,3 +335,38 @@ def test_idempotent_replay_across_partial_progress(local_catalog):
     assert r2.rewrite_id == rid
     assert r2.commits == r1.commits == 2
     assert sorted(r2.snapshot_ids) == sorted(r1.snapshot_ids)
+
+
+def test_groups_are_rewritten_concurrently_within_the_bound(local_catalog, monkeypatch):
+    # Arrange: four singleton groups and a bound of two; observe how many
+    # group rewrites are inside the engine at once.
+    import threading
+
+    table = _make_multifile_table(local_catalog, "default.t_concurrent_groups", n_files=4)
+    from daft.io.iceberg import _compact
+
+    real = _compact._rewrite_group
+    lock = threading.Lock()
+    state = {"active": 0, "peak": 0}
+
+    def observing(*args, **kwargs):
+        with lock:
+            state["active"] += 1
+            state["peak"] = max(state["peak"], state["active"])
+        try:
+            return real(*args, **kwargs)
+        finally:
+            with lock:
+                state["active"] -= 1
+
+    monkeypatch.setattr(_compact, "_rewrite_group", observing)
+    before = _snapshot_count(table)
+
+    # Act
+    result = Table.from_iceberg(table).compact_files(options={**_MULTI_OPTS, "max-concurrent-file-group-rewrites": 2})
+
+    # Assert: overlap happened, stayed within the bound, and the commit is whole.
+    assert state["peak"] == 2
+    assert result.rewritten_files == 4
+    assert result.commits == 1
+    assert _snapshot_count(table) == before + 1

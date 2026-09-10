@@ -1,3 +1,5 @@
+//! Python bindings for the rewrite planner and the z-order key encoder.
+
 use arrow::array::{ArrayRef, make_array};
 use common_arrow_ffi::{ToPyArrow, array_to_rust};
 use pyo3::{
@@ -14,20 +16,8 @@ use crate::{
     zorder::build_zorder_key_array,
 };
 
-pyo3::create_exception!(
-    daft.daft,
-    EqualityDeletesPresentError,
-    pyo3::exceptions::PyException,
-    "Equality deletes prevent rewrite; apply them first."
-);
-
 fn err_to_py(e: IcebergRewriteError) -> PyErr {
     match e {
-        IcebergRewriteError::EqualityDeletesPresent { ref sample, .. } => {
-            EqualityDeletesPresentError::new_err(format!(
-                "equality deletes present in files: {sample:?}"
-            ))
-        }
         IcebergRewriteError::InvalidOption { .. } => PyValueError::new_err(e.to_string()),
         IcebergRewriteError::UnsupportedZOrderType { .. } => PyValueError::new_err(e.to_string()),
         IcebergRewriteError::UnknownOutputSpec { .. } => PyValueError::new_err(e.to_string()),
@@ -44,8 +34,10 @@ macro_rules! get_opt {
     }};
 }
 
-/// Every option the planner reads. A key outside this set is refused rather than
-/// ignored, so a mistyped option fails instead of quietly doing nothing.
+/// Every option key the planner reads.
+///
+/// A key outside this set is refused rather than ignored, so a mistyped option
+/// fails instead of quietly doing nothing.
 const SUPPORTED_OPTIONS: &[&str] = &[
     "compression-factor",
     "delete-file-threshold",
@@ -166,7 +158,8 @@ fn candidate_from_dict(d: &Bound<'_, PyDict>) -> PyResult<CandidateFile> {
     let partition_spec_id = get_opt!(d, "partition_spec_id", i32).unwrap_or(0);
     let positional_delete_paths =
         get_opt!(d, "positional_delete_paths", Vec<String>).unwrap_or_default();
-    let has_equality_deletes = get_opt!(d, "has_equality_deletes", bool).unwrap_or(false);
+    let equality_delete_paths =
+        get_opt!(d, "equality_delete_paths", Vec<String>).unwrap_or_default();
     let record_count = get_opt!(d, "record_count", u64).unwrap_or(0);
     let deleted_record_count = get_opt!(d, "deleted_record_count", u64).unwrap_or(0);
     Ok(CandidateFile {
@@ -175,7 +168,7 @@ fn candidate_from_dict(d: &Bound<'_, PyDict>) -> PyResult<CandidateFile> {
         partition_key,
         partition_spec_id,
         positional_delete_paths,
-        has_equality_deletes,
+        equality_delete_paths,
         record_count,
         deleted_record_count,
     })
@@ -196,7 +189,7 @@ fn group_to_dict<'py>(py: Python<'py>, g: &FileGroup) -> PyResult<Bound<'py, PyD
         fd.set_item("partition_key", &f.partition_key)?;
         fd.set_item("partition_spec_id", f.partition_spec_id)?;
         fd.set_item("positional_delete_paths", &f.positional_delete_paths)?;
-        fd.set_item("has_equality_deletes", f.has_equality_deletes)?;
+        fd.set_item("equality_delete_paths", &f.equality_delete_paths)?;
         fd.set_item("record_count", f.record_count)?;
         fd.set_item("deleted_record_count", f.deleted_record_count)?;
         files.append(fd)?;
@@ -207,8 +200,9 @@ fn group_to_dict<'py>(py: Python<'py>, g: &FileGroup) -> PyResult<Bound<'py, PyD
 
 /// Group candidate files into rewrite units.
 ///
-/// `candidates` is a list of dicts shaped like `CandidateFile`. `options` is a dict of
-/// option keys (kebab-case). Returns a list of group dicts ordered by `rewrite-job-order`.
+/// `candidates` is a list of dicts shaped like `CandidateFile` and `options` is a
+/// dict of kebab-case option keys. Returns a list of group dicts ordered by
+/// `rewrite-job-order`.
 #[pyfunction]
 #[pyo3(signature = (candidates, options, current_spec_id))]
 fn plan_file_groups_py<'py>(
@@ -291,11 +285,11 @@ fn validate_options_py<'py>(
     Ok(d)
 }
 
-/// Build the synthetic z-order key column as a `pyarrow.Array` of binary.
+/// Build the synthetic z-order key column as a binary array.
 ///
-/// `arrays` is a Python list of pyarrow arrays (one per z-order column, equal length).
-/// `var_length_contribution` controls how many bytes string/binary columns contribute;
-/// `max_output_size` caps the final interleaved key byte length.
+/// `arrays` is a list of arrays, one per z-order column and all of one length.
+/// `var_length_contribution` is the number of bytes a text or binary column
+/// contributes and `max_output_size` caps the interleaved key's byte length.
 #[pyfunction]
 #[pyo3(signature = (arrays, var_length_contribution, max_output_size))]
 fn build_zorder_key_py<'py>(
@@ -315,18 +309,19 @@ fn build_zorder_key_py<'py>(
     data.to_pyarrow(arrays.py())
 }
 
+/// Register the `_iceberg` submodule and its functions under `parent`.
+///
+/// # Errors
+/// Returns an error when the submodule or any of its functions cannot be created.
 pub fn register_modules(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = parent.py();
     let m = PyModule::new(py, "_iceberg")?;
     m.add_function(wrap_pyfunction!(plan_file_groups_py, &m)?)?;
     m.add_function(wrap_pyfunction!(validate_options_py, &m)?)?;
     m.add_function(wrap_pyfunction!(build_zorder_key_py, &m)?)?;
-    m.add(
-        "EqualityDeletesPresentError",
-        py.get_type::<EqualityDeletesPresentError>(),
-    )?;
     parent.add_submodule(&m)?;
-    // Mirror parent module name so `import daft.daft._iceberg` resolves.
+    // A submodule added this way is not importable by dotted path until it is
+    // also registered in `sys.modules`.
     py.import("sys")?
         .getattr("modules")?
         .set_item("daft.daft._iceberg", &m)

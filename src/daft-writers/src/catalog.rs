@@ -4,7 +4,10 @@ use daft_logical_plan::{CatalogType, DeltaLakeCatalogInfo, IcebergCatalogInfo};
 use daft_micropartition::MicroPartition;
 use daft_recordbatch::RecordBatch;
 
-use crate::{AsyncFileWriter, WriterFactory, pyarrow::PyArrowWriter};
+use crate::{
+    AsyncFileWriter, WriterFactory,
+    pyarrow::{IcebergFileLayout, PyArrowWriter},
+};
 
 /// CatalogWriterFactory is a factory for creating Catalog writers, i.e. iceberg, delta writers.
 pub struct CatalogWriterFactory {
@@ -78,8 +81,10 @@ pub fn create_pyarrow_catalog_writer(
                 file_idx,
                 iceberg_schema,
                 iceberg_properties,
-                *partition_spec_id,
-                *sort_order_id,
+                IcebergFileLayout {
+                    partition_spec_id: *partition_spec_id,
+                    sort_order_id: *sort_order_id,
+                },
                 partition_values,
                 io_config.as_ref(),
             )?;

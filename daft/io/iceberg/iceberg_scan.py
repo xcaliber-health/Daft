@@ -130,7 +130,14 @@ class IcebergScanOperator(ScanOperator):
         )
 
         self._schema = convert_iceberg_schema(iceberg_schema)
-        self._partition_keys = iceberg_partition_spec_to_fields(iceberg_schema, self._iceberg_table.spec())
+        # A file carries the partition values of the layout it was written
+        # under, so once a table has been laid out more than one way, a
+        # condition on the current layout cannot be used to skip files.
+        self._partition_keys = (
+            iceberg_partition_spec_to_fields(iceberg_schema, self._iceberg_table.spec())
+            if len(self._iceberg_table.specs()) == 1
+            else []
+        )
 
     def schema(self) -> Schema:
         return self._schema

@@ -2261,6 +2261,30 @@ class KeyFilteringConfig:
         filter_batch_size: int | None = None,
     ) -> None: ...
 
+class MergeClause:
+    """One rule of a row-level merge."""
+
+    def __init__(
+        self,
+        action: str,
+        outputs: list[PyExpr],
+        condition: PyExpr | None = None,
+    ) -> None: ...
+
+class MergeRowsConfig:
+    """The rules of one row-level merge, grouped by which side of a pair exists."""
+
+    def __init__(
+        self,
+        matched: list[MergeClause],
+        not_matched: list[MergeClause],
+        not_matched_by_source: list[MergeClause],
+        target_present: PyExpr,
+        source_present: PyExpr,
+        row_id: list[PyExpr],
+        action_column: str,
+    ) -> None: ...
+
 class LogicalPlanBuilder:
     """A logical plan builder, which simplifies constructing logical plans via a fluent interface.
 
@@ -2356,6 +2380,7 @@ class LogicalPlanBuilder:
     def intersect(self, other: LogicalPlanBuilder, is_all: bool) -> LogicalPlanBuilder: ...
     def except_(self, other: LogicalPlanBuilder, is_all: bool) -> LogicalPlanBuilder: ...
     def add_monotonically_increasing_id(self, column_name: str | None) -> LogicalPlanBuilder: ...
+    def merge_rows(self, config: MergeRowsConfig) -> LogicalPlanBuilder: ...
     def table_write(
         self,
         root_dir: str,

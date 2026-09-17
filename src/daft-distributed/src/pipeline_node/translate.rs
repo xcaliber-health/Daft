@@ -25,7 +25,7 @@ use crate::{
         DistributedPipelineNode, NodeID, concat::ConcatNode, distinct::DistinctNode,
         explode::ExplodeNode, filter::FilterNode, glob_scan_source::GlobScanSourceNode,
         in_memory_source::InMemorySourceNode, into_batches::IntoBatchesNode,
-        into_partitions::IntoPartitionsNode, limit::LimitNode,
+        into_partitions::IntoPartitionsNode, limit::LimitNode, merge_rows::MergeRowsNode,
         monotonically_increasing_id::MonotonicallyIncreasingIdNode, pivot::PivotNode,
         project::ProjectNode, random_shuffle::RandomShuffleNode, sample::SampleNode,
         scan_source::ScanSourceNode, sink::SinkNode, sort::SortNode,
@@ -221,6 +221,19 @@ impl TreeNodeVisitor for LogicalPlanToPipelineNodeTranslator {
                         expr,
                         udf.udf_properties.clone(),
                         passthrough_columns,
+                        node.schema(),
+                        self.curr_node.pop().unwrap(),
+                    )),
+                    &self.meter,
+                )
+            }
+            LogicalPlan::MergeRows(merge_rows) => {
+                let config = merge_rows.config.bind(&merge_rows.input.schema())?;
+                DistributedPipelineNode::new(
+                    Arc::new(MergeRowsNode::new(
+                        self.get_next_pipeline_node_id(),
+                        &self.plan_config,
+                        config,
                         node.schema(),
                         self.curr_node.pop().unwrap(),
                     )),

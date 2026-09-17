@@ -9,6 +9,7 @@ mod into_partitions;
 pub mod join;
 pub mod key_filtering;
 mod limit;
+pub mod merge_rows;
 mod monotonically_increasing_id;
 mod offset;
 mod pivot;
@@ -43,6 +44,7 @@ pub use key_filtering::KeyFilteringConfig;
 #[cfg(feature = "python")]
 pub use key_filtering::PyKeyFilteringConfig;
 pub use limit::Limit;
+pub use merge_rows::MergeRows;
 pub use monotonically_increasing_id::MonotonicallyIncreasingId;
 pub use offset::Offset;
 pub use pivot::Pivot;

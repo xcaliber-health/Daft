@@ -11,6 +11,7 @@ from daft.daft import (
     IOConfig,
     JoinStrategy,
     JoinType,
+    MergeRowsConfig,
     PyDaftExecutionConfig,
     PyFormatSinkOption,
     ScanOperatorHandle,
@@ -369,6 +370,10 @@ class LogicalPlanBuilder:
     def add_monotonically_increasing_id(self, column_name: str | None) -> LogicalPlanBuilder:
         builder = self._builder.add_monotonically_increasing_id(column_name)
         return LogicalPlanBuilder(builder)
+
+    def merge_rows(self, config: MergeRowsConfig) -> LogicalPlanBuilder:
+        """Apply row-level merge rules to a joined stream of target and source rows."""
+        return LogicalPlanBuilder(self._builder.merge_rows(config))
 
     def write_tabular(
         self,

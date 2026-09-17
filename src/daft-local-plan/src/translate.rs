@@ -592,6 +592,20 @@ fn translate_helper(
             );
             translate_helper(&into_partitions.input, source_counter, psets)
         }
+        LogicalPlan::MergeRows(merge_rows) => {
+            let (input_plan, inputs) = translate_helper(&merge_rows.input, source_counter, psets)?;
+            let config = merge_rows.config.bind(&merge_rows.input.schema())?;
+            Ok((
+                LocalPhysicalPlan::merge_rows(
+                    input_plan,
+                    config,
+                    merge_rows.schema.clone(),
+                    merge_rows.stats_state.clone(),
+                    LocalNodeContext::default(),
+                ),
+                inputs,
+            ))
+        }
         LogicalPlan::MonotonicallyIncreasingId(monotonically_increasing_id) => {
             let (input_plan, inputs) =
                 translate_helper(&monotonically_increasing_id.input, source_counter, psets)?;

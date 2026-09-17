@@ -3,6 +3,7 @@
 pub mod builder;
 pub mod display;
 pub mod logical_plan;
+pub mod merge_info;
 pub mod ops;
 pub mod optimization;
 pub mod partitioning;
@@ -22,6 +23,7 @@ use daft_scan::{
     WarcSourceConfig, python::PyFileFormatConfig,
 };
 pub use logical_plan::{LogicalPlan, LogicalPlanRef};
+pub use merge_info::{MergeActionKind, MergeClause, MergeRowsConfig};
 pub use ops::join::JoinOptions;
 pub use partitioning::ClusteringSpec;
 #[cfg(feature = "python")]
@@ -56,6 +58,8 @@ pub fn register_modules(parent: &Bound<PyModule>) -> PyResult<()> {
     parent.add_class::<DatabaseSourceConfig>()?;
     parent.add_class::<JoinOptions>()?;
     parent.add_class::<ops::PyKeyFilteringConfig>()?;
+    parent.add_class::<merge_info::PyMergeClause>()?;
+    parent.add_class::<merge_info::PyMergeRowsConfig>()?;
     parent.add_function(wrap_pyfunction!(logical_plan_table_scan, parent)?)?;
 
     Ok(())

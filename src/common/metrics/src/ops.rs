@@ -22,6 +22,7 @@ pub enum NodeType {
     Explode,
     Filter,
     IntoBatches,
+    MergeRows,
     Project,
     Sample,
     StageCheckpointKeys,

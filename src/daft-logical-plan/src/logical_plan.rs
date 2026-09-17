@@ -58,6 +58,7 @@ pub enum LogicalPlan {
     Sample(Sample),
     Shuffle(Shuffle),
     MonotonicallyIncreasingId(MonotonicallyIncreasingId),
+    MergeRows(MergeRows),
     StageCheckpointKeys(StageCheckpointKeys),
     SubqueryAlias(SubqueryAlias),
     Window(Window),
@@ -182,7 +183,8 @@ impl LogicalPlan {
             Self::Sink(Sink { schema, .. }) => schema.clone(),
             Self::Sample(Sample { input, .. }) => input.schema(),
             Self::Shuffle(Shuffle { input, .. }) => input.schema(),
-            Self::MonotonicallyIncreasingId(MonotonicallyIncreasingId { schema, .. }) => {
+            Self::MergeRows(MergeRows { schema, .. })
+            | Self::MonotonicallyIncreasingId(MonotonicallyIncreasingId { schema, .. }) => {
                 schema.clone()
             }
             Self::StageCheckpointKeys(StageCheckpointKeys { input, .. }) => input.schema(),
@@ -203,7 +205,8 @@ impl LogicalPlan {
             | Self::Offset(..)
             | Self::Sample(..)
             | Self::StageCheckpointKeys(..)
-            | Self::MonotonicallyIncreasingId(..) => RequiredCols::new(IndexSet::new(), None),
+            | Self::MonotonicallyIncreasingId(..)
+            | Self::MergeRows(..) => RequiredCols::new(IndexSet::new(), None),
             Self::Concat(..) => RequiredCols::new(IndexSet::new(), Some(IndexSet::new())),
             Self::Project(projection) => {
                 let res = projection
@@ -424,6 +427,7 @@ impl LogicalPlan {
             Self::Sample(..) => "Sample",
             Self::Shuffle(..) => "Shuffle",
             Self::MonotonicallyIncreasingId(..) => "MonotonicallyIncreasingId",
+            Self::MergeRows(..) => "MergeRows",
             Self::StageCheckpointKeys(..) => "StageCheckpointKeys",
             Self::SubqueryAlias(..) => "Alias",
             Self::Window(..) => "Window",
@@ -457,6 +461,7 @@ impl LogicalPlan {
             | Self::Sample(Sample { stats_state, .. })
             | Self::Shuffle(Shuffle { stats_state, .. })
             | Self::MonotonicallyIncreasingId(MonotonicallyIncreasingId { stats_state, .. })
+            | Self::MergeRows(MergeRows { stats_state, .. })
             | Self::StageCheckpointKeys(StageCheckpointKeys { stats_state, .. })
             | Self::Window(Window { stats_state, .. })
             | Self::TopN(TopN { stats_state, .. })
@@ -500,6 +505,7 @@ impl LogicalPlan {
             Self::Sink(plan) => Self::Sink(plan.with_materialized_stats()),
             Self::Sample(plan) => Self::Sample(plan.with_materialized_stats()),
             Self::Shuffle(plan) => Self::Shuffle(plan.with_materialized_stats()),
+            Self::MergeRows(plan) => Self::MergeRows(plan.with_materialized_stats()),
             Self::MonotonicallyIncreasingId(plan) => {
                 Self::MonotonicallyIncreasingId(plan.with_materialized_stats())
             }
@@ -547,6 +553,7 @@ impl LogicalPlan {
             Self::MonotonicallyIncreasingId(monotonically_increasing_id) => {
                 monotonically_increasing_id.multiline_display()
             }
+            Self::MergeRows(merge_rows) => merge_rows.multiline_display(),
             Self::StageCheckpointKeys(stage) => stage.multiline_display(),
             Self::SubqueryAlias(alias) => alias.multiline_display(),
             Self::Window(window) => window.multiline_display(),
@@ -584,6 +591,7 @@ impl LogicalPlan {
             Self::MonotonicallyIncreasingId(MonotonicallyIncreasingId { input, .. }) => {
                 vec![input]
             }
+            Self::MergeRows(MergeRows { input, .. }) => vec![input],
             Self::StageCheckpointKeys(StageCheckpointKeys { input, .. }) => vec![input],
             Self::SubqueryAlias(SubqueryAlias { input, .. }) => vec![input],
             Self::Window(Window { input, .. }) => vec![input],
@@ -706,6 +714,9 @@ impl LogicalPlan {
                     )
                     .unwrap(),
                 ),
+                Self::MergeRows(MergeRows { config, .. }) => {
+                    Self::MergeRows(MergeRows::try_new(input.clone(), config.clone()).unwrap())
+                }
                 Self::Unpivot(Unpivot {
                     ids,
                     values,
@@ -1057,6 +1068,7 @@ impl LogicalPlan {
             | Self::Sample(Sample { plan_id, .. })
             | Self::Shuffle(Shuffle { plan_id, .. })
             | Self::MonotonicallyIncreasingId(MonotonicallyIncreasingId { plan_id, .. })
+            | Self::MergeRows(MergeRows { plan_id, .. })
             | Self::StageCheckpointKeys(StageCheckpointKeys { plan_id, .. })
             | Self::SubqueryAlias(SubqueryAlias { plan_id, .. })
             | Self::Window(Window { plan_id, .. })
@@ -1092,6 +1104,7 @@ impl LogicalPlan {
             | Self::Sample(Sample { node_id, .. })
             | Self::Shuffle(Shuffle { node_id, .. })
             | Self::MonotonicallyIncreasingId(MonotonicallyIncreasingId { node_id, .. })
+            | Self::MergeRows(MergeRows { node_id, .. })
             | Self::StageCheckpointKeys(StageCheckpointKeys { node_id, .. })
             | Self::SubqueryAlias(SubqueryAlias { node_id, .. })
             | Self::Window(Window { node_id, .. })
@@ -1131,6 +1144,7 @@ impl LogicalPlan {
             Self::Sink(sink) => Self::Sink(sink.with_plan_id(plan_id)),
             Self::Sample(sample) => Self::Sample(sample.with_plan_id(plan_id)),
             Self::Shuffle(shuffle) => Self::Shuffle(shuffle.with_plan_id(plan_id)),
+            Self::MergeRows(merge_rows) => Self::MergeRows(merge_rows.with_plan_id(plan_id)),
             Self::MonotonicallyIncreasingId(monotonically_increasing_id) => {
                 Self::MonotonicallyIncreasingId(monotonically_increasing_id.with_plan_id(plan_id))
             }
@@ -1177,6 +1191,7 @@ impl LogicalPlan {
             Self::Sink(sink) => Self::Sink(sink.with_node_id(node_id)),
             Self::Sample(sample) => Self::Sample(sample.with_node_id(node_id)),
             Self::Shuffle(shuffle) => Self::Shuffle(shuffle.with_node_id(node_id)),
+            Self::MergeRows(merge_rows) => Self::MergeRows(merge_rows.with_node_id(node_id)),
             Self::MonotonicallyIncreasingId(monotonically_increasing_id) => {
                 Self::MonotonicallyIncreasingId(monotonically_increasing_id.with_node_id(node_id))
             }
@@ -1298,5 +1313,6 @@ impl_from_data_struct_for_logical_plan!(Sink);
 impl_from_data_struct_for_logical_plan!(Sample);
 impl_from_data_struct_for_logical_plan!(Shuffle);
 impl_from_data_struct_for_logical_plan!(MonotonicallyIncreasingId);
+impl_from_data_struct_for_logical_plan!(MergeRows);
 impl_from_data_struct_for_logical_plan!(Window);
 impl_from_data_struct_for_logical_plan!(TopN);

@@ -318,6 +318,7 @@ impl OptimizerRule for PushDownAntiSemiJoin {
                     | LogicalPlan::Union(..)
                     | LogicalPlan::Sink(..)
                     | LogicalPlan::MonotonicallyIncreasingId(..)
+                    | LogicalPlan::MergeRows(..)
                     | LogicalPlan::SubqueryAlias(..)
                     | LogicalPlan::Window(..)
                     | LogicalPlan::Source(_)

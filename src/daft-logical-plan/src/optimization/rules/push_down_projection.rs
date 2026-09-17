@@ -509,8 +509,10 @@ impl PushDownProjection {
                 // since Intersect implicitly requires all parent columns.
                 Ok(Transformed::no(plan))
             }
-            LogicalPlan::Pivot(_) | LogicalPlan::MonotonicallyIncreasingId(_) => {
-                // Cannot push down past a Pivot/MonotonicallyIncreasingId because it changes the schema.
+            LogicalPlan::Pivot(_)
+            | LogicalPlan::MonotonicallyIncreasingId(_)
+            | LogicalPlan::MergeRows(_) => {
+                // These rewrite the schema, so a projection cannot move past them.
                 Ok(Transformed::no(plan))
             }
             LogicalPlan::Window(_) => {

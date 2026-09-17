@@ -103,6 +103,10 @@ pub(crate) fn to_json_value(node: &LogicalPlan) -> serde_json::Value {
         LogicalPlan::MonotonicallyIncreasingId(monotonically_increasing_id) => json!({
             "column_name": vec![resolved_col(monotonically_increasing_id.column_name.clone()).to_string()]
         }),
+        LogicalPlan::MergeRows(merge_rows) => json!({
+            "action_column": merge_rows.config.action_column,
+            "rules": merge_rows.config.clauses().count(),
+        }),
         LogicalPlan::StageCheckpointKeys(stage) => json!({
             "key_column": stage.checkpoint_config.key_column,
         }),

@@ -19,7 +19,7 @@ use daft_dsl::{
     functions::python::{RuntimePyObject, UDFProperties, get_resource_request},
 };
 use daft_logical_plan::{
-    InMemoryInfo, OutputFileInfo,
+    InMemoryInfo, MergeRowsConfig, OutputFileInfo,
     partitioning::RepartitionSpec,
     stats::{PlanStats, StatsState},
 };
@@ -88,6 +88,7 @@ pub enum LocalPhysicalPlan {
     // Split(Split),
     Sample(Sample),
     MonotonicallyIncreasingId(MonotonicallyIncreasingId),
+    MergeRows(MergeRows),
     StageCheckpointKeys(StageCheckpointKeys),
     // Coalesce(Coalesce),
     // Flatten(Flatten),
@@ -172,6 +173,7 @@ impl LocalPhysicalPlan {
             | Self::TopN(TopN { stats_state, .. })
             | Self::Sample(Sample { stats_state, .. })
             | Self::MonotonicallyIncreasingId(MonotonicallyIncreasingId { stats_state, .. })
+            | Self::MergeRows(MergeRows { stats_state, .. })
             | Self::StageCheckpointKeys(StageCheckpointKeys { stats_state, .. })
             | Self::UnGroupedAggregate(UnGroupedAggregate { stats_state, .. })
             | Self::HashAggregate(HashAggregate { stats_state, .. })
@@ -225,6 +227,7 @@ impl LocalPhysicalPlan {
             | Self::TopN(TopN { context, .. })
             | Self::Sample(Sample { context, .. })
             | Self::MonotonicallyIncreasingId(MonotonicallyIncreasingId { context, .. })
+            | Self::MergeRows(MergeRows { context, .. })
             | Self::StageCheckpointKeys(StageCheckpointKeys { context, .. })
             | Self::UnGroupedAggregate(UnGroupedAggregate { context, .. })
             | Self::HashAggregate(HashAggregate { context, .. })
@@ -275,6 +278,7 @@ impl LocalPhysicalPlan {
             | Self::TopN(TopN { context, .. })
             | Self::Sample(Sample { context, .. })
             | Self::MonotonicallyIncreasingId(MonotonicallyIncreasingId { context, .. })
+            | Self::MergeRows(MergeRows { context, .. })
             | Self::StageCheckpointKeys(StageCheckpointKeys { context, .. })
             | Self::UnGroupedAggregate(UnGroupedAggregate { context, .. })
             | Self::HashAggregate(HashAggregate { context, .. })
@@ -850,6 +854,23 @@ impl LocalPhysicalPlan {
         .arced()
     }
 
+    pub fn merge_rows(
+        input: LocalPhysicalPlanRef,
+        config: MergeRowsConfig<BoundExpr>,
+        schema: SchemaRef,
+        stats_state: StatsState,
+        context: LocalNodeContext,
+    ) -> LocalPhysicalPlanRef {
+        Self::MergeRows(MergeRows {
+            input,
+            config,
+            schema,
+            stats_state,
+            context,
+        })
+        .arced()
+    }
+
     pub fn monotonically_increasing_id(
         input: LocalPhysicalPlanRef,
         column_name: String,
@@ -1200,6 +1221,7 @@ impl LocalPhysicalPlan {
             | Self::Unpivot(Unpivot { schema, .. })
             | Self::Concat(Concat { schema, .. })
             | Self::MonotonicallyIncreasingId(MonotonicallyIncreasingId { schema, .. })
+            | Self::MergeRows(MergeRows { schema, .. })
             | Self::StageCheckpointKeys(StageCheckpointKeys { schema, .. })
             | Self::WindowPartitionOnly(WindowPartitionOnly { schema, .. })
             | Self::WindowPartitionAndOrderBy(WindowPartitionAndOrderBy { schema, .. })
@@ -1280,6 +1302,7 @@ impl LocalPhysicalPlan {
             | Self::Unpivot(Unpivot { input, .. })
             | Self::Concat(Concat { input, .. })
             | Self::MonotonicallyIncreasingId(MonotonicallyIncreasingId { input, .. })
+            | Self::MergeRows(MergeRows { input, .. })
             | Self::StageCheckpointKeys(StageCheckpointKeys { input, .. })
             | Self::WindowPartitionOnly(WindowPartitionOnly { input, .. })
             | Self::WindowPartitionAndOrderBy(WindowPartitionAndOrderBy { input, .. })
@@ -1520,6 +1543,18 @@ impl LocalPhysicalPlan {
                 }) => Self::concat(
                     new_child.clone(),
                     other.clone(),
+                    StatsState::NotMaterialized,
+                    context.clone(),
+                ),
+                Self::MergeRows(MergeRows {
+                    config,
+                    schema,
+                    context,
+                    ..
+                }) => Self::merge_rows(
+                    new_child.clone(),
+                    config.clone(),
+                    schema.clone(),
                     StatsState::NotMaterialized,
                     context.clone(),
                 ),
@@ -2153,6 +2188,16 @@ pub struct Sample {
     pub sampling_method: SamplingMethod,
     pub with_replacement: bool,
     pub seed: Option<u64>,
+    pub schema: SchemaRef,
+    pub stats_state: StatsState,
+    pub context: LocalNodeContext,
+}
+
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub struct MergeRows {
+    pub input: LocalPhysicalPlanRef,
+    pub config: MergeRowsConfig<BoundExpr>,
     pub schema: SchemaRef,
     pub stats_state: StatsState,
     pub context: LocalNodeContext,

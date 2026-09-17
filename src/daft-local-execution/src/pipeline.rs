@@ -42,7 +42,7 @@ use crate::{
     intermediate_ops::{
         distributed_actor_pool_project::DistributedActorPoolProjectOperator,
         explode::ExplodeOperator, filter::FilterOperator, intermediate_op::IntermediateNode,
-        into_batches::IntoBatchesOperator, project::ProjectOperator,
+        into_batches::IntoBatchesOperator, merge_rows::MergeRowsOperator, project::ProjectOperator,
         stage_checkpoint_keys::StageCheckpointKeysOperator, udf::UdfOperator,
         unpivot::UnpivotOperator,
     },
@@ -774,6 +774,24 @@ fn physical_plan_to_pipeline(
             let child_node = physical_plan_to_pipeline(input, cfg, ctx, input_senders)?;
             IntermediateNode::new(
                 Arc::new(filter_op),
+                child_node,
+                stats_state.clone(),
+                ctx,
+                context,
+            )
+            .boxed()
+        }
+        LocalPhysicalPlan::MergeRows(daft_local_plan::MergeRows {
+            input,
+            config,
+            schema,
+            stats_state,
+            context,
+        }) => {
+            let merge_op = MergeRowsOperator::new(config.clone(), schema.clone());
+            let child_node = physical_plan_to_pipeline(input, cfg, ctx, input_senders)?;
+            IntermediateNode::new(
+                Arc::new(merge_op),
                 child_node,
                 stats_state.clone(),
                 ctx,

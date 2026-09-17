@@ -53,6 +53,7 @@ mod into_partitions;
 mod join;
 mod limit;
 pub(crate) mod materialize;
+mod merge_rows;
 pub(crate) mod metrics;
 mod monotonically_increasing_id;
 mod pivot;

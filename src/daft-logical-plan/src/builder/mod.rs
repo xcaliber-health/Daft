@@ -27,6 +27,7 @@ use resolve_expr::ExprResolver;
 #[cfg(feature = "python")]
 use {
     crate::PyFormatSinkOption,
+    crate::merge_info::PyMergeRowsConfig,
     crate::sink_info::{CatalogInfo, IcebergCatalogInfo},
     common_daft_config::PyDaftPlanningConfig,
     common_io_config::python::IOConfig as PyIOConfig,
@@ -41,6 +42,7 @@ use crate::{
     LogicalPlanRef,
     display::json::JsonVisitor,
     logical_plan::{LogicalPlan, SubqueryAlias},
+    merge_info::MergeRowsConfig,
     ops::{
         self, Limit, Offset, SetQuantifier, UnionStrategy, get_right_cols_to_drop,
         join::{JoinOptions, JoinPredicate},
@@ -875,6 +877,12 @@ impl LogicalPlanBuilder {
         Ok(self.with_new_plan(logical_plan))
     }
 
+    /// Apply row-level merge rules to a joined stream of target and source rows.
+    pub fn merge_rows(&self, config: MergeRowsConfig) -> DaftResult<Self> {
+        let logical_plan: LogicalPlan = ops::MergeRows::try_new(self.plan.clone(), config)?.into();
+        Ok(self.with_new_plan(logical_plan))
+    }
+
     #[cfg(feature = "python")]
     #[allow(clippy::too_many_arguments)]
     pub fn table_write(
@@ -1673,6 +1681,10 @@ impl PyLogicalPlanBuilder {
             .builder
             .add_monotonically_increasing_id(column_name, None)?
             .into())
+    }
+
+    pub fn merge_rows(&self, config: PyMergeRowsConfig) -> PyResult<Self> {
+        Ok(self.builder.merge_rows(config.config)?.into())
     }
 
     #[allow(clippy::too_many_arguments)]

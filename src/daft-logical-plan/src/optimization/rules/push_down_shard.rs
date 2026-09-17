@@ -53,6 +53,7 @@ impl PushDownShard {
                     | LogicalPlan::Sample(_)
                     | LogicalPlan::Shuffle(_)
                     | LogicalPlan::MonotonicallyIncreasingId(_)
+                    | LogicalPlan::MergeRows(_)
                     | LogicalPlan::Window(_)
                     | LogicalPlan::TopN(_)
                     | LogicalPlan::VLLMProject(..) => {

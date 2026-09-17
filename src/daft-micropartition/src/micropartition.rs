@@ -582,6 +582,8 @@ fn read_parquet_into_loaded_micropartition<T: AsRef<str>>(
         batch_size: chunk_size,
         num_parallel_tasks,
         per_file,
+        // Row positions are a streaming-scan concern; this path serves whole-file reads.
+        row_position_column: None,
     };
     let all_tables = read_parquet_bulk_sync(uris, io_client, io_stats, multithreaded_io, opts)?;
 

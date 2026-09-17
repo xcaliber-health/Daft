@@ -10,7 +10,10 @@ use daft_core::prelude::*;
 use daft_dsl::expr::bound_expr::BoundExpr;
 use daft_recordbatch::RecordBatch;
 use futures::{StreamExt, future::try_join_all, stream::BoxStream};
-use parquet::{arrow::arrow_reader::RowSelection, file::metadata::ParquetMetaData};
+use parquet::{
+    arrow::arrow_reader::{RowSelection, RowSelector},
+    file::metadata::ParquetMetaData,
+};
 use tokio::sync::mpsc;
 
 use super::{
@@ -103,6 +106,79 @@ pub(super) async fn spawn_col_decoders(
     Ok((rxs, joinset))
 }
 
+/// Absolute row positions of the rows a selection keeps, handed out in the same
+/// chunk sizes the column decoders emit.
+///
+/// Positions are file ordinals: they count every row of the file, including rows
+/// the selection skips, so they stay valid as row identifiers.
+pub(super) struct PositionGenerator {
+    selectors: std::vec::IntoIter<RowSelector>,
+    next_row: i64,
+    remaining_in_run: usize,
+}
+
+impl PositionGenerator {
+    /// Build a generator over the rows `selection` keeps within one row group.
+    ///
+    /// `rg_global_start` is the file ordinal of the row group's first row;
+    /// `rg_rows` is its row count, used when nothing is selected away.
+    pub(super) fn new(
+        rg_global_start: usize,
+        rg_rows: usize,
+        selection: Option<&RowSelection>,
+    ) -> Self {
+        let selectors: Vec<RowSelector> = match selection {
+            Some(selection) => selection.iter().copied().collect(),
+            None => vec![RowSelector::select(rg_rows)],
+        };
+        Self {
+            selectors: selectors.into_iter(),
+            next_row: rg_global_start as i64,
+            remaining_in_run: 0,
+        }
+    }
+
+    /// Return the next `n` kept positions, or fewer once the selection is exhausted.
+    pub(super) fn take(&mut self, n: usize) -> ArrayRef {
+        let mut positions: Vec<i64> = Vec::with_capacity(n);
+        while positions.len() < n {
+            if self.remaining_in_run == 0 {
+                let Some(selector) = self.selectors.next() else {
+                    break;
+                };
+                if selector.skip {
+                    self.next_row += selector.row_count as i64;
+                } else {
+                    self.remaining_in_run = selector.row_count;
+                }
+                continue;
+            }
+            let take = (n - positions.len()).min(self.remaining_in_run);
+            positions.extend(self.next_row..self.next_row + take as i64);
+            self.next_row += take as i64;
+            self.remaining_in_run -= take;
+        }
+        Arc::new(arrow::array::Int64Array::from(positions))
+    }
+}
+
+/// File ordinal of the first row of `rg_idx`.
+fn rg_global_start(metadata: &ParquetMetaData, rg_idx: usize) -> usize {
+    (0..rg_idx)
+        .map(|i| metadata.row_group(i).num_rows() as usize)
+        .sum()
+}
+
+/// Arrow field for a synthesized position column. Positions always exist for a
+/// decoded row, so the field is non-null.
+fn position_field(name: &str) -> Arc<arrow::datatypes::Field> {
+    Arc::new(arrow::datatypes::Field::new(
+        name,
+        arrow::datatypes::DataType::Int64,
+        false,
+    ))
+}
+
 struct StreamingState {
     ctx: Arc<RgTaskCtx>,
     col_receivers: Vec<ColRx>,
@@ -110,6 +186,8 @@ struct StreamingState {
     /// Phase-1 predicate arrays for this RG, already mask-filtered.
     /// Indexed by `ctx.plan.pred_col_indices` position.
     filtered_pred: Vec<ArrayRef>,
+    /// Row positions for this row group, when the caller asked for them.
+    positions: Option<PositionGenerator>,
 }
 
 pub(super) async fn process_rg_with_data_cols(
@@ -138,11 +216,20 @@ pub(super) async fn process_rg_with_data_cols(
         Err(e) => return err_stream(e),
     };
 
+    let positions = ctx.plan.position_column.as_ref().map(|_| {
+        PositionGenerator::new(
+            rg_global_start(&ctx.metadata, rg_idx),
+            ctx.metadata.row_group(rg_idx).num_rows() as usize,
+            selection.as_ref(),
+        )
+    });
+
     let state = StreamingState {
         ctx,
         col_receivers,
         offset: 0,
         filtered_pred,
+        positions,
     };
 
     let stream = futures::stream::unfold(state, |mut state| async move {
@@ -169,6 +256,13 @@ pub(super) async fn process_rg_with_data_cols(
                     .expect("col_idx must be in pred or data set");
                 arrays.push(data_chunks[dp].clone());
             }
+        }
+
+        if let (Some(name), Some(generator)) =
+            (plan.position_column.as_deref(), state.positions.as_mut())
+        {
+            fields.push(position_field(name));
+            arrays.push(generator.take(chunk_rows));
         }
 
         let mut daft_batch = match record_batch_from_arrow(
@@ -211,6 +305,8 @@ struct PredicateOnlyState {
     chunk_arrow_schema: Arc<ArrowSchema>,
     bound_pred: BoundExpr,
     col_receivers: Vec<ColRx>,
+    /// Row positions for this row group, when the caller asked for them.
+    positions: Option<PositionGenerator>,
 }
 
 pub(super) async fn process_rg_predicate_only(
@@ -252,11 +348,20 @@ pub(super) async fn process_rg_predicate_only(
         Ok(b) => b,
         Err(e) => return err_stream(e),
     };
+    let positions = ctx.plan.position_column.as_ref().map(|_| {
+        PositionGenerator::new(
+            rg_global_start(&ctx.metadata, rg_idx),
+            ctx.metadata.row_group(rg_idx).num_rows() as usize,
+            selection.as_ref(),
+        )
+    });
+
     let state = PredicateOnlyState {
         ctx,
         chunk_arrow_schema,
         bound_pred,
         col_receivers,
+        positions,
     };
 
     let stream = futures::stream::unfold(state, |mut state| async move {
@@ -281,25 +386,45 @@ pub(super) async fn process_rg_predicate_only(
                 Err(e) => return Some((Err(e), state)),
             };
 
+            let chunk_positions = state
+                .positions
+                .as_mut()
+                .map(|generator| generator.take(chunks[0].len()));
+
             if arrow_bool.true_count() == 0 {
                 continue;
             }
 
-            let filtered =
+            let mut filtered =
                 match filter_arrays_by_mask(&chunks, &arrow_bool, state.ctx.path.as_ref()) {
                     Ok(f) => f,
                     Err(e) => return Some((Err(e), state)),
                 };
 
+            let mut out_schema = state.chunk_arrow_schema.clone();
+            if let (Some(name), Some(chunk_positions)) = (
+                state.ctx.plan.position_column.as_deref(),
+                chunk_positions.as_ref(),
+            ) {
+                let kept = match filter_arrays_by_mask(
+                    std::slice::from_ref(chunk_positions),
+                    &arrow_bool,
+                    state.ctx.path.as_ref(),
+                ) {
+                    Ok(mut arrays) => arrays.remove(0),
+                    Err(e) => return Some((Err(e), state)),
+                };
+                let mut fields = out_schema.fields().to_vec();
+                fields.push(position_field(name));
+                out_schema = Arc::new(ArrowSchema::new(fields));
+                filtered.push(kept);
+            }
+
             // Build a RecordBatch over the predicate columns; project_to_schema
             // picks the subset for `return_daft_schema` (which is read_col_indices,
             // a subset of pred_col_indices in this path).
-            let out_res = record_batch_from_arrow(
-                state.chunk_arrow_schema.clone(),
-                filtered,
-                state.ctx.path.as_ref(),
-            )
-            .and_then(|b| project_to_schema(b, &state.ctx.plan.return_daft_schema));
+            let out_res = record_batch_from_arrow(out_schema, filtered, state.ctx.path.as_ref())
+                .and_then(|b| project_to_schema(b, &state.ctx.plan.return_daft_schema));
             return Some(match out_res {
                 Ok(p) => (Ok(p), state),
                 Err(e) => (Err(e), state),
@@ -309,4 +434,79 @@ pub(super) async fn process_rg_predicate_only(
     .boxed();
 
     common_runtime::combine_stream(stream, async move { col_decoders.join_all().await }).boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::array::Int64Array;
+
+    use super::*;
+
+    fn positions_of(array: &ArrayRef) -> Vec<i64> {
+        array
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("position arrays are Int64")
+            .values()
+            .to_vec()
+    }
+
+    #[test]
+    fn take_counts_every_row_when_nothing_is_selected_away() {
+        let mut generator = PositionGenerator::new(0, 5, None);
+        assert_eq!(positions_of(&generator.take(5)), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn take_starts_at_the_row_group_offset() {
+        let mut generator = PositionGenerator::new(100, 3, None);
+        assert_eq!(positions_of(&generator.take(3)), vec![100, 101, 102]);
+    }
+
+    #[test]
+    fn take_skips_the_rows_the_selection_drops() {
+        let selection = RowSelection::from(vec![
+            RowSelector::skip(2),
+            RowSelector::select(3),
+            RowSelector::skip(1),
+            RowSelector::select(2),
+        ]);
+        let mut generator = PositionGenerator::new(0, 8, Some(&selection));
+        assert_eq!(positions_of(&generator.take(5)), vec![2, 3, 4, 6, 7]);
+    }
+
+    #[test]
+    fn take_resumes_across_chunk_boundaries() {
+        let selection = RowSelection::from(vec![
+            RowSelector::select(2),
+            RowSelector::skip(3),
+            RowSelector::select(4),
+        ]);
+        let mut generator = PositionGenerator::new(10, 9, Some(&selection));
+        assert_eq!(positions_of(&generator.take(3)), vec![10, 11, 15]);
+        assert_eq!(positions_of(&generator.take(3)), vec![16, 17, 18]);
+    }
+
+    #[test]
+    fn take_returns_fewer_rows_once_the_selection_is_spent() {
+        let selection = RowSelection::from(vec![RowSelector::select(2), RowSelector::skip(6)]);
+        let mut generator = PositionGenerator::new(0, 8, Some(&selection));
+        assert_eq!(positions_of(&generator.take(4)), vec![0, 1]);
+        assert!(positions_of(&generator.take(4)).is_empty());
+    }
+
+    #[test]
+    fn take_handles_a_fully_skipped_selection() {
+        let selection = RowSelection::from(vec![RowSelector::skip(4)]);
+        let mut generator = PositionGenerator::new(0, 4, Some(&selection));
+        assert!(positions_of(&generator.take(4)).is_empty());
+    }
+
+    #[test]
+    fn global_start_sums_preceding_row_groups() {
+        // Row-group starts are the running total of the groups before them.
+        let sizes = [4usize, 6, 5];
+        let starts: Vec<usize> = (0..sizes.len()).map(|i| sizes[..i].iter().sum()).collect();
+        assert_eq!(starts, vec![0, 4, 10]);
+    }
 }

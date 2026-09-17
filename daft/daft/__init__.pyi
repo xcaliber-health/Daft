@@ -267,6 +267,7 @@ class ParquetSourceConfig:
     field_id_mapping: dict[int, PyField] | None
     row_groups: list[list[int]] | None
     chunk_size: int | None
+    row_position_column: str | None
 
     def __init__(
         self,
@@ -275,6 +276,7 @@ class ParquetSourceConfig:
         row_groups: list[list[int]] | None = None,
         chunk_size: int | None = None,
         ignore_corrupt_files: bool = False,
+        row_position_column: str | None = None,
     ): ...
 
 class CsvSourceConfig:

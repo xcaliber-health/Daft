@@ -145,6 +145,32 @@ pub(super) struct ColumnPlan {
     pub(super) return_daft_schema: Arc<Schema>,
     /// Schema for all columns read from Parquet, including predicate helper columns.
     pub(super) read_daft_schema: Schema,
+    /// Name of the synthesized row-position column, when the caller asked for one.
+    pub(super) position_column: Option<Arc<str>>,
+}
+
+/// Index of the column with the smallest compressed footprint across all row groups.
+///
+/// Used only to keep one real column in the read when the caller asked for row
+/// positions alone, since positions follow the decoder's chunking.
+fn cheapest_column_index(metadata: &ParquetMetaData) -> usize {
+    let num_cols = metadata.file_metadata().schema_descr().num_columns();
+    let mut totals = vec![0i64; num_cols];
+    for rg in metadata.row_groups() {
+        for (leaf, column) in rg.columns().iter().enumerate() {
+            totals[leaf] += column.compressed_size();
+        }
+    }
+    let cheapest_leaf = totals
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, bytes)| **bytes)
+        .map_or(0, |(leaf, _)| leaf);
+    // Leaves map to top-level fields in order, so the root index is the field the leaf belongs to.
+    metadata
+        .file_metadata()
+        .schema_descr()
+        .get_column_root_idx(cheapest_leaf)
 }
 
 fn resolve_column_plan(
@@ -154,10 +180,20 @@ fn resolve_column_plan(
     let daft_schema = Schema::try_from(prepared.arrow_schema.as_ref())?;
     let user_cols = opts.columns.as_deref();
 
+    // Row positions are synthesized from the row selection, so the name must never
+    // be matched against the file's own columns.
+    let position_column: Option<Arc<str>> = opts.row_position_column.as_deref().and_then(|name| {
+        let requested = user_cols.is_none_or(|cols| cols.iter().any(|col| col == name));
+        requested.then(|| Arc::from(name))
+    });
+
     let mut read_col_names: HashSet<String> = match user_cols {
         Some(cols) => cols.iter().cloned().collect(),
         None => daft_schema.field_names().map(str::to_string).collect(),
     };
+    if let Some(name) = position_column.as_deref() {
+        read_col_names.remove(name);
+    }
 
     let (pred_cols, predicate_pushed) = match opts.predicate.as_ref() {
         Some(pred) => match predicate_pushable_cols(pred, &daft_schema) {
@@ -177,14 +213,26 @@ fn resolve_column_plan(
         read_col_names.extend(filter_cols.iter().cloned());
     }
 
+    // Positions are handed out chunk by chunk as columns decode, so one column has
+    // to be read even when the caller wants nothing else from the file.
+    if position_column.is_some() && read_col_names.is_empty() {
+        let keeper = cheapest_column_index(&prepared.parquet_metadata);
+        read_col_names.insert(prepared.arrow_schema.field(keeper).name().clone());
+    }
+
     let read_daft_schema = project_schema(&daft_schema, &read_col_names);
-    let return_daft_schema = match user_cols {
-        Some(cols) => Arc::new(project_schema(
-            &daft_schema,
-            &cols.iter().cloned().collect(),
-        )),
-        None => Arc::new(daft_schema),
+    let projected_schema = match user_cols {
+        Some(cols) => project_schema(&daft_schema, &cols.iter().cloned().collect()),
+        None => daft_schema,
     };
+    let return_daft_schema = Arc::new(match position_column.as_deref() {
+        Some(name) => {
+            let mut fields: Vec<Field> = projected_schema.fields().to_vec();
+            fields.push(Field::new(name, DataType::Int64));
+            Schema::new(fields)
+        }
+        None => projected_schema,
+    });
 
     let arrow_fields = prepared.arrow_schema.fields();
     let read_col_indices: Vec<usize> = arrow_fields
@@ -216,6 +264,7 @@ fn resolve_column_plan(
         predicate_pushed,
         return_daft_schema,
         read_daft_schema,
+        position_column,
     })
 }
 

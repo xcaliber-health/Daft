@@ -100,6 +100,10 @@ pub struct ParquetReadOptions {
     pub metadata: Option<Arc<DaftParquetMetadata>>,
     pub ignore_corrupt_files: bool,
     pub skipped_corrupt_files: SkippedCorruptFilesCollector,
+    /// Name of an extra `Int64` column holding each row's ordinal position in the
+    /// file. Positions describe the rows the read keeps, so deleted rows, pushed
+    /// predicates and limits do not shift them.
+    pub row_position_column: Option<String>,
 }
 
 /// Per-file overrides for [`ParquetBulkReadOptions`].
@@ -125,6 +129,8 @@ pub struct ParquetBulkReadOptions {
     pub num_parallel_tasks: usize,
     /// Per-uri overrides. Must be empty or `len() == uris.len()`.
     pub per_file: Vec<PerFileOptions>,
+    /// See [`ParquetReadOptions::row_position_column`].
+    pub row_position_column: Option<String>,
 }
 
 fn make_source<'a>(
@@ -174,6 +180,7 @@ fn single_opts_for(opts: &ParquetBulkReadOptions, i: usize) -> ParquetReadOption
         metadata: per.metadata,
         ignore_corrupt_files: false,
         skipped_corrupt_files: None,
+        row_position_column: opts.row_position_column.clone(),
     }
 }
 
@@ -805,6 +812,218 @@ mod tests {
             total_rows, 5,
             "stream with limit=5 on 5-row file should return 5 rows"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Column of `batch` with the given name; tests read by name for clarity.
+    fn column_named<'a>(batch: &'a RecordBatch, name: &str) -> &'a daft_core::series::Series {
+        let (index, _) = batch
+            .schema
+            .get_fields_with_name(name)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("column {name} not found"));
+        batch.get_column(index)
+    }
+
+    /// Write `groups` row groups of `rows_per_group` rows, `id` counting from 0.
+    fn write_row_group_file(
+        dir_name: &str,
+        groups: usize,
+        rows_per_group: usize,
+    ) -> (PathBuf, String) {
+        use arrow::{
+            array::Int32Array,
+            datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema},
+        };
+        use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
+
+        let dir = std::env::temp_dir().join(dir_name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("test.parquet");
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(rows_per_group))
+            .build();
+        let file = std::fs::File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
+        let total = (groups * rows_per_group) as i32;
+        let batch = arrow::array::RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from((0..total).collect::<Vec<i32>>()))],
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let uri = file_path.to_str().unwrap().to_string();
+        (dir, uri)
+    }
+
+    /// Read `uri` with `opts` and return the `_pos` column paired with the `id` column.
+    fn read_positions(uri: String, opts: ParquetReadOptions) -> Vec<(i64, i32)> {
+        let io_client = Arc::new(IOClient::new(IOConfig::default().into()).unwrap());
+        let runtime = get_io_runtime(true);
+        runtime
+            .block_within_async_context(async move {
+                let mut stream = read_parquet(&uri, io_client, None, opts).await.unwrap();
+                let mut out = Vec::new();
+                while let Some(batch) = stream.next().await {
+                    let batch = batch.unwrap();
+                    let positions = column_named(&batch, "_pos").i64().unwrap().clone();
+                    let ids = column_named(&batch, "id").i32().unwrap().clone();
+                    for i in 0..batch.len() {
+                        out.push((positions.get(i).unwrap(), ids.get(i).unwrap()));
+                    }
+                }
+                out
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn test_row_positions_whole_file() {
+        let (dir, uri) = write_row_group_file("daft_test_row_positions_whole", 3, 4);
+        let rows = read_positions(
+            uri,
+            ParquetReadOptions {
+                row_position_column: Some("_pos".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(rows, (0..12).map(|i| (i, i as i32)).collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_row_positions_skip_deleted_rows() {
+        let (dir, uri) = write_row_group_file("daft_test_row_positions_deletes", 3, 4);
+        let rows = read_positions(
+            uri,
+            ParquetReadOptions {
+                row_position_column: Some("_pos".to_string()),
+                // Spans three row groups, including the boundary rows.
+                delete_rows: Some(vec![1, 4, 7, 11]),
+                ..Default::default()
+            },
+        );
+        let kept: Vec<(i64, i32)> = [0i64, 2, 3, 5, 6, 8, 9, 10]
+            .into_iter()
+            .map(|i| (i, i as i32))
+            .collect();
+        assert_eq!(
+            rows, kept,
+            "positions must be file ordinals of surviving rows"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_row_positions_with_predicate() {
+        use daft_dsl::{lit, resolved_col};
+
+        let (dir, uri) = write_row_group_file("daft_test_row_positions_predicate", 3, 4);
+        let rows = read_positions(
+            uri,
+            ParquetReadOptions {
+                row_position_column: Some("_pos".to_string()),
+                predicate: Some(resolved_col("id").gt(lit(6i32))),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            rows,
+            (7..12).map(|i| (i, i as i32)).collect::<Vec<_>>(),
+            "a pushed predicate must not renumber surviving rows"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_row_positions_with_limit() {
+        let (dir, uri) = write_row_group_file("daft_test_row_positions_limit", 3, 4);
+        let rows = read_positions(
+            uri,
+            ParquetReadOptions {
+                row_position_column: Some("_pos".to_string()),
+                num_rows: Some(5),
+                ..Default::default()
+            },
+        );
+        assert_eq!(rows, (0..5).map(|i| (i, i as i32)).collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_row_positions_stay_absolute_across_row_groups() {
+        let (dir, uri) = write_row_group_file("daft_test_row_positions_rg", 3, 4);
+        let rows = read_positions(
+            uri,
+            ParquetReadOptions {
+                row_position_column: Some("_pos".to_string()),
+                // Reading one row group must not restart the count at zero.
+                row_groups: Some(vec![1]),
+                ..Default::default()
+            },
+        );
+        assert_eq!(rows, (4..8).map(|i| (i, i as i32)).collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_row_positions_without_file_columns() {
+        let (dir, uri) = write_row_group_file("daft_test_row_positions_alone", 2, 4);
+        let io_client = Arc::new(IOClient::new(IOConfig::default().into()).unwrap());
+        let runtime = get_io_runtime(true);
+        let positions: Vec<i64> = runtime
+            .block_within_async_context(async move {
+                let opts = ParquetReadOptions {
+                    row_position_column: Some("_pos".to_string()),
+                    columns: Some(vec!["_pos".to_string()]),
+                    ..Default::default()
+                };
+                let mut stream = read_parquet(&uri, io_client, None, opts).await.unwrap();
+                let mut out = Vec::new();
+                while let Some(batch) = stream.next().await {
+                    let batch = batch.unwrap();
+                    assert_eq!(
+                        batch.schema.len(),
+                        1,
+                        "only the position column is returned"
+                    );
+                    let column = column_named(&batch, "_pos").i64().unwrap().clone();
+                    for i in 0..batch.len() {
+                        out.push(column.get(i).unwrap());
+                    }
+                }
+                out
+            })
+            .unwrap();
+        assert_eq!(positions, (0..8).collect::<Vec<i64>>());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_row_positions_absent_unless_requested() {
+        let (dir, uri) = write_row_group_file("daft_test_row_positions_off", 2, 4);
+        let io_client = Arc::new(IOClient::new(IOConfig::default().into()).unwrap());
+        let runtime = get_io_runtime(true);
+        runtime
+            .block_within_async_context(async move {
+                let mut stream = read_parquet(&uri, io_client, None, ParquetReadOptions::default())
+                    .await
+                    .unwrap();
+                while let Some(batch) = stream.next().await {
+                    let batch = batch.unwrap();
+                    assert!(batch.schema.get_fields_with_name("_pos").is_empty());
+                }
+            })
+            .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -41,6 +41,7 @@
 
 ### Docstrings & Comments
 - NumPy/sklearn style. Required for all public classes, methods, functions.
+- PEP 8 style comments that focus on the 'WHY' and not the 'WHAT'.
 - Purely functional. **No framework names** (PyIceberg, DAFT, gRPC, Glue, Gateway).
 - Concise. Examples only where they aid understanding.
 

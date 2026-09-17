@@ -102,6 +102,7 @@ impl ParquetScanBuilder {
             row_groups: self.row_groups,
             chunk_size: self.chunk_size,
             ignore_corrupt_files: false,
+            row_position_column: None,
         };
 
         let operator = Arc::new(

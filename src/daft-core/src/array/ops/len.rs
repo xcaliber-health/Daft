@@ -162,7 +162,8 @@ mod tests {
     #[test]
     fn a_sliced_string_array_reports_only_its_own_bytes() {
         let values: Vec<String> = (0..1000).map(|i| format!("value-{i:04}")).collect();
-        let array = Utf8Array::from_iter("s", values.iter().map(|v| Some(v.as_str()))).into_series();
+        let array =
+            Utf8Array::from_iter("s", values.iter().map(|v| Some(v.as_str()))).into_series();
         let whole = array.size_bytes();
         let part = array.slice(10, 20).unwrap().size_bytes();
         // ten offsets plus one, and ten values of ten bytes

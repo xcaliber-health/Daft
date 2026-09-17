@@ -28,9 +28,7 @@ def _evolving_table(catalog, name="default.evolving_reads"):
         NestedField(2, "region", StringType(), required=False),
         NestedField(3, "tier", StringType(), required=False),
     )
-    spec = PartitionSpec(
-        PartitionField(source_id=2, field_id=1000, transform=IdentityTransform(), name="region")
-    )
+    spec = PartitionSpec(PartitionField(source_id=2, field_id=1000, transform=IdentityTransform(), name="region"))
     table = catalog.create_table(
         identifier=name, schema=schema, partition_spec=spec, properties={"format-version": "2"}
     )

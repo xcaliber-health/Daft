@@ -35,9 +35,7 @@ def _partitioned(catalog, mode, name="default.by_region"):
         NestedField(2, "region", StringType(), required=False),
         NestedField(3, "label", StringType(), required=False),
     )
-    spec = PartitionSpec(
-        PartitionField(source_id=2, field_id=1000, transform=IdentityTransform(), name="region")
-    )
+    spec = PartitionSpec(PartitionField(source_id=2, field_id=1000, transform=IdentityTransform(), name="region"))
     table = catalog.create_table(
         identifier=name,
         schema=schema,
@@ -66,9 +64,7 @@ def _rows(table):
 def test_a_merge_changes_rows_in_every_partition(local_catalog, mode):
     table = _partitioned(local_catalog, mode)
     changed = [1, 11, 21]
-    source = daft.from_pydict(
-        {"id": changed, "region": ["us", "eu", "apac"], "label": ["merged"] * 3}
-    )
+    source = daft.from_pydict({"id": changed, "region": ["us", "eu", "apac"], "label": ["merged"] * 3})
 
     result = (
         IcebergTable.from_iceberg(table)

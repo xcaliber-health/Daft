@@ -16,6 +16,8 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, TypeAlias
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     import pyarrow as pa
     from pyiceberg.io import FileIO
     from pyiceberg.manifest import DataFile, ManifestEntry
@@ -197,16 +199,19 @@ def read_with_deletes(
     io_config: IOConfig,
     schema_source: SchemaSource = "current",
     ignore_corrupt_files: bool = False,
+    file_indices: Mapping[str, int] | None = None,
 ) -> DataFrame:
     """Build a lazy frame over exactly these data files, with their deletes applied.
 
-    Files sharing a sequence number and partition are read together.
+    Files sharing a sequence number and partition are read together. Supplying
+    ``file_indices`` tags every row with the file it came from and its position in
+    that file, which is what a row-level write needs to name the rows it replaces.
     """
     from daft import runners
     from daft.daft import ScanOperatorHandle, StorageConfig
     from daft.dataframe import DataFrame
     from daft.expressions import lit
-    from daft.io.iceberg.iceberg_scan import IcebergFileGroupScanOperator
+    from daft.io.iceberg.iceberg_scan import IcebergFileGroupScanOperator, IcebergRowLevelScanOperator
     from daft.logical.builder import LogicalPlanBuilder
 
     multithreaded_io = runners.get_or_create_runner().name != "ray"
@@ -214,14 +219,26 @@ def read_with_deletes(
 
     def _frame(group: list[str]) -> DataFrame:
         tasks = [plan.tasks[path] for path in group]
-        operator = IcebergFileGroupScanOperator(
-            table,
-            snapshot_id=snapshot_id,
-            storage_config=storage_config,
-            tasks=tasks,
-            schema_source=schema_source,
-            ignore_corrupt_files=ignore_corrupt_files,
-        )
+        operator: IcebergFileGroupScanOperator
+        if file_indices is None:
+            operator = IcebergFileGroupScanOperator(
+                table,
+                snapshot_id=snapshot_id,
+                storage_config=storage_config,
+                tasks=tasks,
+                schema_source=schema_source,
+                ignore_corrupt_files=ignore_corrupt_files,
+            )
+        else:
+            operator = IcebergRowLevelScanOperator(
+                table,
+                snapshot_id=snapshot_id,
+                storage_config=storage_config,
+                tasks=tasks,
+                file_indices=file_indices,
+                schema_source=schema_source,
+                ignore_corrupt_files=ignore_corrupt_files,
+            )
         handle = ScanOperatorHandle.from_python_scan_operator(operator)
         return DataFrame(LogicalPlanBuilder.from_tabular_scan(scan_operator=handle))
 

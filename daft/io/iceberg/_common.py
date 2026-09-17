@@ -25,6 +25,12 @@ logger = logging.getLogger(__name__)
 
 GC_ENABLED_KEY = "gc.enabled"
 
+#: Column naming the data file a row was read from, as an index into the file table.
+#: An index keeps the column narrow; the path, spec and partition are resolved from it.
+ROW_FILE_COLUMN = "_file_idx"
+#: Column holding a row's ordinal position in its own data file.
+ROW_POSITION_COLUMN = "_pos"
+
 DEFAULT_MAX_CONCURRENT_DELETES = 4
 DEFAULT_MAX_CONCURRENT_MANIFEST_READS = 4
 DEFAULT_DELETE_NUM_RETRIES = 3
@@ -509,8 +515,7 @@ def commit_with_retry(
             base = min(max_wait_s, min_wait_s * (2**attempt)) if min_wait_s > 0 else 0.0
             wait = base * (1.0 + rng()) if base > 0 else 0.0
             remaining = max(0.0, total_timeout_s - elapsed)
-            if wait > remaining:
-                wait = remaining
+            wait = min(wait, remaining)
             if wait > 0:
                 sleep(wait)
             table.refresh()

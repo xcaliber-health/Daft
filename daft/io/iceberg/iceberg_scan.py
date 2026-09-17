@@ -18,6 +18,7 @@ from daft.daft import (
     StorageConfig,
 )
 from daft.dependencies import pa
+from daft.io.iceberg._common import ROW_FILE_COLUMN, ROW_POSITION_COLUMN
 from daft.io.iceberg._expressions import convert_row_filter, retarget_references
 from daft.io.iceberg._metadata import (
     convert_iceberg_data_type,
@@ -26,11 +27,11 @@ from daft.io.iceberg._metadata import (
 )
 from daft.io.iceberg.schema_field_id_mapping_visitor import SchemaFieldIdMappingVisitor, attach_name_mapping
 from daft.io.scan import ScanOperator, make_partition_field
-from daft.logical.schema import Field, Schema
+from daft.logical.schema import DataType, Field, Schema
 from daft.recordbatch import RecordBatch
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterator, Mapping
 
     from pyiceberg.partitioning import PartitionField as IcebergPartitionField
     from pyiceberg.partitioning import PartitionSpec as IcebergPartitionSpec
@@ -118,12 +119,12 @@ class IcebergScanOperator(ScanOperator):
         self._snapshot_id = snapshot_id
         self._storage_config = storage_config
 
-        field_id_mapping = attach_name_mapping(
+        self._field_id_mapping = attach_name_mapping(
             visit(iceberg_schema, SchemaFieldIdMappingVisitor()), iceberg_table.properties
         )
         self._file_format_config = FileFormatConfig.from_parquet_config(
             ParquetSourceConfig(
-                field_id_mapping=field_id_mapping,
+                field_id_mapping=self._field_id_mapping,
                 ignore_corrupt_files=ignore_corrupt_files,
             )
         )
@@ -387,3 +388,109 @@ class IcebergFileGroupScanOperator(IcebergScanOperator):
 
     def supports_count_pushdown(self) -> bool:
         return False
+
+
+class IcebergRowLevelScanOperator(IcebergFileGroupScanOperator):
+    """Scan operator that tags every row with the data file and position it came from.
+
+    Row-level writes name the rows they replace or delete by the file that holds
+    them and their ordinal position in it. Both are added as columns: the file as
+    an index into a caller-supplied table of files, the position as the row's own
+    ordinal, counted after the file's existing deletes are applied so it stays
+    valid as an identifier.
+    """
+
+    def __init__(
+        self,
+        iceberg_table: Table,
+        snapshot_id: int | None,
+        storage_config: StorageConfig,
+        tasks: list[FileScanTask],
+        file_indices: Mapping[str, int],
+        schema_source: SchemaSource = "current",
+        ignore_corrupt_files: bool = False,
+    ) -> None:
+        """Scan ``tasks`` with provenance columns attached.
+
+        Args:
+            iceberg_table (Table): Table the files belong to.
+            snapshot_id (int, optional): Snapshot to read; the current one when ``None``.
+            storage_config (StorageConfig): Storage access configuration for the data files.
+            tasks (list[FileScanTask]): Planned data files with their delete files.
+            file_indices (Mapping[str, int]): Index to report for each file path.
+            schema_source (SchemaSource): Which schema the rows are read under.
+            ignore_corrupt_files (bool): Skip files that fail to parse instead of raising.
+        """
+        super().__init__(
+            iceberg_table,
+            snapshot_id=snapshot_id,
+            storage_config=storage_config,
+            tasks=tasks,
+            schema_source=schema_source,
+            ignore_corrupt_files=ignore_corrupt_files,
+        )
+        missing = [str(task.file.file_path) for task in tasks if str(task.file.file_path) not in file_indices]
+        if missing:
+            raise ValueError(f"file table is missing {len(missing)} scanned file(s), first: {missing[0]}")
+        self._file_indices = file_indices
+        self._file_format_config = FileFormatConfig.from_parquet_config(
+            ParquetSourceConfig(
+                field_id_mapping=self._field_id_mapping,
+                ignore_corrupt_files=ignore_corrupt_files,
+                row_position_column=ROW_POSITION_COLUMN,
+            )
+        )
+        # Provenance rides along as extra columns of the scanned schema: the file
+        # index is broadcast from the file's partition values, the position comes
+        # from the reader.
+        self._schema = Schema._from_fields(
+            [
+                *self._schema,
+                Field.create(ROW_FILE_COLUMN, DataType.int32()),
+                Field.create(ROW_POSITION_COLUMN, DataType.int64()),
+            ]
+        )
+
+    def name(self) -> str:
+        return "IcebergRowLevelScanOperator"
+
+    def display_name(self) -> str:
+        return f"IcebergRowLevelScanOperator({'.'.join(self._iceberg_table.name())})"
+
+    def _scan_task_for_file_task(self, task: FileScanTask, pushdowns: PyPushdowns) -> ScanTask | None:
+        file = task.file
+        file_format = file.file_format
+        if file_format != "PARQUET":
+            raise NotImplementedError(f"row-level reads of {file_format} are not supported")
+
+        path = str(file.file_path)
+        partition_values = self._partition_values_with_index(
+            self._iceberg_table.specs()[file.spec_id], file.partition, self._file_indices[path]
+        )
+        return ScanTask.catalog_scan_task(
+            file=path,
+            file_format=self._file_format_config,
+            schema=self._schema._schema,
+            num_rows=file.record_count,
+            storage_config=self._storage_config,
+            size_bytes=file.file_size_in_bytes,
+            iceberg_delete_files=[str(delete.file_path) for delete in task.delete_files],
+            pushdowns=pushdowns,
+            partition_values=partition_values._recordbatch,
+            stats=None,
+        )
+
+    def _partition_values_with_index(
+        self, spec: IcebergPartitionSpec, record: Record, file_index: int
+    ) -> daft.recordbatch.RecordBatch:
+        """Return one row of partition values for a file, plus the file's index."""
+        columns: dict[str, daft.Series] = {}
+        partition_fields = iceberg_partition_spec_to_fields(self._iceberg_table.schema(), spec)
+        for idx, pfield in enumerate(partition_fields):
+            field = Field._from_pyfield(pfield.field)
+            arrow_type = field.dtype.to_arrow_dtype()
+            columns[field.name] = daft.Series.from_arrow(
+                pa.array([record[idx]], type=arrow_type), name=field.name
+            ).cast(field.dtype)
+        columns[ROW_FILE_COLUMN] = daft.Series.from_arrow(pa.array([file_index], type=pa.int32()), name=ROW_FILE_COLUMN)
+        return daft.recordbatch.RecordBatch.from_pydict(columns)

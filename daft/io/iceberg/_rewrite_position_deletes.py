@@ -53,7 +53,7 @@ if TYPE_CHECKING:
     from daft.daft import IOConfig
     from daft.daft._iceberg import CandidateRecord, FileGroupRecord, OptionValue
     from daft.dataframe import DataFrame
-    from daft.io.writer import IcebergWriter
+    from daft.io.writer import IcebergPositionDeleteWriter
 
 logger = logging.getLogger(__name__)
 
@@ -68,10 +68,6 @@ DELETE_GRANULARITY_KEY = "write.delete.granularity"
 #: One packed file per data file unless the table asks for one per partition.
 _DEFAULT_DELETE_GRANULARITY = "file"
 _GRANULARITIES = ("file", "partition")
-#: Field ids the format reserves for a position delete's columns.
-_DELETE_FILE_PATH_FIELD_ID = 2147483546
-_DELETE_POS_FIELD_ID = 2147483545
-
 _PLANNER_OPTIONS = frozenset(
     {
         "target-file-size-bytes",
@@ -366,22 +362,10 @@ class _DeleteFileWriter:
     """Writes sorted delete rows into files of the format's position delete layout."""
 
     def __init__(self, table: PyIcebergTable, spec_id: int, partition: Record, io_config: IOConfig) -> None:
-        from pyiceberg.schema import Schema
-        from pyiceberg.types import LongType, NestedField, StringType
-
         self._table = table
         self._spec_id = spec_id
         self._partition = partition
         self._io_config = io_config
-        self._schema = Schema(
-            NestedField(_DELETE_FILE_PATH_FIELD_ID, "file_path", StringType(), required=True),
-            NestedField(_DELETE_POS_FIELD_ID, "pos", LongType(), required=True),
-        )
-        # Full bounds on the path column let a reader skip the file by data file.
-        self._properties = {
-            **_delete_write_properties(dict(table.properties)),
-            "write.metadata.metrics.column.file_path": "full",
-        }
 
     def write_all(self, rows: DataFrame, *, roll_size: int, per_file: bool) -> list[DataFile]:
         """Stream sorted ``rows`` into files, cut at ``roll_size`` bytes and, if asked, at each data file.
@@ -414,8 +398,8 @@ class _DeleteFileWriter:
             writer.close()
         return written
 
-    def _open(self, file_idx: int) -> IcebergWriter:
-        from daft.io.writer import IcebergWriter
+    def _open(self, file_idx: int) -> IcebergPositionDeleteWriter:
+        from daft.io.writer import IcebergPositionDeleteWriter
         from daft.recordbatch.recordbatch import RecordBatch
 
         location = self._table.properties.get("write.data.path", f"{self._table.location()}/data")
@@ -425,41 +409,17 @@ class _DeleteFileWriter:
             if fields
             else None
         )
-        return IcebergWriter(
+        return IcebergPositionDeleteWriter(
             root_dir=location,
             file_idx=file_idx,
-            schema=self._schema,
-            properties=self._properties,
+            properties=dict(self._table.properties),
             partition_spec_id=self._spec_id,
             partition_values=partition_values,
             io_config=self._io_config,
         )
 
-    def _close(self, writer: IcebergWriter) -> DataFile:
-        from pyiceberg.manifest import DataFile, DataFileContent
-
-        data_file = writer.close().to_pydict()["data_file"][0]
-        delete_file = DataFile.from_args(
-            _table_format_version=self._table.metadata.format_version,
-            content=DataFileContent.POSITION_DELETES,
-            file_path=data_file.file_path,
-            file_format=data_file.file_format,
-            partition=data_file.partition,
-            record_count=data_file.record_count,
-            file_size_in_bytes=data_file.file_size_in_bytes,
-            column_sizes=data_file.column_sizes,
-            value_counts=data_file.value_counts,
-            null_value_counts=data_file.null_value_counts,
-            nan_value_counts=data_file.nan_value_counts,
-            lower_bounds=data_file.lower_bounds,
-            upper_bounds=data_file.upper_bounds,
-            split_offsets=data_file.split_offsets,
-            equality_ids=None,
-            key_metadata=None,
-            sort_order_id=None,
-        )
-        delete_file.spec_id = self._spec_id
-        return delete_file
+    def _close(self, writer: IcebergPositionDeleteWriter) -> DataFile:
+        return writer.close().to_pydict()["data_file"][0]
 
 
 def _split_by_file(batch: pa.RecordBatch) -> list[pa.RecordBatch]:
@@ -477,19 +437,6 @@ def _split_by_file(batch: pa.RecordBatch) -> list[pa.RecordBatch]:
             pieces.append(batch.slice(start, index - start))
             start = index
     return pieces
-
-
-_DELETE_PROPERTY_PREFIX = "write.delete."
-_DATA_PROPERTY_PREFIX = "write."
-
-
-def _delete_write_properties(properties: dict[str, str]) -> dict[str, str]:
-    """Return the properties a delete file is written under: ``write.delete.*`` over ``write.*``."""
-    out = dict(properties)
-    for key, value in properties.items():
-        if key.startswith(_DELETE_PROPERTY_PREFIX) and not key.endswith(("target-file-size-bytes", "granularity")):
-            out[_DATA_PROPERTY_PREFIX + key[len(_DELETE_PROPERTY_PREFIX) :]] = value
-    return out
 
 
 def _commit_batch(

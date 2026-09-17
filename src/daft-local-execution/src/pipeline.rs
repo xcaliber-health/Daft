@@ -59,6 +59,7 @@ use crate::{
         into_partitions::IntoPartitionsSink,
         pivot::PivotSink,
         repartition::RepartitionSink,
+        row_delta_write::RowDeltaWriteSink,
         sort::SortSink,
         top_n::TopNSink,
         window_order_by_only::WindowOrderByOnlySink,
@@ -1501,6 +1502,34 @@ fn physical_plan_to_pipeline(
             use daft_logical_plan::CatalogType;
 
             let child_node = physical_plan_to_pipeline(input, cfg, ctx, input_senders)?;
+
+            if let CatalogType::IcebergRowDelta(row_delta) = catalog_type {
+                let data_partition_by = (!row_delta.data.partition_cols.is_empty())
+                    .then(|| row_delta.data.partition_cols.clone());
+                let data_factory = daft_writers::make_catalog_writer_factory(
+                    &CatalogType::Iceberg(row_delta.data.clone()),
+                    &data_partition_by,
+                    cfg,
+                );
+                let write_sink = RowDeltaWriteSink::try_new(
+                    row_delta,
+                    data_factory,
+                    input.schema().as_ref(),
+                    file_schema.clone(),
+                    cfg,
+                )
+                .with_context(|_| PipelineCreationSnafu {
+                    plan_name: physical_plan.name(),
+                })?;
+                return Ok(BlockingSinkNode::new(
+                    Arc::new(write_sink),
+                    child_node,
+                    stats_state.clone(),
+                    ctx,
+                    context,
+                )
+                .boxed());
+            }
 
             let (partition_by, write_format) = match catalog_type {
                 CatalogType::Iceberg(ic) => {

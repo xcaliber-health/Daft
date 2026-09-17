@@ -264,6 +264,55 @@ pub fn make_ipc_writer(
 #[cfg(feature = "python")]
 const INFLATION_FACTOR_PROPERTY: &str = "daft.write.inflation-factor";
 
+/// Opens writers for one group of removed-row positions, rolling to a new file
+/// once the one being written reaches `target_file_size`.
+///
+/// `file_index` names a data file of the group, which is what tells the caller's
+/// opener where the group's delete file belongs.
+#[cfg(feature = "python")]
+#[must_use]
+pub fn make_position_delete_writer_factory(
+    opener: Arc<pyo3::Py<pyo3::PyAny>>,
+    file_index: i64,
+    target_file_size: usize,
+    inflation_factor: f64,
+) -> Arc<dyn WriterFactory<Input = MicroPartition, Result = Vec<RecordBatch>>> {
+    let base = PositionDeleteWriterFactory { opener, file_index };
+    Arc::new(TargetFileSizeWriterFactory::new(
+        Arc::new(base),
+        Arc::new(TargetInMemorySizeBytesCalculator::new(
+            target_file_size,
+            inflation_factor,
+        )),
+    ))
+}
+
+/// Opens one delete file at a time for a single group of removed rows.
+#[cfg(feature = "python")]
+struct PositionDeleteWriterFactory {
+    opener: Arc<pyo3::Py<pyo3::PyAny>>,
+    file_index: i64,
+}
+
+#[cfg(feature = "python")]
+impl WriterFactory for PositionDeleteWriterFactory {
+    type Input = MicroPartition;
+    type Result = Option<RecordBatch>;
+
+    fn create_writer(
+        &self,
+        file_idx: usize,
+        _partition_values: Option<&RecordBatch>,
+    ) -> DaftResult<Box<dyn AsyncFileWriter<Input = Self::Input, Result = Self::Result>>> {
+        let writer = pyarrow::PyArrowWriter::new_position_delete_writer(
+            &self.opener,
+            file_idx,
+            self.file_index,
+        )?;
+        Ok(Box::new(writer))
+    }
+}
+
 #[cfg(feature = "python")]
 pub fn make_catalog_writer_factory(
     catalog_info: &daft_logical_plan::CatalogType<BoundExpr>,

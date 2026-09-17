@@ -16,6 +16,7 @@ from daft.udf.legacy import UDF, BoundUDFArgs, InitArgsType, UninitializedUdf
 if TYPE_CHECKING:
     import pyarrow as pa
     import ray
+    from daft.io.writer import IcebergPositionDeleteWriter
     from pyiceberg.schema import Schema as IcebergSchema
     from pyiceberg.table import TableProperties as IcebergTableProperties
 
@@ -2362,6 +2363,14 @@ class LogicalPlanBuilder:
         prefix: str | None = None,
         suffix: str | None = None,
         key_filtering_config: KeyFilteringConfig | None = None,
+        build_on_left: bool | None = None,
+    ) -> LogicalPlanBuilder: ...
+    def join_on(
+        self,
+        right: LogicalPlanBuilder,
+        on: PyExpr,
+        join_type: JoinType,
+        build_on_left: bool | None = None,
     ) -> LogicalPlanBuilder: ...
     def join_asof(
         self,
@@ -2381,6 +2390,25 @@ class LogicalPlanBuilder:
     def except_(self, other: LogicalPlanBuilder, is_all: bool) -> LogicalPlanBuilder: ...
     def add_monotonically_increasing_id(self, column_name: str | None) -> LogicalPlanBuilder: ...
     def merge_rows(self, config: MergeRowsConfig) -> LogicalPlanBuilder: ...
+    def iceberg_row_delta_write(
+        self,
+        table_name: str,
+        table_location: str,
+        partition_spec_id: int,
+        partition_cols: list[PyExpr],
+        iceberg_schema: IcebergSchema,
+        iceberg_properties: IcebergTableProperties,
+        catalog_columns: list[str],
+        action_column: str,
+        file_index_column: str,
+        position_column: str,
+        sort_order_id: int,
+        io_config: IOConfig | None = None,
+        delete_writer_factory: Callable[[int, int], IcebergPositionDeleteWriter] | None = None,
+        delete_file_paths: list[str] | None = None,
+        delete_file_groups: list[int] | None = None,
+        delete_target_file_size: int | None = None,
+    ) -> LogicalPlanBuilder: ...
     def table_write(
         self,
         root_dir: str,

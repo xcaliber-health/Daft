@@ -44,6 +44,7 @@ impl OptimizerRule for SimplifyNullFilteredJoin {
                         join_type,
                         join_strategy,
                         key_filtering_config,
+                        build_on_left,
                         ..
                     }) if matches!(
                         join_type,
@@ -83,6 +84,7 @@ impl OptimizerRule for SimplifyNullFilteredJoin {
                                 simplified_join_type,
                                 *join_strategy,
                             )?
+                            .with_build_on_left(*build_on_left)
                             .with_key_filtering_config(key_filtering_config.clone())
                             .into();
                             return Ok(Transformed::yes(

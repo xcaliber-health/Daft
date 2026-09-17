@@ -51,6 +51,16 @@ impl Sink {
                             Field::new("data_file", DataType::Python),
                         ]
                     }
+                    // A row-level write reports the files it added on both sides,
+                    // plus one row carrying how many rows each decision covered.
+                    CatalogType::IcebergRowDelta(_) => vec![
+                        Field::new("data_file", DataType::Python),
+                        Field::new("delete_file", DataType::Python),
+                        Field::new("rows_kept", DataType::Int64),
+                        Field::new("rows_updated", DataType::Int64),
+                        Field::new("rows_deleted", DataType::Int64),
+                        Field::new("rows_inserted", DataType::Int64),
+                    ],
                     CatalogType::DeltaLake(_) => vec![Field::new("add_action", DataType::Python)],
                     CatalogType::Lance(_) => vec![Field::new("fragments", DataType::Python)],
                 }
@@ -101,6 +111,21 @@ impl Sink {
                 CatalogType::Iceberg(iceberg_info) => {
                     res.push(format!("Sink: Iceberg({})", iceberg_info.table_name));
                     res.extend(iceberg_info.multiline_display());
+                }
+                CatalogType::IcebergRowDelta(row_delta_info) => {
+                    res.push(format!(
+                        "Sink: Iceberg row delta({})",
+                        row_delta_info.data.table_name
+                    ));
+                    res.extend(row_delta_info.data.multiline_display());
+                    res.push(format!(
+                        "Deletes = {}",
+                        if row_delta_info.deletes.is_some() {
+                            "position delete files"
+                        } else {
+                            "rewritten files"
+                        }
+                    ));
                 }
                 CatalogType::DeltaLake(deltalake_info) => {
                     res.push(format!("Sink: DeltaLake({})", deltalake_info.path));

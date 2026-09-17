@@ -188,6 +188,13 @@ pub struct Join {
     /// Only set when join_strategy == Some(KeyFiltering) and join_type == Anti.
     /// Carries the execution configuration for a key-filtering anti-join.
     pub key_filtering_config: Option<KeyFilteringConfig>,
+    /// Which side builds the lookup table, when the caller requires a side.
+    ///
+    /// Left unset the engine picks by size. A caller sets it when the shape of
+    /// the output matters to it: the probe side's rows come back grouped, so a
+    /// consumer that reasons about all matches of one row needs that row to be
+    /// on the probe side.
+    pub build_on_left: Option<bool>,
 }
 
 impl Join {
@@ -215,11 +222,19 @@ impl Join {
             output_schema,
             stats_state: StatsState::NotMaterialized,
             key_filtering_config: None,
+            build_on_left: None,
         })
     }
 
     pub fn with_key_filtering_config(mut self, config: Option<KeyFilteringConfig>) -> Self {
         self.key_filtering_config = config;
+        self
+    }
+
+    /// Require a side to build the lookup table; see [`Self::build_on_left`].
+    #[must_use]
+    pub fn with_build_on_left(mut self, build_on_left: Option<bool>) -> Self {
+        self.build_on_left = build_on_left;
         self
     }
 

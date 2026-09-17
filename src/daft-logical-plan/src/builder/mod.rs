@@ -28,7 +28,7 @@ use resolve_expr::ExprResolver;
 use {
     crate::PyFormatSinkOption,
     crate::merge_info::PyMergeRowsConfig,
-    crate::sink_info::{CatalogInfo, IcebergCatalogInfo},
+    crate::sink_info::{CatalogInfo, IcebergCatalogInfo, IcebergDeleteInfo, IcebergRowDeltaInfo},
     common_daft_config::PyDaftPlanningConfig,
     common_io_config::python::IOConfig as PyIOConfig,
     daft_dsl::python::PyExpr,
@@ -953,6 +953,36 @@ impl LogicalPlanBuilder {
         Ok(self.with_new_plan(logical_plan))
     }
 
+    /// Write the rows a row-level merge decided on: data files for the rows that
+    /// survive, and, when `deletes` is given, delete files naming the rows removed
+    /// from files that stay.
+    #[cfg(feature = "python")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn iceberg_row_delta_write(
+        &self,
+        data: IcebergCatalogInfo,
+        deletes: Option<IcebergDeleteInfo>,
+        action_column: String,
+        file_index_column: String,
+        position_column: String,
+        catalog_columns: Vec<String>,
+    ) -> DaftResult<Self> {
+        let sink_info = SinkInfo::CatalogInfo(CatalogInfo {
+            catalog: crate::sink_info::CatalogType::IcebergRowDelta(IcebergRowDeltaInfo {
+                data,
+                deletes,
+                action_column,
+                file_index_column,
+                position_column,
+            }),
+            catalog_columns,
+        });
+
+        let logical_plan: LogicalPlan =
+            ops::Sink::try_new(self.plan.clone(), sink_info.into())?.into();
+        Ok(self.with_new_plan(logical_plan))
+    }
+
     #[cfg(feature = "python")]
     #[allow(clippy::too_many_arguments)]
     pub fn delta_write(
@@ -1505,6 +1535,7 @@ impl PyLogicalPlanBuilder {
         prefix,
         suffix,
         key_filtering_config=None,
+        build_on_left=None,
     ))]
     pub fn join(
         &self,
@@ -1516,6 +1547,7 @@ impl PyLogicalPlanBuilder {
         prefix: Option<String>,
         suffix: Option<String>,
         key_filtering_config: Option<ops::PyKeyFilteringConfig>,
+        build_on_left: Option<bool>,
     ) -> PyResult<Self> {
         let key_filtering_config = match (join_strategy, key_filtering_config) {
             (Some(JoinStrategy::KeyFiltering), Some(config)) => {
@@ -1600,12 +1632,16 @@ impl PyLogicalPlanBuilder {
             JoinOptions { prefix, suffix },
         )?;
 
-        if let Some(key_filtering_config) = key_filtering_config {
+        if key_filtering_config.is_some() || build_on_left.is_some() {
             result = match result.plan.as_ref() {
                 LogicalPlan::Join(join) => {
-                    let new_join = join
-                        .clone()
-                        .with_key_filtering_config(Some(key_filtering_config));
+                    let mut new_join = join.clone();
+                    if let Some(config) = key_filtering_config {
+                        new_join = new_join.with_key_filtering_config(Some(config));
+                    }
+                    if build_on_left.is_some() {
+                        new_join = new_join.with_build_on_left(build_on_left);
+                    }
                     let logical_plan: LogicalPlan = new_join.into();
                     result.with_new_plan(logical_plan)
                 }
@@ -1615,6 +1651,38 @@ impl PyLogicalPlanBuilder {
 
         Ok(result.into())
     }
+    /// Join on an arbitrary predicate rather than matching column pairs.
+    ///
+    /// `build_on_left` requires a side to build the lookup table, which a caller
+    /// needs when it reasons about all matches of one row: those come back
+    /// grouped only for rows on the probe side.
+    #[pyo3(signature = (right, on, join_type, build_on_left=None))]
+    pub fn join_on(
+        &self,
+        right: &Self,
+        on: PyExpr,
+        join_type: JoinType,
+        build_on_left: Option<bool>,
+    ) -> PyResult<Self> {
+        let result = self.builder.join(
+            &right.builder,
+            Some(on.expr),
+            Vec::new(),
+            join_type,
+            None,
+            JoinOptions::default(),
+        )?;
+        let result = match (build_on_left, result.plan.as_ref()) {
+            (Some(_), LogicalPlan::Join(join)) => {
+                let logical_plan: LogicalPlan =
+                    join.clone().with_build_on_left(build_on_left).into();
+                result.with_new_plan(logical_plan)
+            }
+            _ => result,
+        };
+        Ok(result.into())
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (right, left_by, right_by, left_on, right_on, strategy, prefix, suffix, assume_sorted_and_aligned=false))]
     pub fn join_asof(
@@ -1762,6 +1830,88 @@ impl PyLogicalPlanBuilder {
                 Arc::new(iceberg_properties),
                 sort_order_id,
                 io_config.map(|cfg| cfg.config),
+                catalog_columns,
+            )?
+            .into())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        table_name,
+        table_location,
+        partition_spec_id,
+        partition_cols,
+        iceberg_schema,
+        iceberg_properties,
+        catalog_columns,
+        action_column,
+        file_index_column,
+        position_column,
+        sort_order_id,
+        io_config=None,
+        delete_writer_factory=None,
+        delete_file_paths=None,
+        delete_file_groups=None,
+        delete_target_file_size=None,
+    ))]
+    pub fn iceberg_row_delta_write(
+        &self,
+        table_name: String,
+        table_location: String,
+        partition_spec_id: i64,
+        partition_cols: Vec<PyExpr>,
+        iceberg_schema: pyo3::Py<pyo3::PyAny>,
+        iceberg_properties: pyo3::Py<pyo3::PyAny>,
+        catalog_columns: Vec<String>,
+        action_column: String,
+        file_index_column: String,
+        position_column: String,
+        sort_order_id: i64,
+        io_config: Option<common_io_config::python::IOConfig>,
+        delete_writer_factory: Option<pyo3::Py<pyo3::PyAny>>,
+        delete_file_paths: Option<Vec<String>>,
+        delete_file_groups: Option<Vec<i64>>,
+        delete_target_file_size: Option<usize>,
+    ) -> PyResult<Self> {
+        let deletes = match (delete_writer_factory, delete_file_paths, delete_file_groups) {
+            (Some(writer_factory), Some(file_paths), Some(file_groups)) => {
+                if file_paths.len() != file_groups.len() {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "every planned file needs both a path and a delete group",
+                    ));
+                }
+                Some(IcebergDeleteInfo {
+                    writer_factory: Arc::new(writer_factory),
+                    file_paths,
+                    file_groups,
+                    target_file_size: delete_target_file_size.unwrap_or(64 * 1024 * 1024),
+                })
+            }
+            (None, None, None) => None,
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "writing delete files needs the opener, the file paths and their groups",
+                ));
+            }
+        };
+        let data = IcebergCatalogInfo {
+            table_name,
+            table_location,
+            partition_spec_id,
+            partition_cols: pyexprs_to_exprs(partition_cols),
+            iceberg_schema: Arc::new(iceberg_schema),
+            iceberg_properties: Arc::new(iceberg_properties),
+            sort_order_id,
+            io_config: io_config.map(|cfg| cfg.config),
+        };
+        Ok(self
+            .builder
+            .iceberg_row_delta_write(
+                data,
+                deletes,
+                action_column,
+                file_index_column,
+                position_column,
                 catalog_columns,
             )?
             .into())

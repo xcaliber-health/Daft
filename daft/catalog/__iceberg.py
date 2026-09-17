@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from daft.io.iceberg import (
         ExpireResult,
         IcebergMaintenanceOptions,
+        MergeIntoBuilder,
         RemoveOrphanResult,
         RewriteManifestsResult,
         RewritePositionDeletesResult,
@@ -731,6 +732,75 @@ class IcebergTable(Table):
         from daft.io.iceberg._rewrite_position_deletes import run as _rewrite_position_deletes_run
 
         return _rewrite_position_deletes_run(self._inner, where=where, branch=branch, options=options)
+
+    def merge_into(
+        self,
+        source: DataFrame,
+        on: Expression,
+        *,
+        target_alias: str = "target",
+        source_alias: str = "source",
+        branch: str | None = None,
+        options: IcebergMaintenanceOptions | None = None,
+    ) -> MergeIntoBuilder:
+        """Merge rows of ``source`` into this table.
+
+        State the rules on the returned builder, then run it. Rules are tried in
+        the order they are given and the first whose condition holds decides the
+        row; a row no rule claims is left as it is. One row of the table may be
+        matched by at most one source row.
+
+        Whether a change rewrites the files holding the old rows or records their
+        positions instead follows the table's own ``write.merge.mode``.
+
+        Parameters
+        ----------
+        source : DataFrame
+            Rows to merge in.
+        on : Expression
+            Condition pairing the table's rows with the source's, over
+            ``target.<column>`` and ``source.<column>``.
+        target_alias : str
+            Name the table's columns are addressed under. Defaults to ``target``.
+        source_alias : str
+            Name the source's columns are addressed under. Defaults to ``source``.
+        branch : str, optional
+            Branch to write. Defaults to ``main``.
+        options : dict, optional
+            ``isolation-level`` (``serializable`` or ``snapshot``; defaults to the
+            table's) and ``merge-id``, which makes a repeated run return the
+            result of the first rather than applying the change twice.
+
+        Returns:
+        -------
+        MergeIntoBuilder
+            Builder to state the rules on and run.
+
+        Examples:
+        --------
+        >>> from daft import col
+        >>> (  # doctest: +SKIP
+        ...     table.merge_into(updates, on=col("target.id") == col("source.id"))
+        ...     .when_matched(col("source.op") == "delete")
+        ...     .delete()
+        ...     .when_matched()
+        ...     .update({"label": col("source.label")})
+        ...     .when_not_matched()
+        ...     .insert_all()
+        ...     .execute()
+        ... )
+        """
+        from daft.io.iceberg._merge import MergeIntoBuilder
+
+        return MergeIntoBuilder(
+            self._inner,
+            source,
+            on,
+            target_alias=target_alias,
+            source_alias=source_alias,
+            branch=branch,
+            options=options,
+        )
 
     def compact_files(
         self,

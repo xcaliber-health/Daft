@@ -49,8 +49,94 @@ pub struct CatalogInfo<E = ExprRef> {
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum CatalogType<E = ExprRef> {
     Iceberg(IcebergCatalogInfo<E>),
+    IcebergRowDelta(IcebergRowDeltaInfo<E>),
     DeltaLake(DeltaLakeCatalogInfo<E>),
     Lance(LanceCatalogInfo),
+}
+
+/// A write that both adds rows and removes rows named by where they are stored.
+///
+/// The incoming rows are tagged with what the write should do with each of them.
+/// Rows to keep or add go to the data writer; rows to remove are recorded by the
+/// file and position they occupy, and become delete files when `deletes` is set.
+/// Without `deletes` the removals are implied by rewriting whole files instead.
+#[cfg(feature = "python")]
+#[derive(Educe, Clone, Serialize, Deserialize)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[educe(PartialEq, Eq, Hash)]
+pub struct IcebergRowDeltaInfo<E = ExprRef> {
+    /// Where and how new data files are written.
+    pub data: IcebergCatalogInfo<E>,
+    /// How rows removed from existing files are recorded.
+    pub deletes: Option<IcebergDeleteInfo>,
+    /// Column holding what the merge decided for each row.
+    pub action_column: String,
+    /// Column holding the index of the file a row was read from.
+    pub file_index_column: String,
+    /// Column holding a row's position in that file.
+    pub position_column: String,
+}
+
+/// Where the rows removed by a write are recorded.
+#[cfg(feature = "python")]
+#[derive(Educe, Clone, Serialize, Deserialize)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[educe(PartialEq, Eq, Hash)]
+pub struct IcebergDeleteInfo {
+    /// Opens the writer for one group of removals, given the group's ordinal and
+    /// the index of a file it names.
+    #[serde(
+        serialize_with = "serialize_py_object",
+        deserialize_with = "deserialize_py_object"
+    )]
+    #[educe(PartialEq(ignore))]
+    #[educe(Hash(ignore))]
+    pub writer_factory: Arc<pyo3::Py<pyo3::PyAny>>,
+    /// Path of the data file at each file index.
+    pub file_paths: Vec<String>,
+    /// Group each file index belongs to. Non-decreasing, so one pass over rows
+    /// sorted by file index and position visits each group once.
+    pub file_groups: Vec<i64>,
+    /// Size a delete file is rolled at, in bytes.
+    pub target_file_size: usize,
+}
+
+#[cfg(feature = "python")]
+impl IcebergDeleteInfo {
+    /// Group of the file at `index`.
+    ///
+    /// # Errors
+    /// If `index` names no planned file, which means a row carried provenance
+    /// from a different plan than the one being written.
+    pub fn group_of(&self, index: i64) -> common_error::DaftResult<i64> {
+        usize::try_from(index)
+            .ok()
+            .and_then(|index| self.file_groups.get(index))
+            .copied()
+            .ok_or_else(|| {
+                common_error::DaftError::ValueError(format!(
+                    "file index {index} is outside the {} planned file(s)",
+                    self.file_groups.len()
+                ))
+            })
+    }
+
+    /// Path of the file at `index`.
+    ///
+    /// # Errors
+    /// See [`Self::group_of`].
+    pub fn path_of(&self, index: i64) -> common_error::DaftResult<&str> {
+        usize::try_from(index)
+            .ok()
+            .and_then(|index| self.file_paths.get(index))
+            .map(String::as_str)
+            .ok_or_else(|| {
+                common_error::DaftError::ValueError(format!(
+                    "file index {index} is outside the {} planned file(s)",
+                    self.file_paths.len()
+                ))
+            })
+    }
 }
 
 #[cfg(feature = "python")]
@@ -287,6 +373,15 @@ impl CatalogType {
         match self {
             Self::Iceberg(iceberg_catalog_info) => {
                 Ok(CatalogType::Iceberg(iceberg_catalog_info.bind(schema)?))
+            }
+            Self::IcebergRowDelta(row_delta_info) => {
+                Ok(CatalogType::IcebergRowDelta(IcebergRowDeltaInfo {
+                    data: row_delta_info.data.bind(schema)?,
+                    deletes: row_delta_info.deletes,
+                    action_column: row_delta_info.action_column,
+                    file_index_column: row_delta_info.file_index_column,
+                    position_column: row_delta_info.position_column,
+                }))
             }
             Self::DeltaLake(delta_lake_catalog_info) => Ok(CatalogType::DeltaLake(
                 delta_lake_catalog_info.bind(schema)?,

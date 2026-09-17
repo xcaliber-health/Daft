@@ -149,6 +149,13 @@ fn sink_display_name(sink_info: &SinkInfo<BoundExpr>) -> String {
                     "Partitioned DeltaLake Write".to_string()
                 }
             }
+            CatalogType::IcebergRowDelta(rd) => {
+                if rd.deletes.is_some() {
+                    "Iceberg Row Delta Write".to_string()
+                } else {
+                    "Iceberg Row Rewrite Write".to_string()
+                }
+            }
             CatalogType::Lance(_) => "Lance Write".to_string(),
         },
         #[cfg(feature = "python")]
@@ -215,14 +222,17 @@ impl SinkNode {
             #[cfg(feature = "python")]
             SinkInfo::CatalogInfo(info) => match &info.catalog {
                 daft_logical_plan::CatalogType::DeltaLake(..)
-                | daft_logical_plan::CatalogType::Iceberg(..) => LocalPhysicalPlan::catalog_write(
-                    input,
-                    info.catalog.clone(),
-                    data_schema,
-                    file_schema,
-                    StatsState::NotMaterialized,
-                    LocalNodeContext::new(Some(node_id as usize)),
-                ),
+                | daft_logical_plan::CatalogType::Iceberg(..)
+                | daft_logical_plan::CatalogType::IcebergRowDelta(..) => {
+                    LocalPhysicalPlan::catalog_write(
+                        input,
+                        info.catalog.clone(),
+                        data_schema,
+                        file_schema,
+                        StatsState::NotMaterialized,
+                        LocalNodeContext::new(Some(node_id as usize)),
+                    )
+                }
                 daft_logical_plan::CatalogType::Lance(info) => LocalPhysicalPlan::lance_write(
                     input,
                     info.clone(),
@@ -306,6 +316,13 @@ impl PipelineNodeImpl for SinkNode {
                 daft_logical_plan::CatalogType::DeltaLake(deltalake_info) => {
                     res.push(format!("Sink: DeltaLake({})", deltalake_info.path));
                     res.extend(deltalake_info.multiline_display());
+                }
+                daft_logical_plan::CatalogType::IcebergRowDelta(row_delta_info) => {
+                    res.push(format!(
+                        "Sink: Iceberg row delta({})",
+                        row_delta_info.data.table_name
+                    ));
+                    res.extend(row_delta_info.data.multiline_display());
                 }
                 daft_logical_plan::CatalogType::Lance(lance_info) => {
                     res.push(format!("Sink: Lance({})", lance_info.path));

@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from pyiceberg.table import Table as IcebergTable
 
     from daft.io import DataSink
+    from daft.io.writer import IcebergPositionDeleteWriter
     from daft.runners.partitioning import PartitionCacheEntry
 
 
@@ -304,6 +305,7 @@ class LogicalPlanBuilder:
         prefix: str | None = None,
         suffix: str | None = None,
         key_filtering_config: Any = None,
+        build_on_left: bool | None = None,
     ) -> LogicalPlanBuilder:
         builder = self._builder.join(
             right._builder,
@@ -314,8 +316,19 @@ class LogicalPlanBuilder:
             prefix,
             suffix,
             key_filtering_config,
+            build_on_left,
         )
         return LogicalPlanBuilder(builder)
+
+    def join_on(
+        self,
+        right: LogicalPlanBuilder,
+        on: Expression,
+        how: JoinType,
+        build_on_left: bool | None = None,
+    ) -> LogicalPlanBuilder:
+        """Join on a predicate, optionally requiring which side builds the lookup table."""
+        return LogicalPlanBuilder(self._builder.join_on(right._builder, on._expr, how, build_on_left))
 
     def join_asof(
         self,
@@ -473,6 +486,79 @@ class LogicalPlanBuilder:
             columns,
             sort_order_id,
             io_config,
+        )
+        return LogicalPlanBuilder(builder)
+
+    def write_iceberg_row_delta(
+        self,
+        table: IcebergTable,
+        io_config: IOConfig,
+        *,
+        action_column: str,
+        file_index_column: str,
+        position_column: str,
+        partition_spec_id: int | None = None,
+        sort_order_id: int = 0,
+        delete_writer_factory: Callable[[int, int], IcebergPositionDeleteWriter] | None = None,
+        delete_file_paths: list[str] | None = None,
+        delete_file_groups: list[int] | None = None,
+        delete_target_file_size: int | None = None,
+    ) -> LogicalPlanBuilder:
+        """Build a plan that writes the rows a row-level merge decided on.
+
+        Parameters
+        ----------
+        table
+            The destination table handle.
+        io_config
+            Object-store access configuration for the write.
+        action_column
+            Column holding what the merge decided for each row.
+        file_index_column
+            Column holding the index of the file a row was read from.
+        position_column
+            Column holding a row's position in that file.
+        partition_spec_id
+            When set, writes new data files under the partition spec with this id
+            rather than the destination's current spec.
+        sort_order_id
+            Identifier of the order the written rows are in; the unsorted order
+            by default.
+        delete_writer_factory
+            Opens the writer for one group of removed rows, given the group's
+            ordinal and the index of a file it names. Leaving it unset records
+            removals by rewriting whole files instead.
+        delete_file_paths
+            Path of the data file at each file index.
+        delete_file_groups
+            Delete-file group of each file index; must not decrease.
+        delete_target_file_size
+            Size a delete file is rolled at, in bytes.
+        """
+        from daft.io.iceberg.iceberg_write import partition_field_to_expr
+
+        name = ".".join(table.name())
+        location = table.metadata.properties.get("write.data.path", f"{table.location()}/data")
+        partition_spec = table.spec() if partition_spec_id is None else table.specs()[partition_spec_id]
+        schema = table.schema()
+        partition_cols = [partition_field_to_expr(field, schema)._expr for field in partition_spec.fields]
+        builder = self._builder.iceberg_row_delta_write(
+            name,
+            location,
+            partition_spec.spec_id,
+            partition_cols,
+            schema,
+            dict(table.properties),
+            [col.name for col in schema.columns],
+            action_column,
+            file_index_column,
+            position_column,
+            sort_order_id,
+            io_config,
+            delete_writer_factory,
+            delete_file_paths,
+            delete_file_groups,
+            delete_target_file_size,
         )
         return LogicalPlanBuilder(builder)
 

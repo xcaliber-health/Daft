@@ -762,3 +762,104 @@ class DeltalakeWriter(ParquetFileWriter):
         )
 
         return RecordBatch.from_pydict({"add_action": [add_action]})
+
+
+class IcebergPositionDeleteWriter(IcebergWriter):
+    """Writes the positions of removed rows as a delete file.
+
+    A delete file names rows by the data file holding them and their position in
+    that file, so it carries only those two columns and is read in that order.
+    Bounds are kept in full on the path column, which is what lets a reader skip
+    a delete file that names no file it is reading.
+    """
+
+    def __init__(
+        self,
+        root_dir: str,
+        file_idx: int,
+        properties: IcebergTableProperties,
+        partition_spec_id: int,
+        partition_values: RecordBatch | None = None,
+        io_config: IOConfig | None = None,
+    ):
+        """Open a delete file under ``root_dir``.
+
+        Args:
+            root_dir (str): Directory the file is written under.
+            file_idx (int): Ordinal of this file among the writer's output.
+            properties (IcebergTableProperties): Table properties; ``write.delete.*``
+                override their ``write.*`` counterparts.
+            partition_spec_id (int): Partitioning the removed rows were stored under.
+            partition_values (RecordBatch, optional): Partition of the removed rows.
+            io_config (IOConfig, optional): Storage access configuration.
+        """
+        super().__init__(
+            root_dir=root_dir,
+            file_idx=file_idx,
+            schema=position_delete_schema(),
+            properties={**delete_write_properties(dict(properties or {})), _PATH_METRICS_KEY: "full"},
+            partition_spec_id=partition_spec_id,
+            sort_order_id=0,
+            partition_values=partition_values,
+            io_config=io_config,
+        )
+
+    def close(self) -> RecordBatch:
+        """Return the delete file's metadata, or an empty batch if nothing was written."""
+        from pyiceberg.manifest import DataFile, DataFileContent
+
+        written = super().close()
+        files = written.to_pydict().get("data_file", [])
+        if not files:
+            return written
+        data_file = files[0]
+        delete_file = DataFile.from_args(
+            _table_format_version=2,
+            content=DataFileContent.POSITION_DELETES,
+            file_path=data_file.file_path,
+            file_format=data_file.file_format,
+            partition=data_file.partition,
+            record_count=data_file.record_count,
+            file_size_in_bytes=data_file.file_size_in_bytes,
+            column_sizes=data_file.column_sizes,
+            value_counts=data_file.value_counts,
+            null_value_counts=data_file.null_value_counts,
+            nan_value_counts=data_file.nan_value_counts,
+            lower_bounds=data_file.lower_bounds,
+            upper_bounds=data_file.upper_bounds,
+            split_offsets=data_file.split_offsets,
+            equality_ids=None,
+            key_metadata=None,
+            sort_order_id=None,
+        )
+        delete_file.spec_id = self.partition_spec_id
+        return RecordBatch.from_pydict({"data_file": [delete_file]})
+
+
+#: Field ids the format reserves for the two columns of a position delete file.
+_DELETE_FILE_PATH_FIELD_ID = 2147483546
+_DELETE_POS_FIELD_ID = 2147483545
+#: Property that keeps untruncated bounds on the path column.
+_PATH_METRICS_KEY = "write.metadata.metrics.column.file_path"
+_DELETE_PROPERTY_PREFIX = "write.delete."
+_DATA_PROPERTY_PREFIX = "write."
+
+
+def position_delete_schema() -> IcebergSchema:
+    """Return the schema of a position delete file."""
+    from pyiceberg.schema import Schema
+    from pyiceberg.types import LongType, NestedField, StringType
+
+    return Schema(
+        NestedField(_DELETE_FILE_PATH_FIELD_ID, "file_path", StringType(), required=True),
+        NestedField(_DELETE_POS_FIELD_ID, "pos", LongType(), required=True),
+    )
+
+
+def delete_write_properties(properties: dict[str, str]) -> dict[str, str]:
+    """Return the properties a delete file is written under: ``write.delete.*`` over ``write.*``."""
+    out = dict(properties)
+    for key, value in properties.items():
+        if key.startswith(_DELETE_PROPERTY_PREFIX) and not key.endswith(("target-file-size-bytes", "granularity")):
+            out[_DATA_PROPERTY_PREFIX + key[len(_DELETE_PROPERTY_PREFIX) :]] = value
+    return out

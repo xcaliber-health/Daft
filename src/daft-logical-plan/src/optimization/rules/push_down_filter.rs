@@ -350,6 +350,7 @@ impl PushDownFilter {
                 on,
                 join_strategy,
                 key_filtering_config,
+                build_on_left,
                 ..
             }) => {
                 // TODO(Kevin): add more filter pushdowns for joins
@@ -448,6 +449,7 @@ impl PushDownFilter {
 
                     let new_join = Arc::new(LogicalPlan::Join(
                         Join::try_new(new_left, new_right, on.clone(), *join_type, *join_strategy)?
+                            .with_build_on_left(*build_on_left)
                             .with_key_filtering_config(key_filtering_config.clone()),
                     ));
 

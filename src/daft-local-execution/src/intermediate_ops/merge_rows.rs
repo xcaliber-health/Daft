@@ -142,7 +142,12 @@ fn merge_batch(
             if claimed.true_count() == 0 {
                 continue;
             }
-            outputs.push(apply_clause(batch, clause, &claimed)?);
+            outputs.push(apply_clause(
+                batch,
+                clause,
+                &claimed,
+                &config.action_column,
+            )?);
             unclaimed = and(&unclaimed, &not(&claimed)?)?;
         }
     }
@@ -154,11 +159,12 @@ fn apply_clause(
     batch: &RecordBatch,
     clause: &MergeClause<BoundExpr>,
     claimed: &ArrowBooleanArray,
+    action_column: &str,
 ) -> DaftResult<RecordBatch> {
     let rows = batch.mask_filter(&mask_series(claimed)?)?;
     let projected = rows.eval_expression_list(&clause.outputs)?;
     let action = UInt8Array::from_iter(
-        Field::new(ACTION_COLUMN_PLACEHOLDER, DataType::UInt8),
+        Field::new(action_column, DataType::UInt8),
         std::iter::repeat_n(Some(clause.action.tag()), projected.len()),
     )
     .into_series();
@@ -168,9 +174,6 @@ fn apply_clause(
     columns.push(action);
     RecordBatch::from_nonempty_columns(columns)
 }
-
-/// Placeholder name for the action column; the real name is applied by the caller's schema.
-const ACTION_COLUMN_PLACEHOLDER: &str = "__merge_action";
 
 /// Evaluate a predicate, reading a null result as "does not hold".
 fn predicate_mask(batch: &RecordBatch, expr: &BoundExpr) -> DaftResult<ArrowBooleanArray> {

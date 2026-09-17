@@ -178,6 +178,28 @@ impl PyArrowWriter {
         })
     }
 
+    /// Opens the writer for one group of removed-row positions.
+    ///
+    /// `factory` is the caller's own opener, which resolves where the group's
+    /// delete file belongs from the index of a data file it names.
+    ///
+    /// # Errors
+    /// If the opener raises.
+    pub fn new_position_delete_writer(
+        factory: &pyo3::Py<pyo3::PyAny>,
+        group_idx: usize,
+        file_index: i64,
+    ) -> DaftResult<Self> {
+        Python::attach(|py| {
+            let py_writer = factory.bind(py).call1((group_idx, file_index))?;
+            Ok(Self {
+                py_writer: py_writer.into(),
+                is_closed: false,
+                bytes_written: 0,
+            })
+        })
+    }
+
     pub fn new_deltalake_writer(
         root_dir: &str,
         file_idx: usize,

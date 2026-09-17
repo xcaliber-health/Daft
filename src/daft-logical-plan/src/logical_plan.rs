@@ -832,6 +832,7 @@ impl LogicalPlan {
                     join_type,
                     join_strategy,
                     key_filtering_config,
+                    build_on_left,
                     ..
                 }) => Self::Join(
                     Join::try_new(
@@ -842,7 +843,8 @@ impl LogicalPlan {
                         *join_strategy,
                     )
                     .unwrap()
-                    .with_key_filtering_config(key_filtering_config.clone()),
+                    .with_key_filtering_config(key_filtering_config.clone())
+                    .with_build_on_left(*build_on_left),
                 ),
                 Self::AsofJoin(AsofJoin {
                     left_by,

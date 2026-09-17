@@ -483,7 +483,7 @@ fn translate_helper(
                         right_plan,
                         left_on,
                         right_on,
-                        None,
+                        join.build_on_left,
                         Some(null_equals_nulls),
                         join.join_type,
                         join.output_schema.clone(),
@@ -649,7 +649,8 @@ fn translate_helper(
                 #[cfg(feature = "python")]
                 SinkInfo::CatalogInfo(info) => match &info.catalog {
                     daft_logical_plan::CatalogType::DeltaLake(..)
-                    | daft_logical_plan::CatalogType::Iceberg(..) => {
+                    | daft_logical_plan::CatalogType::Iceberg(..)
+                    | daft_logical_plan::CatalogType::IcebergRowDelta(..) => {
                         LocalPhysicalPlan::catalog_write(
                             input_plan,
                             info.catalog.clone().bind(&data_schema)?,

@@ -900,6 +900,7 @@ impl LocalPhysicalPlan {
         null_equals_null: Option<Vec<bool>>,
         join_type: JoinType,
         schema: SchemaRef,
+        residual: Option<BoundExpr>,
         stats_state: StatsState,
         context: LocalNodeContext,
     ) -> LocalPhysicalPlanRef {
@@ -912,6 +913,7 @@ impl LocalPhysicalPlan {
             null_equals_null,
             join_type,
             schema,
+            residual,
             stats_state,
             context,
         })
@@ -1887,6 +1889,7 @@ impl LocalPhysicalPlan {
                     join_type,
                     build_on_left,
                     schema,
+                    residual,
                     stats_state,
                     context,
                     ..
@@ -1899,6 +1902,7 @@ impl LocalPhysicalPlan {
                     null_equals_null.clone(),
                     *join_type,
                     schema.clone(),
+                    residual.clone(),
                     stats_state.clone(),
                     context.clone(),
                 ),
@@ -2284,6 +2288,9 @@ pub struct HashJoin {
     pub null_equals_null: Option<Vec<bool>>,
     pub join_type: JoinType,
     pub schema: SchemaRef,
+    /// Part of the join predicate key equality cannot express, checked on the
+    /// pairs key equality allows. Bound against the join's own output.
+    pub residual: Option<BoundExpr>,
     pub stats_state: StatsState,
     pub context: LocalNodeContext,
 }

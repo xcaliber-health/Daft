@@ -59,7 +59,6 @@ use crate::{
         into_partitions::IntoPartitionsSink,
         pivot::PivotSink,
         repartition::RepartitionSink,
-        row_delta_write::RowDeltaWriteSink,
         sort::SortSink,
         top_n::TopNSink,
         window_order_by_only::WindowOrderByOnlySink,
@@ -1138,6 +1137,7 @@ fn physical_plan_to_pipeline(
             join_type,
             build_on_left,
             schema,
+            residual,
             stats_state,
             context,
         }) => {
@@ -1269,8 +1269,10 @@ fn physical_plan_to_pipeline(
                 }
                 let key_schema = Arc::new(Schema::new(build_key_fields));
 
+                // Checking a predicate beyond key equality needs the rows behind
+                // each match, not only that a match exists.
                 let track_indices = if matches!(join_type, JoinType::Anti | JoinType::Semi) {
-                    build_on_left
+                    build_on_left || residual.is_some()
                 } else {
                     true
                 };
@@ -1287,6 +1289,7 @@ fn physical_plan_to_pipeline(
                     right_schema.clone(),
                     common_join_cols,
                     schema.clone(),
+                    residual.clone(),
                 )?;
                 let build_child_node = physical_plan_to_pipeline(build_child, cfg, ctx, input_senders)?;
                 let probe_child_node = physical_plan_to_pipeline(probe_child, cfg, ctx, input_senders)?;
@@ -1502,6 +1505,8 @@ fn physical_plan_to_pipeline(
             use daft_logical_plan::CatalogType;
 
             let child_node = physical_plan_to_pipeline(input, cfg, ctx, input_senders)?;
+
+            use crate::sinks::row_delta_write::RowDeltaWriteSink;
 
             if let CatalogType::IcebergRowDelta(row_delta) = catalog_type {
                 let data_partition_by = (!row_delta.data.partition_cols.is_empty())

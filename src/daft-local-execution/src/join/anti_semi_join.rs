@@ -10,6 +10,7 @@ use futures::{StreamExt, stream};
 use crate::join::{
     hash_join::{HashJoinParams, HashJoinProbeState},
     index_bitmap::IndexBitmapBuilder,
+    residual::Candidates,
 };
 
 pub(crate) fn probe_anti_semi(
@@ -21,7 +22,24 @@ pub(crate) fn probe_anti_semi(
 
     let input_tables = input.record_batches();
     let mut input_idxs = vec![vec![]; input_tables.len()];
+    let build_side_tables = probe_state.get_record_batches().iter().collect::<Vec<_>>();
     for (probe_side_table_idx, table) in input_tables.iter().enumerate() {
+        // A predicate beyond key equality can leave a row with no pair, which
+        // decides the row the same way having no key match does.
+        if let Some(residual) = params.residual.as_ref() {
+            let unmatched = Candidates::collect(table, probe_state, &params.probe_on)?
+                .retain(residual, table, &build_side_tables, params.build_on_left)?
+                .unmatched;
+            let mut unmatched = unmatched.into_iter().peekable();
+            for probe_row_idx in 0..table.len() as u64 {
+                let matched = unmatched.next_if_eq(&probe_row_idx).is_none();
+                if matched == is_semi {
+                    input_idxs[probe_side_table_idx].push(probe_row_idx);
+                }
+            }
+            continue;
+        }
+
         let join_keys = table.eval_expression_list(&params.probe_on)?;
         let iter = probe_state.probe_exists(join_keys)?;
 
@@ -57,14 +75,15 @@ pub(crate) fn probe_anti_semi_with_bitmap(
     probe_state: &ProbeState,
     params: &HashJoinParams,
 ) -> DaftResult<()> {
+    let build_side_tables = probe_state.get_record_batches().iter().collect::<Vec<_>>();
     for table in input.record_batches() {
-        let join_keys = table.eval_expression_list(&params.probe_on)?;
-        let idx_iter = probe_state.probe_indices(join_keys)?;
-
-        for inner_iter in idx_iter.flatten() {
-            for (build_table_idx, build_row_idx) in inner_iter {
-                bitmap_builder.mark_used(build_table_idx as usize, build_row_idx as usize);
-            }
+        let mut candidates = Candidates::collect(table, probe_state, &params.probe_on)?;
+        if let Some(residual) = params.residual.as_ref() {
+            candidates =
+                candidates.retain(residual, table, &build_side_tables, params.build_on_left)?;
+        }
+        for (build_table_idx, build_row_idx) in &candidates.build {
+            bitmap_builder.mark_used(*build_table_idx as usize, *build_row_idx as usize);
         }
     }
     Ok(())

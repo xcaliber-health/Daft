@@ -90,6 +90,9 @@ pub(crate) struct HashJoinParams {
     pub right_schema: SchemaRef,
     pub common_join_cols: IndexSet<String>,
     pub output_schema: SchemaRef,
+    /// Part of the join predicate key equality cannot express, checked on the
+    /// pairs key equality allows.
+    pub residual: Option<BoundExpr>,
 }
 
 pub struct HashJoinOperator {
@@ -110,6 +113,7 @@ impl HashJoinOperator {
         right_schema: SchemaRef,
         common_join_cols: IndexSet<String>,
         output_schema: SchemaRef,
+        residual: Option<BoundExpr>,
     ) -> DaftResult<Self> {
         Ok(Self {
             params: Arc::new(HashJoinParams {
@@ -124,6 +128,7 @@ impl HashJoinOperator {
                 right_schema,
                 common_join_cols,
                 output_schema,
+                residual,
             }),
         })
     }

@@ -10,6 +10,7 @@ use crate::join::{
     hash_join::{HashJoinParams, HashJoinProbeState},
     index_bitmap::IndexBitmapBuilder,
     outer_join::merge_bitmaps_and_construct_null_table,
+    residual::{Candidates, take_build_rows, take_probe_rows},
 };
 
 pub(crate) fn probe_left_right_with_bitmap(
@@ -24,62 +25,23 @@ pub(crate) fn probe_left_right_with_bitmap(
         .record_batches()
         .iter()
         .map(|input_table| {
-            let mut build_side_growable = GrowableRecordBatch::new(
-                &build_side_tables,
-                false,
-                build_side_tables.iter().map(|table| table.len()).sum(),
-            )?;
-            let mut probe_side_idxs = Vec::new();
-
-            let join_keys = input_table.eval_expression_list(&params.probe_on)?;
-            let idx_iter = probe_state.probe_indices(join_keys)?;
-
-            for (probe_row_idx, inner_iter) in idx_iter.enumerate() {
-                if let Some(inner_iter) = inner_iter {
-                    for (build_table_idx, build_row_idx) in inner_iter {
-                        bitmap_builder.mark_used(build_table_idx as usize, build_row_idx as usize);
-                        build_side_growable.extend(
-                            build_table_idx as usize,
-                            build_row_idx as usize,
-                            1,
-                        );
-                        probe_side_idxs.push(probe_row_idx as u64);
-                    }
-                }
+            let mut candidates = Candidates::collect(input_table, probe_state, &params.probe_on)?;
+            if let Some(residual) = params.residual.as_ref() {
+                candidates = candidates.retain(
+                    residual,
+                    input_table,
+                    &build_side_tables,
+                    params.build_on_left,
+                )?;
             }
-
-            let build_side_table = build_side_growable.build()?;
-            let probe_side_table = {
-                let indices_arr = UInt64Array::from_vec("", probe_side_idxs);
-                input_table.take(&indices_arr)?
-            };
-
-            let common_join_keys: Vec<String> = params.common_join_cols.iter().cloned().collect();
-            let left_non_join_columns: Vec<String> = params
-                .left_schema
-                .field_names()
-                .filter(|c| !params.common_join_cols.contains(*c))
-                .map(ToString::to_string)
-                .collect();
-            let right_non_join_columns: Vec<String> = params
-                .right_schema
-                .field_names()
-                .filter(|c| !params.common_join_cols.contains(*c))
-                .map(ToString::to_string)
-                .collect();
-
-            let final_table = if params.join_type == JoinType::Left {
-                let join_table = get_columns_by_name(&build_side_table, &common_join_keys)?;
-                let left = get_columns_by_name(&build_side_table, &left_non_join_columns)?;
-                let right = get_columns_by_name(&probe_side_table, &right_non_join_columns)?;
-                join_table.union(&left)?.union(&right)?
-            } else {
-                let join_table = get_columns_by_name(&build_side_table, &common_join_keys)?;
-                let left = get_columns_by_name(&probe_side_table, &left_non_join_columns)?;
-                let right = get_columns_by_name(&build_side_table, &right_non_join_columns)?;
-                join_table.union(&left)?.union(&right)?
-            };
-            Ok(final_table)
+            for (build_table_idx, build_row_idx) in &candidates.build {
+                bitmap_builder.mark_used(*build_table_idx as usize, *build_row_idx as usize);
+            }
+            assemble_outer_build(
+                &take_build_rows(&build_side_tables, &candidates.build)?,
+                &take_probe_rows(input_table, &candidates.probe)?,
+                params,
+            )
         })
         .collect::<DaftResult<Vec<_>>>()?;
 
@@ -88,6 +50,38 @@ pub(crate) fn probe_left_right_with_bitmap(
         Arc::new(final_tables),
         None,
     ))
+}
+
+/// One row of the join for each pair, where the outer side is the one built on.
+fn assemble_outer_build(
+    build_side_table: &RecordBatch,
+    probe_side_table: &RecordBatch,
+    params: &HashJoinParams,
+) -> DaftResult<RecordBatch> {
+    let common_join_keys: Vec<String> = params.common_join_cols.iter().cloned().collect();
+    let left_non_join_columns: Vec<String> = params
+        .left_schema
+        .field_names()
+        .filter(|c| !params.common_join_cols.contains(*c))
+        .map(ToString::to_string)
+        .collect();
+    let right_non_join_columns: Vec<String> = params
+        .right_schema
+        .field_names()
+        .filter(|c| !params.common_join_cols.contains(*c))
+        .map(ToString::to_string)
+        .collect();
+
+    let join_table = get_columns_by_name(build_side_table, &common_join_keys)?;
+    if params.join_type == JoinType::Left {
+        let left = get_columns_by_name(build_side_table, &left_non_join_columns)?;
+        let right = get_columns_by_name(probe_side_table, &right_non_join_columns)?;
+        join_table.union(&left)?.union(&right)
+    } else {
+        let left = get_columns_by_name(probe_side_table, &left_non_join_columns)?;
+        let right = get_columns_by_name(build_side_table, &right_non_join_columns)?;
+        join_table.union(&left)?.union(&right)
+    }
 }
 
 pub(crate) fn probe_left_right(
@@ -101,65 +95,34 @@ pub(crate) fn probe_left_right(
         .record_batches()
         .iter()
         .map(|input_table| {
+            let mut candidates = Candidates::collect(input_table, probe_state, &params.probe_on)?;
+            if let Some(residual) = params.residual.as_ref() {
+                candidates = candidates.retain(
+                    residual,
+                    input_table,
+                    &build_side_tables,
+                    params.build_on_left,
+                )?;
+            }
+
+            // Rows of the outer side that kept no pair are still emitted, with the
+            // other side left empty.
             let mut build_side_growable = GrowableRecordBatch::new(
                 &build_side_tables,
                 true,
                 build_side_tables.iter().map(|table| table.len()).sum(),
             )?;
-            let mut probe_side_idxs = Vec::with_capacity(input_table.len());
-
-            let join_keys = input_table.eval_expression_list(&params.probe_on)?;
-            let idx_iter = probe_state.probe_indices(join_keys)?;
-            for (probe_row_idx, inner_iter) in idx_iter.enumerate() {
-                if let Some(inner_iter) = inner_iter {
-                    for (build_table_idx, build_row_idx) in inner_iter {
-                        build_side_growable.extend(
-                            build_table_idx as usize,
-                            build_row_idx as usize,
-                            1,
-                        );
-                        probe_side_idxs.push(probe_row_idx as u64);
-                    }
-                } else {
-                    // if there's no match, we should still emit the probe side and fill the build side with nulls
-                    build_side_growable.add_nulls(1);
-                    probe_side_idxs.push(probe_row_idx as u64);
-                }
+            for (build_table_idx, build_row_idx) in &candidates.build {
+                build_side_growable.extend(*build_table_idx as usize, *build_row_idx as usize, 1);
             }
-
+            build_side_growable.add_nulls(candidates.unmatched.len());
             let build_side_table = build_side_growable.build()?;
 
-            let probe_side_table = {
-                let indices_arr = UInt64Array::from_vec("", probe_side_idxs);
-                input_table.take(&indices_arr)?
-            };
+            let mut probe_side_idxs = candidates.probe;
+            probe_side_idxs.extend_from_slice(&candidates.unmatched);
+            let probe_side_table = input_table.take(&UInt64Array::from_vec("", probe_side_idxs))?;
 
-            let common_join_keys: Vec<String> = params.common_join_cols.iter().cloned().collect();
-            let left_non_join_columns: Vec<String> = params
-                .left_schema
-                .field_names()
-                .filter(|c| !params.common_join_cols.contains(*c))
-                .map(ToString::to_string)
-                .collect();
-            let right_non_join_columns: Vec<String> = params
-                .right_schema
-                .field_names()
-                .filter(|c| !params.common_join_cols.contains(*c))
-                .map(ToString::to_string)
-                .collect();
-
-            let final_table = if params.join_type == JoinType::Left {
-                let join_table = get_columns_by_name(&probe_side_table, &common_join_keys)?;
-                let left = get_columns_by_name(&probe_side_table, &left_non_join_columns)?;
-                let right = get_columns_by_name(&build_side_table, &right_non_join_columns)?;
-                join_table.union(&left)?.union(&right)?
-            } else {
-                let join_table = get_columns_by_name(&probe_side_table, &common_join_keys)?;
-                let left = get_columns_by_name(&build_side_table, &left_non_join_columns)?;
-                let right = get_columns_by_name(&probe_side_table, &right_non_join_columns)?;
-                join_table.union(&left)?.union(&right)?
-            };
-            Ok(final_table)
+            assemble_outer_probe(&build_side_table, &probe_side_table, params)
         })
         .collect::<DaftResult<Vec<_>>>()?;
 
@@ -168,6 +131,38 @@ pub(crate) fn probe_left_right(
         Arc::new(final_tables),
         None,
     ))
+}
+
+/// One row of the join for each pair, where the outer side is the one probing.
+fn assemble_outer_probe(
+    build_side_table: &RecordBatch,
+    probe_side_table: &RecordBatch,
+    params: &HashJoinParams,
+) -> DaftResult<RecordBatch> {
+    let common_join_keys: Vec<String> = params.common_join_cols.iter().cloned().collect();
+    let left_non_join_columns: Vec<String> = params
+        .left_schema
+        .field_names()
+        .filter(|c| !params.common_join_cols.contains(*c))
+        .map(ToString::to_string)
+        .collect();
+    let right_non_join_columns: Vec<String> = params
+        .right_schema
+        .field_names()
+        .filter(|c| !params.common_join_cols.contains(*c))
+        .map(ToString::to_string)
+        .collect();
+
+    let join_table = get_columns_by_name(probe_side_table, &common_join_keys)?;
+    if params.join_type == JoinType::Left {
+        let left = get_columns_by_name(probe_side_table, &left_non_join_columns)?;
+        let right = get_columns_by_name(build_side_table, &right_non_join_columns)?;
+        join_table.union(&left)?.union(&right)
+    } else {
+        let left = get_columns_by_name(build_side_table, &left_non_join_columns)?;
+        let right = get_columns_by_name(probe_side_table, &right_non_join_columns)?;
+        join_table.union(&left)?.union(&right)
+    }
 }
 
 pub(crate) async fn finalize_left(

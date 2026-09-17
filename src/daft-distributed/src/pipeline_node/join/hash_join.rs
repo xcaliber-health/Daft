@@ -145,6 +145,7 @@ impl PipelineNodeImpl for HashJoinNode {
                                 self.null_equals_nulls.clone(),
                                 self.join_type,
                                 self.config.schema.clone(),
+                                None,
                                 StatsState::NotMaterialized,
                                 LocalNodeContext::new(Some(self.node_id() as usize)),
                             )

@@ -33,6 +33,7 @@ from daft.io.iceberg._row_level import (
     TARGET_PRESENT_COLUMN,
     DeleteWriterOpener,
     FileTable,
+    RowLevelConflict,
     WrittenFiles,
     collect_written_files,
     commit_row_level,
@@ -468,6 +469,38 @@ def run_merge(
     MergeCardinalityError
         If one row of the table is matched by more than one source row.
     """
+    from daft.io.iceberg._row_level import attempt_with_replan
+
+    def _once() -> MergeResult:
+        return _merge_once(
+            table,
+            source,
+            on,
+            rules,
+            target_alias=target_alias,
+            source_alias=source_alias,
+            branch=branch,
+            options=options,
+        )
+
+    try:
+        return attempt_with_replan(table, _once, op_name="merge_into")
+    except RowLevelConflict as conflict:
+        raise MergeFailedException(str(conflict)) from conflict
+
+
+def _merge_once(
+    table: PyIcebergTable,
+    source: DataFrame,
+    on: Expression,
+    rules: _Rules,
+    *,
+    target_alias: str,
+    source_alias: str,
+    branch: str | None,
+    options: MaintenanceOptions | None,
+) -> MergeResult:
+    """Carry out one attempt of a merge against the branch's current head."""
     from pyiceberg.expressions import AlwaysTrue
 
     from daft.dataframe import DataFrame
@@ -609,6 +642,9 @@ def run_merge(
     except CommitRetryExhausted as exhausted:
         discard_files(table, [*written.data_files, *written.delete_files])
         raise MergeFailedException(str(exhausted)) from exhausted
+    except RowLevelConflict:
+        discard_files(table, [*written.data_files, *written.delete_files])
+        raise
 
     return MergeResult(
         snapshot_id=snapshot_id,

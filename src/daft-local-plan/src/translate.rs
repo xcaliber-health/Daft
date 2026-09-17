@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 
 use common_error::{DaftError, DaftResult};
-use daft_core::join::JoinStrategy;
+use common_treenode::{Transformed, TreeNode};
+use daft_core::{join::JoinStrategy, prelude::Schema};
 use daft_dsl::{
+    Column, Expr, ResolvedColumn,
     expr::{
         agg::extract_agg_expr,
         bound_expr::{BoundAggExpr, BoundExpr, BoundVLLMExpr, BoundWindowExpr},
@@ -455,9 +457,31 @@ fn translate_helper(
 
             let (remaining_on, left_on, right_on, null_equals_nulls) = join.on.split_eq_preds();
 
-            if !remaining_on.is_empty() {
-                return Err(DaftError::not_implemented("Execution of non-equality join"));
-            }
+            // What key equality cannot express is checked on the pairs it allows,
+            // so it is read against the join's own output rather than one side.
+            let residual = remaining_on
+                .inner()
+                .map(|predicate| {
+                    let predicate = predicate
+                        .clone()
+                        .transform(|expr| match expr.as_ref() {
+                            Expr::Column(Column::Resolved(ResolvedColumn::JoinSide(field, _))) => {
+                                Ok(Transformed::yes(resolved_col(field.name.clone())))
+                            }
+                            _ => Ok(Transformed::no(expr)),
+                        })?
+                        .data;
+                    let pair_schema = Schema::new(
+                        join.left
+                            .schema()
+                            .fields()
+                            .iter()
+                            .chain(join.right.schema().fields())
+                            .cloned(),
+                    );
+                    BoundExpr::try_new(predicate, &pair_schema)
+                })
+                .transpose()?;
 
             let (left_on, right_on) =
                 normalize_join_keys(left_on, right_on, join.left.schema(), join.right.schema())?;
@@ -487,6 +511,7 @@ fn translate_helper(
                         Some(null_equals_nulls),
                         join.join_type,
                         join.output_schema.clone(),
+                        residual,
                         join.stats_state.clone(),
                         LocalNodeContext::default(),
                     ),

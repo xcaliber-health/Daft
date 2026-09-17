@@ -7,6 +7,7 @@ pub mod grouped_aggregate;
 pub mod into_partitions;
 pub mod pivot;
 pub mod repartition;
+#[cfg(feature = "python")]
 pub mod row_delta_write;
 pub mod shuffle_backend;
 pub mod sort;

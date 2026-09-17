@@ -9,14 +9,18 @@ came from.
 from __future__ import annotations
 
 import logging
+import random
+import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 
 from daft.io.iceberg._common import ROW_FILE_COLUMN, ROW_POSITION_COLUMN
 from daft.io.iceberg._deletes import read_with_deletes, stable_partition_key
 from daft.io.iceberg.iceberg_write import partition_field_to_expr
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -627,3 +631,47 @@ def discard_files(table: PyIcebergTable, files: Sequence[DataFile]) -> None:
             table.io.delete(str(data_file.file_path))
         except OSError as exc:
             logger.warning("row-level write: could not remove %s: %s", data_file.file_path, exc)
+
+
+def attempt_with_replan(
+    table: PyIcebergTable,
+    run: Callable[[], T],
+    *,
+    op_name: str,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    rng: Callable[[], float] = random.random,
+) -> T:
+    """Run ``run``, starting over when another writer invalidates what it planned.
+
+    A conflict means the snapshot the work was planned against no longer holds,
+    so retrying the commit alone would commit the wrong thing: the whole
+    operation is planned and carried out again against the new head. The budget
+    is the table's own commit-retry policy, and waits back off with jitter so
+    competing writers do not retry in step.
+
+    Raises:
+    ------
+    RowLevelConflict
+        When the budget runs out while conflicts keep arriving.
+    """
+    from daft.io.iceberg._common import _read_retry_policy
+
+    num_retries, min_wait, max_wait, total_timeout = _read_retry_policy(table)
+    started = monotonic()
+    last: RowLevelConflict | None = None
+    for attempt in range(num_retries + 1):
+        try:
+            return run()
+        except RowLevelConflict as conflict:
+            last = conflict
+            logger.info("%s: replanning after a competing write: %s", op_name, conflict)
+        elapsed = monotonic() - started
+        if attempt == num_retries or elapsed >= total_timeout:
+            break
+        wait = min(max_wait, min_wait * (2**attempt)) * rng()
+        if elapsed + wait >= total_timeout:
+            break
+        sleep(wait)
+        table.refresh()
+    raise RowLevelConflict(f"{op_name}: gave up after {num_retries + 1} attempt(s) against competing writes") from last

@@ -31,6 +31,7 @@ from daft.io.iceberg._row_level import (
     UPDATE_COUNT_KEYS,
     DeleteWriterOpener,
     FileTable,
+    RowLevelConflict,
     collect_written_files,
     commit_row_level,
     discard_files,
@@ -112,9 +113,7 @@ def _as_table_predicate(where: Expression, table: PyIcebergTable) -> tuple[Boole
         return AlwaysTrue(), False
 
 
-def _whole_file_matches(
-    table: PyIcebergTable, predicate: BooleanExpression, files: Sequence[DataFile]
-) -> set[str]:
+def _whole_file_matches(table: PyIcebergTable, predicate: BooleanExpression, files: Sequence[DataFile]) -> set[str]:
     """Return the files the condition covers entirely.
 
     A file whose recorded bounds put every row inside the condition needs no
@@ -171,11 +170,32 @@ def _run_row_level(
     branch: str | None,
     options: MaintenanceOptions | None,
 ) -> tuple[int, str, str, str, WrittenFiles | None, int]:
-    """Apply ``where`` to the table and commit the result.
+    """Apply ``where`` to the table and commit the result, planning again if needed.
 
     Returns the snapshot, its operation, the mode used, the operation's name, what
     was written and how many files were dropped without being read.
     """
+    from daft.io.iceberg._row_level import attempt_with_replan
+
+    def _once() -> tuple[int, str, str, str, WrittenFiles | None, int]:
+        return _row_level_once(table, where, assignments, verb=verb, branch=branch, options=options)
+
+    try:
+        return attempt_with_replan(table, _once, op_name=f"{verb}_where")
+    except RowLevelConflict as conflict:
+        raise RowLevelFailedException(str(conflict)) from conflict
+
+
+def _row_level_once(
+    table: PyIcebergTable,
+    where: Expression,
+    assignments: Mapping[str, Expression] | None,
+    *,
+    verb: str,
+    branch: str | None,
+    options: MaintenanceOptions | None,
+) -> tuple[int, str, str, str, WrittenFiles | None, int]:
+    """Carry out one attempt against the branch's current head."""
     from pyiceberg.table.snapshots import Operation
 
     from daft.dataframe import DataFrame
@@ -299,13 +319,14 @@ def _run_row_level(
     except CommitRetryExhausted as exhausted:
         discard_files(table, [*added_data, *added_deletes])
         raise RowLevelFailedException(str(exhausted)) from exhausted
+    except RowLevelConflict:
+        discard_files(table, [*added_data, *added_deletes])
+        raise
 
     return (snapshot_id, str(operation.value), mode, operation_id, written, len(whole_files))
 
 
-def _snapshot_properties(
-    verb: str, operation_id: str, mode: str, written: WrittenFiles | None
-) -> dict[str, str]:
+def _snapshot_properties(verb: str, operation_id: str, mode: str, written: WrittenFiles | None) -> dict[str, str]:
     """Return what the snapshot records about the change."""
     keys = UPDATE_COUNT_KEYS if verb == "update" else DELETE_COUNT_KEYS
     changed = 0 if written is None else (written.rows_updated if verb == "update" else written.rows_deleted)

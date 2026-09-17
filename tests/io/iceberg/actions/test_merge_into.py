@@ -239,3 +239,30 @@ def test_repeating_a_merge_under_the_same_name_changes_nothing_twice(local_catal
     assert first.snapshot_id == second.snapshot_id
     assert second.rows_updated == first.rows_updated
     assert len(_rows(table)) == 12
+
+
+def test_a_condition_beyond_key_equality_decides_which_rows_pair(local_catalog, mode):
+    table = _table(local_catalog, mode)
+    _labelled(table, 100, 2, "recent")
+    source = daft.from_pydict({"id": [1, 100], "label": ["new", "new"], "floor": [5, 5]})
+
+    # Only the row whose id clears the floor is paired; the other is unmatched.
+    result = (
+        _handle(table)
+        .merge_into(
+            source,
+            on=(col("target.id") == col("source.id")) & (col("target.id") > col("source.floor")),
+        )
+        .when_matched()
+        .update({"label": col("source.label")})
+        .when_not_matched()
+        .insert({"id": col("source.id"), "label": col("source.label")})
+        .execute()
+    )
+
+    rows = _rows(table)
+    assert result.rows_updated == 1
+    assert (100, "new") in rows, "the pair that satisfies the whole condition is updated"
+    assert (1, "seed") in rows, "the pair that fails it leaves the table's row alone"
+    assert (1, "new") in rows, "and the source row it left unmatched is added instead"
+    assert result.rows_inserted == 1

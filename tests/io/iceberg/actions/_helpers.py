@@ -154,6 +154,46 @@ def inject_once_around_rewrite(
     return state
 
 
+def inject_around_row_level(
+    monkeypatch: pytest.MonkeyPatch, action: Callable[[], None], *, every_attempt: bool = False
+) -> dict[str, int]:
+    """Run ``action`` after a row-level write produces its files.
+
+    That is the window a competing writer has to commit in: the files exist but
+    nothing references them yet, so what the write assumed may no longer hold.
+    By default it fires once, which a write can recover from by planning again;
+    ``every_attempt`` keeps interfering, which it cannot. The returned counters
+    report how often the write ran and how often the action fired.
+    """
+    from daft.io.iceberg import _merge, _update_delete
+
+    state = {"fired": 0, "attempts": 0, "inside": 0}
+
+    def instrument(real_collect: Callable[_P, _R]) -> Callable[_P, _R]:
+        def instrumented(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+            out = real_collect(*args, **kwargs)
+            # The competing writer may itself be a row-level write; only the
+            # operation under test is counted, and it is never interfered with
+            # from inside its own interference.
+            if state["inside"]:
+                return out
+            state["attempts"] += 1
+            if every_attempt or state["fired"] == 0:
+                state["fired"] += 1
+                state["inside"] = 1
+                try:
+                    action()
+                finally:
+                    state["inside"] = 0
+            return out
+
+        return instrumented
+
+    for module in (_merge, _update_delete):
+        monkeypatch.setattr(module, "collect_written_files", instrument(module.collect_written_files))
+    return state
+
+
 def make_seeded_table(
     catalog: Catalog,
     name: str,

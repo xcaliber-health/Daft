@@ -3263,6 +3263,7 @@ dependencies = [
  "common-py-serde",
  "common-resource-request",
  "common-treenode",
+ "daft-algebra",
  "daft-core",
  "daft-dsl",
  "daft-functions",

@@ -743,9 +743,10 @@ def _snapshot_operation(mode: str, written: WrittenFiles, removed: Sequence[Data
     """Return what the commit is: rows added, rows removed, or rows replaced."""
     from pyiceberg.table.snapshots import Operation
 
+    del mode
     if not removed and not written.delete_files:
         return Operation.APPEND
-    if not written.data_files and not removed:
+    if not written.data_files:
         return Operation.DELETE
     return Operation.OVERWRITE
 

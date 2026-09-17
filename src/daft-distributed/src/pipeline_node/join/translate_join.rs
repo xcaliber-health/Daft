@@ -1,14 +1,18 @@
 use std::{cmp::max, sync::Arc};
 
 use common_error::{DaftError, DaftResult};
-use daft_dsl::{ExprRef, expr::bound_expr::BoundExpr, is_exact_partition_match};
+use common_treenode::{Transformed, TreeNode};
+use daft_dsl::{
+    Column, Expr, ExprRef, ResolvedColumn, expr::bound_expr::BoundExpr, is_exact_partition_match,
+    resolved_col,
+};
 use daft_logical_plan::{
     JoinStrategy, JoinType,
     ops::Join,
     partitioning::{HashRepartitionConfig, RepartitionSpec},
     stats::ApproxStats,
 };
-use daft_schema::schema::SchemaRef;
+use daft_schema::schema::{Schema, SchemaRef};
 
 #[cfg(feature = "python")]
 use crate::pipeline_node::join::KeyFilteringJoinNode;
@@ -73,6 +77,7 @@ impl LogicalPlanToPipelineNodeTranslator {
         right_on: Vec<BoundExpr>,
         null_equals_nulls: Vec<bool>,
         join_type: JoinType,
+        residual: Option<BoundExpr>,
         output_schema: SchemaRef,
         left_size_bytes: usize,
         right_size_bytes: usize,
@@ -154,6 +159,7 @@ impl LogicalPlanToPipelineNodeTranslator {
                 right_on,
                 Some(null_equals_nulls),
                 join_type,
+                residual,
                 num_partitions,
                 left,
                 right,
@@ -285,9 +291,32 @@ impl LogicalPlanToPipelineNodeTranslator {
         right_node: DistributedPipelineNode,
     ) -> DaftResult<DistributedPipelineNode> {
         let (remaining_on, left_on, right_on, null_equals_nulls) = join.on.split_eq_preds();
-        if !remaining_on.is_empty() {
-            todo!("FLOTILLA_MS?: Implement non-equality joins")
-        }
+
+        // What key equality cannot express is checked on the pairs it allows,
+        // read against both sides side by side.
+        let residual = remaining_on
+            .inner()
+            .map(|predicate| {
+                let predicate = predicate
+                    .clone()
+                    .transform(|expr| match expr.as_ref() {
+                        Expr::Column(Column::Resolved(ResolvedColumn::JoinSide(field, _))) => {
+                            Ok(Transformed::yes(resolved_col(field.name.clone())))
+                        }
+                        _ => Ok(Transformed::no(expr)),
+                    })?
+                    .data;
+                let pair_schema = Schema::new(
+                    join.left
+                        .schema()
+                        .fields()
+                        .iter()
+                        .chain(join.right.schema().fields())
+                        .cloned(),
+                );
+                BoundExpr::try_new(predicate, &pair_schema)
+            })
+            .transpose()?;
 
         // Normalize join keys
         let (left_on, right_on) = daft_dsl::join::normalize_join_keys(
@@ -310,6 +339,17 @@ impl LogicalPlanToPipelineNodeTranslator {
             &left_stats,
             &right_stats,
         );
+        // Only the hash join checks a predicate beyond key equality, so a join
+        // that has one is done that way whatever the sizes suggest.
+        let join_strategy = match (&residual, join_strategy) {
+            (Some(_), _) if left_on.is_empty() => {
+                return Err(DaftError::not_implemented(
+                    "a join predicate with no equality between the sides",
+                ));
+            }
+            (Some(_), _) => JoinStrategy::Hash,
+            (None, strategy) => strategy,
+        };
 
         // Bind join keys to schemas
         let left_on = BoundExpr::bind_all(&left_on, &left_node.config().schema)?;
@@ -323,6 +363,7 @@ impl LogicalPlanToPipelineNodeTranslator {
                 right_on,
                 null_equals_nulls,
                 join.join_type,
+                residual,
                 join.output_schema.clone(),
                 left_stats.size_bytes,
                 right_stats.size_bytes,

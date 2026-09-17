@@ -284,7 +284,9 @@ def _row_level_once(
         snapshot = int(head.snapshot_id) if head is not None else -1
         return (snapshot, "none", mode, operation_id, written, 0)
 
-    operation = Operation.DELETE if not added_data and not added_deletes else Operation.OVERWRITE
+    # A commit that adds nothing holding rows is a removal, whether the rows went
+    # away with their files or were named by position.
+    operation = Operation.OVERWRITE if added_data else Operation.DELETE
     touched_partitions = {stable_partition_key(file_table.entry(file_table.index_of(path)).partition) for path in paths}
 
     def _validate() -> None:

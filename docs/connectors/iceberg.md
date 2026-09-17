@@ -267,6 +267,75 @@ The budget bounds the rows a sort buffers; the rest of a process's peak is the s
 
 On the distributed runner each file group is one plan and groups run one at a time; within a plan the scan, the range shuffle and the writes are spread across workers, and per-task memory is bounded by the object store, which spills on its own. A clustering rewrite sorts over every input partition and then joins adjacent sorted ranges into as many partitions as the planner expects output files, so the files are even and a range query opens few of them.
 
+## Row-Level Writes
+
+Appending rows and replacing a whole table are not the only ways a table changes. A table also has rows replaced, removed, and added in one step, from a stream of changes that names the rows it affects. Daft does this through four operations on a catalog table handle.
+
+```python
+import daft
+from daft import col, lit
+from daft.catalog import Table
+
+table = Table.from_iceberg(pyiceberg_table)
+
+# Replace matched rows, add the rest.
+table.upsert(changes, keys=["id"])
+
+# The same, stated rule by rule.
+(
+    table.merge_into(changes, on=col("target.id") == col("source.id"))
+    .when_matched(col("source.op") == "delete")
+    .delete()
+    .when_matched()
+    .update({"status": col("source.status")})
+    .when_not_matched()
+    .insert_all()
+    .execute()
+)
+
+table.update_where(col("status") == "new", {"status": lit("seen")})
+table.delete_where(col("expired"))
+```
+
+### Rules
+
+A merge pairs the table's rows with the source's on `on`, and states what to do with each kind of pair: `when_matched` for pairs where both sides exist, `when_not_matched` for source rows that matched nothing, and `when_not_matched_by_source` for the table's rows that matched nothing. Each rule may carry a condition, rules are tried in the order they are given, and the first whose condition holds decides the row. A row no rule claims is left as it is.
+
+Columns are addressed as `target.<column>` and `source.<column>`; pass `target_alias=` and `source_alias=` to change the names. `update_all()` and `insert_all()` take every column from the source column of the same name. `update({...})` leaves the columns it does not name alone; `insert({...})` must supply a value for every column the table requires.
+
+The condition may say more than key equality — `col("target.id") == col("source.id")` narrowed by `col("source.seen_at") > col("target.seen_at")`, for instance. The equality part decides which rows are candidates; the rest decides which candidates are actually pairs, so a row whose every candidate fails it counts as having matched nothing and is handled by the rules for unmatched rows.
+
+**One row of the table may be matched by at most one source row.** Which of several matching rows should win is not defined, so a second match is refused with `MergeCardinalityError` rather than resolved arbitrarily. Deduplicate the source on the join keys, or narrow the condition. The check is skipped where nothing depends on it: when there are no rules for matched pairs, or when the only such rule removes the row unconditionally.
+
+### How a change is recorded
+
+The table decides, through `write.merge.mode`, `write.update.mode` and `write.delete.mode`:
+
+- **`copy-on-write`** (the default) rewrites the files holding changed rows without them and writes the new rows alongside. Only files holding rows the source matched are rewritten, which is found from the join columns alone before the rest of the table is read. A rule for the table's unmatched rows can change any row, so that narrowing does not apply when one is given.
+- **`merge-on-read`** leaves the data files alone and writes delete files naming the rows that left by the file holding them and their position in it. The write is then proportional to the change rather than to the files it touches, at the cost of every later read applying those deletes until a `rewrite_data_files` resolves them.
+
+Under merge-on-read, removals already recorded for the files being read are carried into the new delete files and the old ones dropped, so a table does not accumulate one delete file per merge. `write.delete.granularity` decides whether a delete file covers one data file (the default) or a whole partition, and `write.delete.target-file-size-bytes` the size they roll at.
+
+A removal whose condition covers whole files does not read them: the table's own record of what each file holds is enough to prove no row survives, so the files are dropped and nothing is written.
+
+### Concurrent writers
+
+A row-level write reads a snapshot, decides what to change, and commits later. Before committing it checks that what it decided still holds: the files it read are still there, and, for a write that replaces rows, that nobody has recorded removals against those rows in the meantime. Under `serializable` — the default for `write.merge.isolation-level` and its update and delete counterparts — it also checks that no rows were added that it would have acted on had it seen them. Setting the level to `snapshot` drops that last check.
+
+When a check fails the whole operation is planned and carried out again against what the other writer left, bounded by the table's `commit.retry.*` properties; the files a refused attempt wrote are removed. Repeated interference ends in a refusal rather than an unbounded loop.
+
+Passing `options={"merge-id": "..."}` makes a repeated run return the first run's result instead of applying the change twice, which is what a caller that retries after losing the answer needs.
+
+### What the snapshot records
+
+A merge commits an `overwrite` snapshot, or an `append` when it only adds rows, or a `delete` when it only removes them. Alongside the format's own counts it records what the merge decided, as `daft.merge-into.num-target-rows-copied`, `-deleted`, `-updated` and `-inserted`; an update and a removal record `daft.update.num-updated-rows` and `daft.delete.num-deleted-rows` with their copied counts. The same numbers come back on the result object.
+
+### Memory and the two runners
+
+Nothing is held in memory that does not have to be. The target is read as a stream, paired with the source through the streaming hash join, and the rows the merge produces go straight to the writers; the only things that accumulate are the metadata of the files written and, under merge-on-read, the positions of removed rows at twelve bytes each. Those positions are sorted before they are written, because that is the order a delete file is read in, and under memory pressure they shed to disk and merge back sorted, like a sort does.
+
+On the distributed runner both sides are grouped by the join columns, so every pair of one row lands in one task, and the writes are spread across workers. `write.merge.distribution-mode` and its update and delete counterparts decide how rows are grouped before they are written; on a single machine, where one stream writes the files, grouping them first would only move them and is skipped.
+
 ## Type System
 
 | Iceberg                             | Daft                                                                                         |

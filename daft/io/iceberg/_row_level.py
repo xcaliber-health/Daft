@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
     from daft.daft import IOConfig
     from daft.dataframe import DataFrame
-    from daft.io.iceberg._deletes import ScanPlan
+    from daft.io.iceberg._deletes import PartitionValue, ScanPlan
     from daft.io.writer import IcebergPositionDeleteWriter
 
 
@@ -330,33 +330,38 @@ class DeleteWriterOpener:
     """Opens the delete file for one group of removed rows.
 
     A delete file belongs to the partition of the data files it names, so the
-    group is located from the index of one of them.
+    group is located from the index of one of them. Everything it needs is held
+    as plain values, because the opener travels to wherever the write runs.
     """
 
     def __init__(self, table: PyIcebergTable, file_table: FileTable, io_config: IOConfig) -> None:
-        self._table = table
-        self._file_table = file_table
-        self._io_config = io_config
         self._location = table.properties.get("write.data.path", f"{table.location()}/data")
+        self._properties = dict(table.properties)
+        self._io_config = io_config
+        specs = table.specs()
+        self._spec_ids = [file_table.entry(index).spec_id for index in range(len(file_table))]
+        self._partitions: list[dict[str, PartitionValue]] = []
+        for index in range(len(file_table)):
+            entry = file_table.entry(index)
+            fields = specs[entry.spec_id].fields
+            self._partitions.append({field.name: entry.partition[position] for position, field in enumerate(fields)})
 
     def __call__(self, file_idx: int, file_index: int) -> IcebergPositionDeleteWriter:
         """Return a writer for the group containing the file at ``file_index``."""
         from daft.io.writer import IcebergPositionDeleteWriter
         from daft.recordbatch.recordbatch import RecordBatch
 
-        entry = self._file_table.entry(file_index)
-        fields = self._table.specs()[entry.spec_id].fields
-        partition_values = (
-            RecordBatch.from_pydict({field.name: [entry.partition[i]] for i, field in enumerate(fields)})
-            if fields
-            else None
-        )
+        if file_index < 0 or file_index >= len(self._spec_ids):
+            raise IndexError(f"file index {file_index} is outside the {len(self._spec_ids)} planned file(s)")
+        values = self._partitions[file_index]
         return IcebergPositionDeleteWriter(
             root_dir=self._location,
             file_idx=file_idx,
-            properties=dict(self._table.properties),
-            partition_spec_id=entry.spec_id,
-            partition_values=partition_values,
+            properties=self._properties,
+            partition_spec_id=self._spec_ids[file_index],
+            partition_values=(
+                RecordBatch.from_pydict({name: [value] for name, value in values.items()}) if values else None
+            ),
             io_config=self._io_config,
         )
 

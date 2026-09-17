@@ -30,6 +30,9 @@ pub(crate) struct HashJoinNode {
     right_on: Vec<BoundExpr>,
     null_equals_nulls: Option<Vec<bool>>,
     join_type: JoinType,
+    /// Part of the join predicate key equality cannot express, checked on the
+    /// pairs key equality allows.
+    residual: Option<BoundExpr>,
 
     left: DistributedPipelineNode,
     right: DistributedPipelineNode,
@@ -46,6 +49,7 @@ impl HashJoinNode {
         right_on: Vec<BoundExpr>,
         null_equals_nulls: Option<Vec<bool>>,
         join_type: JoinType,
+        residual: Option<BoundExpr>,
         num_partitions: usize,
         left: DistributedPipelineNode,
         right: DistributedPipelineNode,
@@ -76,6 +80,7 @@ impl HashJoinNode {
             right_on,
             null_equals_nulls,
             join_type,
+            residual,
             left,
             right,
         }
@@ -145,7 +150,7 @@ impl PipelineNodeImpl for HashJoinNode {
                                 self.null_equals_nulls.clone(),
                                 self.join_type,
                                 self.config.schema.clone(),
-                                None,
+                                self.residual.clone(),
                                 StatsState::NotMaterialized,
                                 LocalNodeContext::new(Some(self.node_id() as usize)),
                             )

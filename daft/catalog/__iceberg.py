@@ -35,7 +35,7 @@ from daft.catalog import (
 from daft.io.iceberg._iceberg import read_iceberg
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Mapping, Sequence
     from datetime import datetime
 
     from pyiceberg.schema import Schema as PyIcebergSchema
@@ -43,13 +43,16 @@ if TYPE_CHECKING:
     from daft.dataframe import DataFrame
     from daft.expressions import Expression
     from daft.io.iceberg import (
+        DeleteResult,
         ExpireResult,
         IcebergMaintenanceOptions,
         MergeIntoBuilder,
+        MergeResult,
         RemoveOrphanResult,
         RewriteManifestsResult,
         RewritePositionDeletesResult,
         RewriteResult,
+        UpdateResult,
     )
     from daft.io.partitioning import PartitionField
 
@@ -800,6 +803,141 @@ class IcebergTable(Table):
             source_alias=source_alias,
             branch=branch,
             options=options,
+        )
+
+    def update_where(
+        self,
+        where: Expression,
+        assignments: Mapping[str, Expression],
+        *,
+        branch: str | None = None,
+        options: IcebergMaintenanceOptions | None = None,
+    ) -> UpdateResult:
+        """Replace named columns of the rows ``where`` selects.
+
+        Columns the assignments do not name keep their values. Whether the files
+        holding the old rows are rewritten or the old rows are recorded as
+        removed follows the table's own ``write.update.mode``.
+
+        Parameters
+        ----------
+        where : Expression
+            Condition the rows to change satisfy.
+        assignments : Mapping[str, Expression]
+            New value for each column being changed.
+        branch : str, optional
+            Branch to write. Defaults to ``main``.
+        options : dict, optional
+            ``isolation-level`` and ``merge-id``; see ``merge_into``.
+
+        Returns:
+        -------
+        UpdateResult
+            Rows changed and left alone, with the snapshot committed.
+
+        Examples:
+        --------
+        >>> from daft import col, lit
+        >>> table.update_where(col("status") == "new", {"status": lit("seen")})  # doctest: +SKIP
+        """
+        from daft.io.iceberg._update_delete import run_update
+
+        return run_update(self._inner, where, assignments, branch=branch, options=options)
+
+    def delete_where(
+        self,
+        where: Expression,
+        *,
+        branch: str | None = None,
+        options: IcebergMaintenanceOptions | None = None,
+    ) -> DeleteResult:
+        """Remove the rows ``where`` selects.
+
+        Files the condition covers entirely are dropped without being read.
+        Whether the remaining files are rewritten or the removed rows are
+        recorded by position follows the table's own ``write.delete.mode``.
+
+        Parameters
+        ----------
+        where : Expression
+            Condition the rows to remove satisfy.
+        branch : str, optional
+            Branch to write. Defaults to ``main``.
+        options : dict, optional
+            ``isolation-level`` and ``merge-id``; see ``merge_into``.
+
+        Returns:
+        -------
+        DeleteResult
+            Rows removed and left alone, with the snapshot committed.
+
+        Examples:
+        --------
+        >>> from daft import col
+        >>> table.delete_where(col("expired"))  # doctest: +SKIP
+        """
+        from daft.io.iceberg._update_delete import run_delete
+
+        return run_delete(self._inner, where, branch=branch, options=options)
+
+    def upsert(
+        self,
+        source: DataFrame,
+        keys: Sequence[str] | None = None,
+        *,
+        branch: str | None = None,
+        options: IcebergMaintenanceOptions | None = None,
+    ) -> MergeResult:
+        """Replace the rows ``source`` matches on ``keys`` and add the rest.
+
+        Leaving ``keys`` unset uses the columns the table declares as its row
+        identity. This is a merge stated once: matched rows take every column
+        from the source, unmatched source rows are added.
+
+        Parameters
+        ----------
+        source : DataFrame
+            Rows to merge in.
+        keys : Sequence[str], optional
+            Columns that identify a row. Defaults to the table's own identity.
+        branch : str, optional
+            Branch to write. Defaults to ``main``.
+        options : dict, optional
+            ``isolation-level`` and ``merge-id``; see ``merge_into``.
+
+        Returns:
+        -------
+        MergeResult
+            Rows replaced and added, with the snapshot committed.
+
+        Raises:
+        ------
+        ValueError
+            If no keys are given and the table declares no row identity.
+
+        Examples:
+        --------
+        >>> table.upsert(updates, keys=["id"])  # doctest: +SKIP
+        """
+        from daft.expressions import col
+        from daft.io.iceberg._merge import MergeIntoBuilder
+
+        schema = self._inner.schema()
+        names = list(keys) if keys is not None else [schema.find_field(fid).name for fid in schema.identifier_field_ids]
+        if not names:
+            raise ValueError("upsert needs keys, or a table that declares which columns identify a row")
+        condition = None
+        for name in names:
+            equals = col(f"target.{name}") == col(f"source.{name}")
+            condition = equals if condition is None else condition & equals
+        assert condition is not None
+        return (
+            MergeIntoBuilder(self._inner, source, condition, branch=branch, options=options)
+            .when_matched()
+            .update_all()
+            .when_not_matched()
+            .insert_all()
+            .execute()
         )
 
     def compact_files(

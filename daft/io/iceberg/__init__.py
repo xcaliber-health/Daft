@@ -22,6 +22,11 @@ from daft.io.iceberg._merge import (
     MergeResult,
 )
 from daft.io.iceberg._row_level import RowLevelConflict
+from daft.io.iceberg._update_delete import (
+    DeleteResult,
+    RowLevelFailedException,
+    UpdateResult,
+)
 from daft.io.iceberg._expire import (
     ExpireResult,
     ExpireSnapshotsFailedException,
@@ -46,6 +51,7 @@ IcebergMaintenanceOptions: TypeAlias = MaintenanceOptions
 
 __all__ = [
     "CommitRetryExhausted",
+    "DeleteResult",
     "ExpireResult",
     "ExpireSnapshotsFailedException",
     "IcebergMaintenanceOptions",
@@ -63,4 +69,6 @@ __all__ = [
     "RewritePositionDeletesResult",
     "RewriteResult",
     "RowLevelConflict",
+    "RowLevelFailedException",
+    "UpdateResult",
 ]

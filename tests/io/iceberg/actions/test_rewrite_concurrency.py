@@ -1,9 +1,12 @@
-"""File groups are rewritten concurrently up to a configurable bound.
+"""File groups are rewritten up to a configurable bound, and the result is the same.
 
 Each group's read, re-cluster, and write stream through the execution engine.
-Up to ``max-concurrent-file-group-rewrites`` groups run at once; the bound caps
-how many group working sets share the engine budget. The number of concurrent
-groups never exceeds the bound, and the result is independent of it.
+Up to ``max-concurrent-file-group-rewrites`` groups run at once, which caps how
+many group working sets share the engine budget. The bound is an upper limit
+everywhere; a run spread over a cluster takes its groups one at a time whatever
+the bound says, because each group is already spread over the cluster and a
+second one started beside it costs the plan runner that carries both. The number
+running at once never exceeds the bound, and the result does not depend on it.
 """
 
 from __future__ import annotations
@@ -91,8 +94,12 @@ def test_concurrency_bounded_by_option(local_catalog, monkeypatch, max_concurren
     if max_concurrent == 1:
         assert active["peak"] == 1, "groups must not overlap when the bound is 1"
     elif runners.get_or_create_runner().name == "ray":
-        # Three partitions form three groups; a distributed runner overlaps them.
-        assert active["peak"] >= 2, "distributed groups should run concurrently"
+        # Spreading one group over a cluster is itself the parallelism; a second
+        # group started beside it from another thread costs the plan runner that
+        # carries both, so groups are taken one at a time there.
+        assert active["peak"] == 1, "a distributed run takes its groups one at a time"
+    else:
+        assert active["peak"] >= 2, "a bound above one lets groups overlap"
 
 
 def test_concurrency_option_does_not_change_result(local_catalog):

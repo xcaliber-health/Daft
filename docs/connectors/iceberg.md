@@ -68,6 +68,8 @@ Any subsequent filter operations on the Daft `df` DataFrame object will be corre
     df.show()
     ```
 
+A file carries the partition values of the layout it was written under, so once a table has been laid out more than one way, a condition on the current layout says nothing about the files written before it. Such a table reads every file and applies the condition to the rows; file-level statistics still narrow the read. Tables laid out one way are unaffected.
+
 ### Writing to a Table
 
 To write to an Apache Iceberg table, use the [`df.write_iceberg()`][daft.DataFrame.write_iceberg] method.

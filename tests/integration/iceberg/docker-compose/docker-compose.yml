@@ -64,7 +64,7 @@ services:
       retries: 20
       start_period: 10s
   minio:
-    image: minio/minio
+    image: quay.io/minio/minio
     container_name: pyiceberg-minio
     environment:
     - MINIO_ROOT_USER=admin
@@ -87,7 +87,7 @@ services:
     depends_on:
       minio:
         condition: service_healthy
-    image: minio/mc
+    image: quay.io/minio/mc
     container_name: pyiceberg-mc
     networks:
       iceberg_net:

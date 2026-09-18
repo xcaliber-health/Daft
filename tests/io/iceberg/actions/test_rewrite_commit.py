@@ -18,7 +18,7 @@ from pyiceberg.table import Transaction
 from pyiceberg.types import LongType, NestedField, StringType
 
 from daft.catalog import Table
-from daft.io.iceberg import RewriteConflict
+from daft.io.iceberg import RewriteConflict, RewriteFailedException
 
 
 def _random_strings(n: int, width: int, rng: random.Random) -> list[str]:
@@ -287,7 +287,9 @@ def test_atomic_rewrite_removes_its_outputs_when_the_commit_cannot_land(local_ca
 
     _patch_commit(monkeypatch, behavior)
     dt = Table.from_iceberg(table)
-    with pytest.raises(Exception):
+    # A commit that keeps failing exhausts the retry budget; the caller is told
+    # the rewrite failed, not how any one attempt failed.
+    with pytest.raises(RewriteFailedException):
         dt.compact_files(options=_MULTI_OPTS)
 
     assert _data_files_on_disk(table) == before, "an aborted rewrite leaves nothing behind"

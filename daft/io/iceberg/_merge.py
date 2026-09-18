@@ -469,7 +469,7 @@ def run_merge(
     MergeCardinalityError
         If one row of the table is matched by more than one source row.
     """
-    from daft.io.iceberg._row_level import attempt_with_replan
+    from daft.io.iceberg._row_level import attempt_with_replan, reports_double_match
 
     def _once() -> MergeResult:
         return _merge_once(
@@ -487,6 +487,16 @@ def run_merge(
         return attempt_with_replan(table, _once, op_name="merge_into")
     except RowLevelConflict as conflict:
         raise MergeFailedException(str(conflict)) from conflict
+    except Exception as error:
+        # Which matching row should win is undefined, and the engine refuses
+        # while the rows are in flight; the refusal is named here so a caller
+        # can tell it apart from a failure of the work itself.
+        if reports_double_match(error):
+            raise MergeCardinalityError(
+                "a target row was matched by more than one source row; remove the duplicate "
+                "keys from the source or narrow the match condition"
+            ) from error
+        raise
 
 
 def _merge_once(

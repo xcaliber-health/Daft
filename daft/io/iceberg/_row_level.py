@@ -251,6 +251,28 @@ class RowLevelConflict(RuntimeError):
     """Raised when another writer changed what an operation planned against."""
 
 
+#: Wording the engine uses when one row of the table is matched twice.
+CARDINALITY_MARK = "matched by more than one source row"
+
+
+def reports_double_match(error: BaseException) -> bool:
+    """Return whether an execution failure reports a row matched more than once.
+
+    The failure reaches this layer differently depending on where the work ran:
+    directly when it ran in this process, and wrapped in the failure of the task
+    that carried it when it ran elsewhere. Both forms carry the wording, either
+    on the error itself or on one it was raised from.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if CARDINALITY_MARK in str(current):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def resolve_mode(properties: Mapping[str, str], operation: str) -> str:
     """Return whether ``operation`` rewrites whole files or records removed rows.
 

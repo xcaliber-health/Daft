@@ -14,7 +14,7 @@ pytest.importorskip("pyiceberg")
 import daft
 from daft import col
 from daft.catalog.__iceberg import IcebergTable
-from daft.io.iceberg import MergeCardinalityError, MergeFailedException
+from daft.io.iceberg import MergeCardinalityError
 
 from ._helpers import make_seeded_table, read_ids
 
@@ -64,7 +64,7 @@ def test_a_row_matched_twice_is_refused_wherever_the_matches_land(local_catalog,
     ids = list(range(0, 300, 11)) * 2
     source = daft.from_pydict({"id": sorted(ids), "label": ["merged"] * len(ids)})
 
-    with pytest.raises((MergeCardinalityError, MergeFailedException, Exception), match="more than one source row"):
+    with pytest.raises(MergeCardinalityError, match="more than one source row"):
         (
             IcebergTable.from_iceberg(table)
             .merge_into(source, on=col("target.id") == col("source.id"))

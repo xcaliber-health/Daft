@@ -963,6 +963,7 @@ mod test {
             row_groups: None,
             chunk_size: None,
             ignore_corrupt_files: false,
+            row_position_column: None,
         }));
 
         ScanTask::new(
@@ -982,6 +983,7 @@ mod test {
             row_groups: None,
             chunk_size: None,
             ignore_corrupt_files: false,
+            row_position_column: None,
         });
 
         let mut sources: Vec<String> = Vec::new();
@@ -1258,6 +1260,7 @@ mod test {
                     row_groups: None,
                     chunk_size: None,
                     ignore_corrupt_files: false,
+                    row_position_column: None,
                 },
             ))),
             schema,
@@ -1310,6 +1313,7 @@ mod test {
                     row_groups: None,
                     chunk_size: None,
                     ignore_corrupt_files: false,
+                    row_position_column: None,
                 },
             ))),
             schema,
@@ -1355,6 +1359,7 @@ mod test {
                     row_groups: None,
                     chunk_size: None,
                     ignore_corrupt_files: false,
+                    row_position_column: None,
                 },
             ))),
             schema,
@@ -1405,6 +1410,7 @@ mod test {
                     row_groups: None,
                     chunk_size: None,
                     ignore_corrupt_files: false,
+                    row_position_column: None,
                 },
             ))),
             schema,
@@ -1468,6 +1474,7 @@ mod test {
                     row_groups: None,
                     chunk_size: None,
                     ignore_corrupt_files: false,
+                    row_position_column: None,
                 },
             ))),
             schema,
@@ -1578,6 +1585,7 @@ mod test {
                     row_groups: None,
                     chunk_size: None,
                     ignore_corrupt_files: false,
+                    row_position_column: None,
                 },
             ))),
             schema,

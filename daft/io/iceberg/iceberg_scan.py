@@ -300,29 +300,32 @@ class IcebergScanOperator(ScanOperator):
             yield from self._create_regular_scan_tasks(pushdowns)
 
     def _has_delete_files(self) -> bool:
-        """Check if the table has any delete files.
+        """Return whether the snapshot being read holds any live delete files.
 
-        This method quickly scans the table to determine if there are any delete files
-        present. If delete files are found, count pushdown should be disabled to avoid
-        complex delete file processing logic.
+        A count answered from file metadata alone would include deleted rows, so
+        any delete file disables it. The snapshot's manifest list records, per
+        manifest, what it holds and how many of its files are live, which
+        answers this without opening a single manifest.
 
         Returns:
-            True if the table has delete files, False otherwise
+            True if the snapshot has live delete files, or if that cannot be
+            determined; False otherwise.
         """
+        from pyiceberg.manifest import ManifestContent
+
         try:
-            # Get a limited scan to check for delete files
-            iceberg_tasks = self._iceberg_table.scan(
-                limit=1,  # Only need to check if any delete files exist
-                snapshot_id=self._snapshot_id,
-            ).plan_files()
-
-            # Check if any task has delete files
-            for task in iceberg_tasks:
-                if task.delete_files and len(task.delete_files) > 0:
-                    logger.debug("Found delete files in table, count pushdown will be disabled")
-                    return True
-            return False
-
+            snapshot = (
+                self._iceberg_table.snapshot_by_id(self._snapshot_id)
+                if self._snapshot_id is not None
+                else self._iceberg_table.current_snapshot()
+            )
+            if snapshot is None:
+                return False
+            return any(
+                manifest.content == ManifestContent.DELETES
+                and (manifest.has_added_files() or manifest.has_existing_files())
+                for manifest in snapshot.manifests(self._iceberg_table.io)
+            )
         except Exception as e:
             logger.warning(
                 "Error checking for delete files: %s, disabling count pushdown as precaution",

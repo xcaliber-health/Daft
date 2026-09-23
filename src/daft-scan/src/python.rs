@@ -428,7 +428,6 @@ pub mod pylib {
     }
 
     #[pyclass(module = "daft.daft")]
-    #[derive(Debug)]
     pub struct PythonScanOperatorBridge {
         name: String,
         operator: pyo3::Py<pyo3::PyAny>,
@@ -437,8 +436,25 @@ pub mod pylib {
         can_absorb_filter: bool,
         can_absorb_limit: bool,
         can_absorb_select: bool,
-        supports_count_pushdown: bool,
+        /// Asked of the operator only when a count could be pushed down, since
+        /// answering it may cost the operator a pass over its metadata.
+        supports_count_pushdown: pyo3::sync::PyOnceLock<bool>,
         display_name: String,
+    }
+
+    impl std::fmt::Debug for PythonScanOperatorBridge {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("PythonScanOperatorBridge")
+                .field("name", &self.name)
+                .field("operator", &self.operator)
+                .field("schema", &self.schema)
+                .field("partitioning_keys", &self.partitioning_keys)
+                .field("can_absorb_filter", &self.can_absorb_filter)
+                .field("can_absorb_limit", &self.can_absorb_limit)
+                .field("can_absorb_select", &self.can_absorb_select)
+                .field("display_name", &self.display_name)
+                .finish_non_exhaustive()
+        }
     }
 
     impl PythonScanOperatorBridge {
@@ -503,7 +519,6 @@ pub mod pylib {
             let can_absorb_limit = Self::_can_absorb_limit(&abc, py)?;
             let can_absorb_select = Self::_can_absorb_select(&abc, py)?;
             let display_name = Self::_display_name(&abc, py)?;
-            let supports_count_pushdown = Self::_supports_count_pushdown(&abc, py)?;
 
             Ok(Self {
                 name,
@@ -514,7 +529,7 @@ pub mod pylib {
                 can_absorb_limit,
                 can_absorb_select,
                 display_name,
-                supports_count_pushdown,
+                supports_count_pushdown: pyo3::sync::PyOnceLock::new(),
             })
         }
     }
@@ -618,7 +633,18 @@ pub mod pylib {
         }
 
         fn supports_count_pushdown(&self) -> bool {
-            self.supports_count_pushdown
+            Python::attach(|py| {
+                *self.supports_count_pushdown.get_or_init(py, || {
+                    Self::_supports_count_pushdown(&self.operator, py).unwrap_or_else(|err| {
+                        // Declining is always safe: the count is then computed by reading.
+                        log::warn!(
+                            "{}: supports_count_pushdown() failed, reading to count instead: {err}",
+                            self.display_name
+                        );
+                        false
+                    })
+                })
+            })
         }
 
         fn multiline_display(&self) -> Vec<String> {

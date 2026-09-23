@@ -7,6 +7,8 @@ import pytest
 
 pyiceberg = pytest.importorskip("pyiceberg")
 
+from pyiceberg.manifest import ManifestContent
+
 from daft.daft import CountMode, PyPushdowns
 from daft.io.iceberg.iceberg_scan import (
     IcebergScanOperator,
@@ -127,17 +129,31 @@ class TestIcebergScanOperatorUnit:
 
         mock_scan.plan_files.return_value = mock_tasks
 
+        # The snapshot's manifest list says which manifests hold live delete files.
+        manifests = [self._manifest(ManifestContent.DATA, live_files=len(record_counts))]
+        if has_delete_files:
+            manifests.append(self._manifest(ManifestContent.DELETES, live_files=1))
+        mock_table.current_snapshot.return_value.manifests.return_value = manifests
+
         return mock_table
 
-    @patch("daft.io.iceberg.iceberg_scan.schema_to_pyarrow")
+    @staticmethod
+    def _manifest(content: ManifestContent, live_files: int) -> Mock:
+        manifest = Mock()
+        manifest.content = content
+        manifest.has_added_files.return_value = live_files > 0
+        manifest.has_existing_files.return_value = False
+        return manifest
+
+    @patch("daft.io.iceberg.iceberg_scan.convert_iceberg_schema")
     @patch("daft.io.iceberg.iceberg_scan.visit")
-    @patch("daft.io.iceberg.iceberg_scan.Schema.from_pyarrow_schema")
-    def test_has_delete_files_no_delete_files(self, mock_from_pyarrow, mock_visit, mock_schema_to_pyarrow):
+    @patch("daft.io.iceberg.iceberg_scan.iceberg_partition_spec_to_fields")
+    def test_has_delete_files_no_delete_files(self, mock_partition_fields, mock_visit, mock_convert_schema):
         """Test _has_delete_files when there are no delete files."""
         # Setup mocks
-        mock_schema_to_pyarrow.return_value = pa.schema([pa.field("id", pa.int64())])
+        mock_convert_schema.return_value = Schema.from_pyarrow_schema(pa.schema([pa.field("id", pa.int64())]))
         mock_visit.return_value = {}
-        mock_from_pyarrow.return_value = Schema.from_pyarrow_schema(pa.schema([pa.field("id", pa.int64())]))
+        mock_partition_fields.return_value = []
 
         mock_table = self.create_mock_iceberg_table(has_delete_files=False)
         mock_storage_config = Mock()
@@ -148,15 +164,15 @@ class TestIcebergScanOperatorUnit:
         result = operator._has_delete_files()
         assert result is False
 
-    @patch("daft.io.iceberg.iceberg_scan.schema_to_pyarrow")
+    @patch("daft.io.iceberg.iceberg_scan.convert_iceberg_schema")
     @patch("daft.io.iceberg.iceberg_scan.visit")
-    @patch("daft.io.iceberg.iceberg_scan.Schema.from_pyarrow_schema")
-    def test_has_delete_files_with_delete_files(self, mock_from_pyarrow, mock_visit, mock_schema_to_pyarrow):
+    @patch("daft.io.iceberg.iceberg_scan.iceberg_partition_spec_to_fields")
+    def test_has_delete_files_with_delete_files(self, mock_partition_fields, mock_visit, mock_convert_schema):
         """Test _has_delete_files when there are delete files."""
         # Setup mocks
-        mock_schema_to_pyarrow.return_value = pa.schema([pa.field("id", pa.int64())])
+        mock_convert_schema.return_value = Schema.from_pyarrow_schema(pa.schema([pa.field("id", pa.int64())]))
         mock_visit.return_value = {}
-        mock_from_pyarrow.return_value = Schema.from_pyarrow_schema(pa.schema([pa.field("id", pa.int64())]))
+        mock_partition_fields.return_value = []
 
         mock_table = self.create_mock_iceberg_table(has_delete_files=True)
         mock_storage_config = Mock()
@@ -167,15 +183,15 @@ class TestIcebergScanOperatorUnit:
         result = operator._has_delete_files()
         assert result is True
 
-    @patch("daft.io.iceberg.iceberg_scan.schema_to_pyarrow")
+    @patch("daft.io.iceberg.iceberg_scan.convert_iceberg_schema")
     @patch("daft.io.iceberg.iceberg_scan.visit")
-    @patch("daft.io.iceberg.iceberg_scan.Schema.from_pyarrow_schema")
-    def test_supports_count_pushdown_no_delete_files(self, mock_from_pyarrow, mock_visit, mock_schema_to_pyarrow):
+    @patch("daft.io.iceberg.iceberg_scan.iceberg_partition_spec_to_fields")
+    def test_supports_count_pushdown_no_delete_files(self, mock_partition_fields, mock_visit, mock_convert_schema):
         """Test supports_count_pushdown when there are no delete files."""
         # Setup mocks
-        mock_schema_to_pyarrow.return_value = pa.schema([pa.field("id", pa.int64())])
+        mock_convert_schema.return_value = Schema.from_pyarrow_schema(pa.schema([pa.field("id", pa.int64())]))
         mock_visit.return_value = {}
-        mock_from_pyarrow.return_value = Schema.from_pyarrow_schema(pa.schema([pa.field("id", pa.int64())]))
+        mock_partition_fields.return_value = []
 
         mock_table = self.create_mock_iceberg_table(has_delete_files=False)
         mock_storage_config = Mock()
@@ -186,15 +202,15 @@ class TestIcebergScanOperatorUnit:
         result = operator.supports_count_pushdown()
         assert result is True
 
-    @patch("daft.io.iceberg.iceberg_scan.schema_to_pyarrow")
+    @patch("daft.io.iceberg.iceberg_scan.convert_iceberg_schema")
     @patch("daft.io.iceberg.iceberg_scan.visit")
-    @patch("daft.io.iceberg.iceberg_scan.Schema.from_pyarrow_schema")
-    def test_supports_count_pushdown_with_delete_files(self, mock_from_pyarrow, mock_visit, mock_schema_to_pyarrow):
+    @patch("daft.io.iceberg.iceberg_scan.iceberg_partition_spec_to_fields")
+    def test_supports_count_pushdown_with_delete_files(self, mock_partition_fields, mock_visit, mock_convert_schema):
         """Test supports_count_pushdown when there are delete files."""
         # Setup mocks
-        mock_schema_to_pyarrow.return_value = pa.schema([pa.field("id", pa.int64())])
+        mock_convert_schema.return_value = Schema.from_pyarrow_schema(pa.schema([pa.field("id", pa.int64())]))
         mock_visit.return_value = {}
-        mock_from_pyarrow.return_value = Schema.from_pyarrow_schema(pa.schema([pa.field("id", pa.int64())]))
+        mock_partition_fields.return_value = []
 
         mock_table = self.create_mock_iceberg_table(has_delete_files=True)
         mock_storage_config = Mock()
@@ -205,15 +221,15 @@ class TestIcebergScanOperatorUnit:
         result = operator.supports_count_pushdown()
         assert result is False
 
-    @patch("daft.io.iceberg.iceberg_scan.schema_to_pyarrow")
+    @patch("daft.io.iceberg.iceberg_scan.convert_iceberg_schema")
     @patch("daft.io.iceberg.iceberg_scan.visit")
-    @patch("daft.io.iceberg.iceberg_scan.Schema.from_pyarrow_schema")
-    def test_supported_count_modes(self, mock_from_pyarrow, mock_visit, mock_schema_to_pyarrow):
+    @patch("daft.io.iceberg.iceberg_scan.iceberg_partition_spec_to_fields")
+    def test_supported_count_modes(self, mock_partition_fields, mock_visit, mock_convert_schema):
         """Test supported_count_modes returns correct modes."""
         # Setup mocks
-        mock_schema_to_pyarrow.return_value = pa.schema([pa.field("id", pa.int64())])
+        mock_convert_schema.return_value = Schema.from_pyarrow_schema(pa.schema([pa.field("id", pa.int64())]))
         mock_visit.return_value = {}
-        mock_from_pyarrow.return_value = Schema.from_pyarrow_schema(pa.schema([pa.field("id", pa.int64())]))
+        mock_partition_fields.return_value = []
 
         mock_table = self.create_mock_iceberg_table()
         mock_storage_config = Mock()
@@ -224,15 +240,15 @@ class TestIcebergScanOperatorUnit:
         result = operator.supported_count_modes()
         assert result == [CountMode.All]
 
-    @patch("daft.io.iceberg.iceberg_scan.schema_to_pyarrow")
+    @patch("daft.io.iceberg.iceberg_scan.convert_iceberg_schema")
     @patch("daft.io.iceberg.iceberg_scan.visit")
-    @patch("daft.io.iceberg.iceberg_scan.Schema.from_pyarrow_schema")
-    def test_create_count_scan_task_basic(self, mock_from_pyarrow, mock_visit, mock_schema_to_pyarrow):
+    @patch("daft.io.iceberg.iceberg_scan.iceberg_partition_spec_to_fields")
+    def test_create_count_scan_task_basic(self, mock_partition_fields, mock_visit, mock_convert_schema):
         """Test _create_count_scan_task basic functionality."""
         # Setup mocks
-        mock_schema_to_pyarrow.return_value = pa.schema([pa.field("id", pa.int64())])
+        mock_convert_schema.return_value = Schema.from_pyarrow_schema(pa.schema([pa.field("id", pa.int64())]))
         mock_visit.return_value = {}
-        mock_from_pyarrow.return_value = Schema.from_pyarrow_schema(pa.schema([pa.field("id", pa.int64())]))
+        mock_partition_fields.return_value = []
 
         mock_table = self.create_mock_iceberg_table()
         mock_storage_config = Mock()
@@ -256,15 +272,15 @@ class TestIcebergScanOperatorUnit:
             call_args = mock_scan_task.call_args
             assert call_args[1]["func_args"] == (100, "count")  # 100 from mock record_count
 
-    @patch("daft.io.iceberg.iceberg_scan.schema_to_pyarrow")
+    @patch("daft.io.iceberg.iceberg_scan.convert_iceberg_schema")
     @patch("daft.io.iceberg.iceberg_scan.visit")
-    @patch("daft.io.iceberg.iceberg_scan.Schema.from_pyarrow_schema")
-    def test_create_count_scan_task_multiple_files(self, mock_from_pyarrow, mock_visit, mock_schema_to_pyarrow):
+    @patch("daft.io.iceberg.iceberg_scan.iceberg_partition_spec_to_fields")
+    def test_create_count_scan_task_multiple_files(self, mock_partition_fields, mock_visit, mock_convert_schema):
         """Test _create_count_scan_task with multiple data files."""
         # Setup mocks
-        mock_schema_to_pyarrow.return_value = pa.schema([pa.field("id", pa.int64())])
+        mock_convert_schema.return_value = Schema.from_pyarrow_schema(pa.schema([pa.field("id", pa.int64())]))
         mock_visit.return_value = {}
-        mock_from_pyarrow.return_value = Schema.from_pyarrow_schema(pa.schema([pa.field("id", pa.int64())]))
+        mock_partition_fields.return_value = []
 
         # Create table with multiple files having different counts
         mock_table = self.create_mock_iceberg_table(record_counts=[50, 60, 70])
@@ -288,15 +304,15 @@ class TestIcebergScanOperatorUnit:
             call_args = mock_scan_task.call_args
             assert call_args[1]["func_args"] == (180, "count")
 
-    @patch("daft.io.iceberg.iceberg_scan.schema_to_pyarrow")
+    @patch("daft.io.iceberg.iceberg_scan.convert_iceberg_schema")
     @patch("daft.io.iceberg.iceberg_scan.visit")
-    @patch("daft.io.iceberg.iceberg_scan.Schema.from_pyarrow_schema")
-    def test_empty_table_count_pushdown(self, mock_from_pyarrow, mock_visit, mock_schema_to_pyarrow):
+    @patch("daft.io.iceberg.iceberg_scan.iceberg_partition_spec_to_fields")
+    def test_empty_table_count_pushdown(self, mock_partition_fields, mock_visit, mock_convert_schema):
         """Test count pushdown on empty table."""
         # Setup mocks
-        mock_schema_to_pyarrow.return_value = pa.schema([pa.field("id", pa.int64())])
+        mock_convert_schema.return_value = Schema.from_pyarrow_schema(pa.schema([pa.field("id", pa.int64())]))
         mock_visit.return_value = {}
-        mock_from_pyarrow.return_value = Schema.from_pyarrow_schema(pa.schema([pa.field("id", pa.int64())]))
+        mock_partition_fields.return_value = []
 
         # Create empty table
         mock_table = self.create_mock_iceberg_table(record_counts=[])
@@ -353,15 +369,15 @@ class TestIcebergScanOperatorUnit:
         with pytest.raises(pa.ArrowTypeError, match="Invalid field definition"):
             list(_iceberg_count_result_function(total_count, field_name))
 
-    @patch("daft.io.iceberg.iceberg_scan.schema_to_pyarrow")
+    @patch("daft.io.iceberg.iceberg_scan.convert_iceberg_schema")
     @patch("daft.io.iceberg.iceberg_scan.visit")
-    @patch("daft.io.iceberg.iceberg_scan.Schema.from_pyarrow_schema")
-    def test_large_file_count_aggregation(self, mock_from_pyarrow, mock_visit, mock_schema_to_pyarrow):
+    @patch("daft.io.iceberg.iceberg_scan.iceberg_partition_spec_to_fields")
+    def test_large_file_count_aggregation(self, mock_partition_fields, mock_visit, mock_convert_schema):
         """Test count pushdown with many files having large record counts."""
         # Setup mocks
-        mock_schema_to_pyarrow.return_value = pa.schema([pa.field("id", pa.int64())])
+        mock_convert_schema.return_value = Schema.from_pyarrow_schema(pa.schema([pa.field("id", pa.int64())]))
         mock_visit.return_value = {}
-        mock_from_pyarrow.return_value = Schema.from_pyarrow_schema(pa.schema([pa.field("id", pa.int64())]))
+        mock_partition_fields.return_value = []
 
         # Create table with many files having large counts
         large_counts = [1000000, 2000000, 3000000, 4000000, 5000000]  # 15M total
@@ -407,15 +423,15 @@ class TestIcebergScanOperatorUnit:
             expected_total = sum(large_counts)
             assert call_args[1]["func_args"] == (expected_total, "count")
 
-    @patch("daft.io.iceberg.iceberg_scan.schema_to_pyarrow")
+    @patch("daft.io.iceberg.iceberg_scan.convert_iceberg_schema")
     @patch("daft.io.iceberg.iceberg_scan.visit")
-    @patch("daft.io.iceberg.iceberg_scan.Schema.from_pyarrow_schema")
-    def test_create_count_scan_task_exception_fallback(self, mock_from_pyarrow, mock_visit, mock_schema_to_pyarrow):
+    @patch("daft.io.iceberg.iceberg_scan.iceberg_partition_spec_to_fields")
+    def test_create_count_scan_task_exception_fallback(self, mock_partition_fields, mock_visit, mock_convert_schema):
         """Test _create_count_scan_task exception handling and fallback."""
         # Setup mocks
-        mock_schema_to_pyarrow.return_value = pa.schema([pa.field("id", pa.int64())])
+        mock_convert_schema.return_value = Schema.from_pyarrow_schema(pa.schema([pa.field("id", pa.int64())]))
         mock_visit.return_value = {}
-        mock_from_pyarrow.return_value = Schema.from_pyarrow_schema(pa.schema([pa.field("id", pa.int64())]))
+        mock_partition_fields.return_value = []
 
         # Create table that will fail on scan
         mock_table = Mock()
@@ -447,15 +463,15 @@ class TestIcebergScanOperatorUnit:
             mock_fallback.assert_called_once_with(mock_pushdowns)
             assert len(results) == 1
 
-    @patch("daft.io.iceberg.iceberg_scan.schema_to_pyarrow")
+    @patch("daft.io.iceberg.iceberg_scan.convert_iceberg_schema")
     @patch("daft.io.iceberg.iceberg_scan.visit")
-    @patch("daft.io.iceberg.iceberg_scan.Schema.from_pyarrow_schema")
-    def test_has_delete_files_exception_handling(self, mock_from_pyarrow, mock_visit, mock_schema_to_pyarrow):
+    @patch("daft.io.iceberg.iceberg_scan.iceberg_partition_spec_to_fields")
+    def test_has_delete_files_exception_handling(self, mock_partition_fields, mock_visit, mock_convert_schema):
         """Test _has_delete_files exception handling."""
         # Setup mocks
-        mock_schema_to_pyarrow.return_value = pa.schema([pa.field("id", pa.int64())])
+        mock_convert_schema.return_value = Schema.from_pyarrow_schema(pa.schema([pa.field("id", pa.int64())]))
         mock_visit.return_value = {}
-        mock_from_pyarrow.return_value = Schema.from_pyarrow_schema(pa.schema([pa.field("id", pa.int64())]))
+        mock_partition_fields.return_value = []
 
         # Create table that will fail on scan
         mock_table = Mock()

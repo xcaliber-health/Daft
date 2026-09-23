@@ -60,9 +60,17 @@ impl OptimizerRule for PushDownAggregation {
                                     } else {
                                         external_info.pushdowns.filters.is_none()
                                     };
-                                    let can_pushdown = scan_op.supports_count_pushdown()
+                                    // A pushed count is answered from the scan's metadata,
+                                    // which knows nothing of partition pruning, a row limit
+                                    // or a shard; any of these would be silently ignored.
+                                    let pushdowns = &external_info.pushdowns;
+                                    let reads_every_row = pushdowns.partition_filters.is_none()
+                                        && pushdowns.limit.is_none()
+                                        && pushdowns.sharder.is_none();
+                                    let can_pushdown = is_remaining_filters
+                                        && reads_every_row
                                         && is_count_mode_supported(count_mode)
-                                        && is_remaining_filters;
+                                        && scan_op.supports_count_pushdown();
 
                                     if can_pushdown {
                                         // Create new pushdown info with count aggregation
@@ -369,6 +377,24 @@ mod tests {
                 RuleExecutionStrategy::Once,
             )],
         )?;
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::partition_filters(Pushdowns::default().with_partition_filters(Some(resolved_col("a").eq(lit(1u64)))))]
+    #[case::limit(Pushdowns::default().with_limit(Some(5)))]
+    fn agg_count_all_over_a_narrowed_scan_should_not_pushdown(
+        #[case] pushdowns: Pushdowns,
+    ) -> DaftResult<()> {
+        let scan_op =
+            dummy_scan_operator_for_aggregation(vec![Field::new("a", DataType::UInt64)], true);
+        let plan = dummy_scan_node_with_pushdowns(scan_op, pushdowns)
+            .aggregate(vec![unresolved_col("a").count(CountMode::All)], vec![])?
+            .build();
+
+        let expected = plan.clone();
+
+        assert_optimized_plan_eq(plan, expected)?;
         Ok(())
     }
 

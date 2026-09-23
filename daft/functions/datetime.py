@@ -53,7 +53,7 @@ def day(expr: Expression) -> Expression:
     """Retrieves the day for a datetime column.
 
     Returns:
-        Expression: a UInt32 expression with just the day extracted from a datetime column
+        Expression: an Int32 expression with just the day extracted from a datetime column
 
     Examples:
         >>> import datetime
@@ -70,17 +70,17 @@ def day(expr: Expression) -> Expression:
         ... )
         >>> df = df.with_column("day", day(df["x"]))
         >>> df.show()
-        ╭─────────────────────┬────────╮
-        │ x                   ┆ day    │
-        │ ---                 ┆ ---    │
-        │ Timestamp[us]       ┆ UInt32 │
-        ╞═════════════════════╪════════╡
-        │ 2021-01-01 05:01:01 ┆ 1      │
-        ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┤
-        │ 2021-01-02 06:01:59 ┆ 2      │
-        ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┤
-        │ 2021-01-03 07:02:00 ┆ 3      │
-        ╰─────────────────────┴────────╯
+        ╭─────────────────────┬───────╮
+        │ x                   ┆ day   │
+        │ ---                 ┆ ---   │
+        │ Timestamp[us]       ┆ Int32 │
+        ╞═════════════════════╪═══════╡
+        │ 2021-01-01 05:01:01 ┆ 1     │
+        ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┤
+        │ 2021-01-02 06:01:59 ┆ 2     │
+        ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┤
+        │ 2021-01-03 07:02:00 ┆ 3     │
+        ╰─────────────────────┴───────╯
         <BLANKLINE>
         (Showing first 3 of 3 rows)
 
@@ -92,7 +92,7 @@ def hour(expr: Expression) -> Expression:
     """Retrieves the hour for a datetime column.
 
     Returns:
-        Expression: a UInt32 expression with just the hour extracted from a datetime column
+        Expression: an Int32 expression with just the hour extracted from a datetime column
 
     Examples:
         >>> import datetime
@@ -109,17 +109,17 @@ def hour(expr: Expression) -> Expression:
         ... )
         >>> df = df.with_column("hour", hour(df["x"]))
         >>> df.show()
-        ╭─────────────────────┬────────╮
-        │ x                   ┆ hour   │
-        │ ---                 ┆ ---    │
-        │ Timestamp[us]       ┆ UInt32 │
-        ╞═════════════════════╪════════╡
-        │ 2021-01-01 05:01:01 ┆ 5      │
-        ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┤
-        │ 2021-01-02 06:01:59 ┆ 6      │
-        ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┤
-        │ 2021-01-03 07:02:00 ┆ 7      │
-        ╰─────────────────────┴────────╯
+        ╭─────────────────────┬───────╮
+        │ x                   ┆ hour  │
+        │ ---                 ┆ ---   │
+        │ Timestamp[us]       ┆ Int32 │
+        ╞═════════════════════╪═══════╡
+        │ 2021-01-01 05:01:01 ┆ 5     │
+        ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┤
+        │ 2021-01-02 06:01:59 ┆ 6     │
+        ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┤
+        │ 2021-01-03 07:02:00 ┆ 7     │
+        ╰─────────────────────┴───────╯
         <BLANKLINE>
         (Showing first 3 of 3 rows)
 
@@ -131,7 +131,7 @@ def minute(expr: Expression) -> Expression:
     """Retrieves the minute for a datetime column.
 
     Returns:
-        Expression: a UInt32 expression with just the minute extracted from a datetime column
+        Expression: an Int32 expression with just the minute extracted from a datetime column
 
     Examples:
         >>> import datetime
@@ -151,7 +151,7 @@ def minute(expr: Expression) -> Expression:
         ╭─────────────────────┬────────╮
         │ x                   ┆ minute │
         │ ---                 ┆ ---    │
-        │ Timestamp[us]       ┆ UInt32 │
+        │ Timestamp[us]       ┆ Int32  │
         ╞═════════════════════╪════════╡
         │ 2021-01-01 05:01:01 ┆ 1      │
         ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┤
@@ -170,7 +170,7 @@ def second(expr: Expression) -> Expression:
     """Retrieves the second for a datetime column.
 
     Returns:
-        Expression: a UInt32 expression with just the second extracted from a datetime column
+        Expression: an Int32 expression with just the second extracted from a datetime column
 
     Examples:
         >>> import datetime
@@ -190,7 +190,7 @@ def second(expr: Expression) -> Expression:
         ╭─────────────────────┬────────╮
         │ x                   ┆ second │
         │ ---                 ┆ ---    │
-        │ Timestamp[us]       ┆ UInt32 │
+        │ Timestamp[us]       ┆ Int32  │
         ╞═════════════════════╪════════╡
         │ 2021-01-01 00:01:01 ┆ 1      │
         ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┤
@@ -226,7 +226,7 @@ def millisecond(expr: Expression) -> Expression:
         ╭──────────╮
         │ datetime │
         │ ---      │
-        │ UInt32   │
+        │ Int32    │
         ╞══════════╡
         │ 0        │
         ├╌╌╌╌╌╌╌╌╌╌┤
@@ -260,7 +260,7 @@ def microsecond(expr: Expression) -> Expression:
         ╭──────────╮
         │ datetime │
         │ ---      │
-        │ UInt32   │
+        │ Int32    │
         ╞══════════╡
         │ 0        │
         ├╌╌╌╌╌╌╌╌╌╌┤
@@ -296,7 +296,7 @@ def nanosecond(expr: Expression) -> Expression:
         ╭───────────╮
         │ datetime  │
         │ ---       │
-        │ UInt32    │
+        │ Int32     │
         ╞═══════════╡
         │ 0         │
         ├╌╌╌╌╌╌╌╌╌╌╌┤
@@ -315,7 +315,7 @@ def unix_date(expr: Expression) -> Expression:
     """Retrieves the number of days since 1970-01-01 00:00:00 UTC.
 
     Returns:
-        Expression: a UInt64 expression
+        Expression: an Int64 expression, negative for dates before 1970
 
     Examples:
         >>> import datetime
@@ -335,7 +335,7 @@ def unix_date(expr: Expression) -> Expression:
         ╭───────────╮
         │ unix_date │
         │ ---       │
-        │ UInt64    │
+        │ Int64     │
         ╞═══════════╡
         │ 2922      │
         ├╌╌╌╌╌╌╌╌╌╌╌┤
@@ -393,7 +393,7 @@ def month(expr: Expression) -> Expression:
     """Retrieves the month for a datetime column.
 
     Returns:
-        Expression: a UInt32 expression with just the month extracted from a datetime column
+        Expression: an Int32 expression with just the month extracted from a datetime column
 
     Examples:
         >>> import datetime
@@ -409,17 +409,17 @@ def month(expr: Expression) -> Expression:
         ...     }
         ... )
         >>> df.with_column("month", month(df["datetime"])).collect()
-        ╭─────────────────────┬────────╮
-        │ datetime            ┆ month  │
-        │ ---                 ┆ ---    │
-        │ Timestamp[us]       ┆ UInt32 │
-        ╞═════════════════════╪════════╡
-        │ 2024-07-03 00:00:00 ┆ 7      │
-        ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┤
-        │ 2024-06-04 00:00:00 ┆ 6      │
-        ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┤
-        │ 2024-05-05 00:00:00 ┆ 5      │
-        ╰─────────────────────┴────────╯
+        ╭─────────────────────┬───────╮
+        │ datetime            ┆ month │
+        │ ---                 ┆ ---   │
+        │ Timestamp[us]       ┆ Int32 │
+        ╞═════════════════════╪═══════╡
+        │ 2024-07-03 00:00:00 ┆ 7     │
+        ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┤
+        │ 2024-06-04 00:00:00 ┆ 6     │
+        ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┤
+        │ 2024-05-05 00:00:00 ┆ 5     │
+        ╰─────────────────────┴───────╯
         <BLANKLINE>
         (Showing first 3 of 3 rows)
 
@@ -431,7 +431,7 @@ def quarter(expr: Expression) -> Expression:
     """Retrieves the quarter for a datetime column.
 
     Returns:
-        Expression: a UInt32 expression with just the quarter extracted from a datetime column
+        Expression: an Int32 expression with just the quarter extracted from a datetime column
 
     Examples:
         >>> import datetime
@@ -450,7 +450,7 @@ def quarter(expr: Expression) -> Expression:
         ╭─────────────────────┬─────────╮
         │ datetime            ┆ quarter │
         │ ---                 ┆ ---     │
-        │ Timestamp[us]       ┆ UInt32  │
+        │ Timestamp[us]       ┆ Int32   │
         ╞═════════════════════╪═════════╡
         │ 2024-01-01 00:00:00 ┆ 1       │
         ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┤
@@ -507,7 +507,7 @@ def day_of_week(expr: Expression) -> Expression:
     """Retrieves the day of the week for a datetime column, starting at 0 for Monday and ending at 6 for Sunday.
 
     Returns:
-        Expression: a UInt32 expression with just the day_of_week extracted from a datetime column
+        Expression: an Int32 expression with just the day_of_week extracted from a datetime column
 
     Examples:
         >>> import datetime
@@ -526,7 +526,7 @@ def day_of_week(expr: Expression) -> Expression:
         ╭─────────────────────┬─────────────╮
         │ datetime            ┆ day_of_week │
         │ ---                 ┆ ---         │
-        │ Timestamp[us]       ┆ UInt32      │
+        │ Timestamp[us]       ┆ Int32       │
         ╞═════════════════════╪═════════════╡
         │ 2024-07-03 00:00:00 ┆ 2           │
         ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌┤
@@ -545,7 +545,7 @@ def day_of_month(expr: Expression) -> Expression:
     """Retrieves the day of the month for a datetime column.
 
     Returns:
-        Expression: a UInt32 expression with just the day_of_month extracted from a datetime column
+        Expression: an Int32 expression with just the day_of_month extracted from a datetime column
 
     Examples:
         >>> import datetime
@@ -565,7 +565,7 @@ def day_of_month(expr: Expression) -> Expression:
         ╭─────────────────────┬──────────────╮
         │ datetime            ┆ day_of_month │
         │ ---                 ┆ ---          │
-        │ Timestamp[us]       ┆ UInt32       │
+        │ Timestamp[us]       ┆ Int32        │
         ╞═════════════════════╪══════════════╡
         │ 2024-01-01 00:00:00 ┆ 1            │
         ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
@@ -590,7 +590,7 @@ def day_of_year(expr: Expression) -> Expression:
     """Retrieves the ordinal day for a datetime column. Starting at 1 for January 1st and ending at 365 or 366 for December 31st.
 
     Returns:
-        Expression: a UInt32 expression with just the day_of_year extracted from a datetime column
+        Expression: an Int32 expression with just the day_of_year extracted from a datetime column
 
     Examples:
         >>> import datetime
@@ -610,7 +610,7 @@ def day_of_year(expr: Expression) -> Expression:
         ╭─────────────────────┬─────────────╮
         │ datetime            ┆ day_of_year │
         │ ---                 ┆ ---         │
-        │ Timestamp[us]       ┆ UInt32      │
+        │ Timestamp[us]       ┆ Int32       │
         ╞═════════════════════╪═════════════╡
         │ 2024-01-01 00:00:00 ┆ 1           │
         ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌┤
@@ -635,7 +635,7 @@ def week_of_year(expr: Expression) -> Expression:
     """Retrieves the week of the year for a datetime column.
 
     Returns:
-        Expression: a UInt32 expression with just the week_of_year extracted from a datetime column
+        Expression: an Int32 expression with just the week_of_year extracted from a datetime column
 
     Examples:
         >>> import datetime
@@ -657,7 +657,7 @@ def week_of_year(expr: Expression) -> Expression:
         ╭─────────────────────┬──────────────╮
         │ datetime            ┆ week_of_year │
         │ ---                 ┆ ---          │
-        │ Timestamp[us]       ┆ UInt32       │
+        │ Timestamp[us]       ┆ Int32        │
         ╞═════════════════════╪══════════════╡
         │ 2024-01-01 00:00:00 ┆ 1            │
         ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤

@@ -5,6 +5,8 @@ use chrono::NaiveDate;
 use daft_core::datatypes::TimeUnit;
 use daft_dsl::functions::prelude::*;
 
+use crate::rows::align_to_rows;
+
 const UNIX_EPOCH: NaiveDate = match NaiveDate::from_ymd_opt(1970, 1, 1) {
     Some(d) => d,
     None => unreachable!(),
@@ -31,9 +33,10 @@ impl ScalarUDF for MakeDate {
     fn call(
         &self,
         inputs: FunctionArgs<Series>,
-        _ctx: &daft_dsl::functions::scalar::EvalContext,
+        ctx: &daft_dsl::functions::scalar::EvalContext,
     ) -> DaftResult<Series> {
         let MakeDateArgs { year, month, day } = inputs.try_into()?;
+        let [year, month, day] = align_to_rows(self.name(), [year, month, day], ctx.row_count)?;
         let year_i32 = year.cast(&DataType::Int32)?;
         let month_i32 = month.cast(&DataType::Int32)?;
         let day_i32 = day.cast(&DataType::Int32)?;
@@ -113,7 +116,7 @@ impl ScalarUDF for MakeTimestamp {
     fn call(
         &self,
         inputs: FunctionArgs<Series>,
-        _ctx: &daft_dsl::functions::scalar::EvalContext,
+        ctx: &daft_dsl::functions::scalar::EvalContext,
     ) -> DaftResult<Series> {
         let MakeTimestampArgs {
             year,
@@ -124,6 +127,11 @@ impl ScalarUDF for MakeTimestamp {
             second,
             timezone,
         } = inputs.try_into()?;
+        let [year, month, day, hour, minute, second] = align_to_rows(
+            self.name(),
+            [year, month, day, hour, minute, second],
+            ctx.row_count,
+        )?;
 
         let year_i32 = year.cast(&DataType::Int32)?;
         let month_i32 = month.cast(&DataType::Int32)?;
@@ -280,7 +288,7 @@ impl ScalarUDF for MakeTimestampLtz {
     fn call(
         &self,
         inputs: FunctionArgs<Series>,
-        _ctx: &daft_dsl::functions::scalar::EvalContext,
+        ctx: &daft_dsl::functions::scalar::EvalContext,
     ) -> DaftResult<Series> {
         let MakeTimestampLtzArgs {
             year,
@@ -291,6 +299,11 @@ impl ScalarUDF for MakeTimestampLtz {
             second,
             timezone,
         } = inputs.try_into()?;
+        let [year, month, day, hour, minute, second] = align_to_rows(
+            self.name(),
+            [year, month, day, hour, minute, second],
+            ctx.row_count,
+        )?;
 
         let year_i32 = year.cast(&DataType::Int32)?;
         let month_i32 = month.cast(&DataType::Int32)?;

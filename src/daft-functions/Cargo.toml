@@ -15,6 +15,9 @@ snafu = {workspace = true}
 uuid = {workspace = true}
 rand = {workspace = true}
 
+[dev-dependencies]
+rstest = {workspace = true}
+
 [features]
 python = [
   "common-error/python",

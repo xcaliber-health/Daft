@@ -116,3 +116,36 @@ def test_percentile_sql_integer_percentage_raises():
         daft.sql("SELECT percentile(values, 1) FROM df", df=df).collect()
 
     assert "float literal" in str(excinfo.value)
+
+
+_DECIMALS = daft.from_pydict({"g": [1, 1, 2, 2], "v": ["1.25", "2.50", "3.00", "5.00"]}).with_column(
+    "v", col("v").cast(DataType.decimal128(18, 2))
+)
+
+
+@pytest.mark.parametrize("partitions", [1, 3])
+def test_percentile_of_a_decimal_is_a_float(partitions: int) -> None:
+    df = _DECIMALS.where(col("g") == 1).repartition(partitions)
+
+    actual = df.agg(col("v").percentile(0.5).alias("p50")).to_pydict()
+
+    assert actual == {"p50": [1.875]}
+    assert df.agg(col("v").percentile(0.5)).schema()["v"].dtype == DataType.float64()
+
+
+@pytest.mark.parametrize("partitions", [1, 3])
+def test_percentile_of_a_decimal_by_group(partitions: int) -> None:
+    df = _DECIMALS.repartition(partitions)
+
+    actual = df.groupby("g").agg(col("v").percentile(0.5).alias("p50")).sort("g").to_pydict()
+
+    assert actual == {"g": [1, 2], "p50": [1.875, 4.0]}
+
+
+@pytest.mark.parametrize("partitions", [1, 3])
+def test_approx_percentile_of_a_decimal_is_near_the_exact_one(partitions: int) -> None:
+    df = _DECIMALS.repartition(partitions)
+
+    actual = df.agg(col("v").approx_percentiles(0.5).alias("p50")).to_pydict()["p50"][0]
+
+    assert actual == pytest.approx(2.5, rel=0.02)

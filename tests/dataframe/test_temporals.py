@@ -3,6 +3,7 @@ from __future__ import annotations
 import itertools
 import tempfile
 from datetime import date, datetime, timedelta, timezone
+from typing import TYPE_CHECKING
 
 import pyarrow as pa
 import pytest
@@ -42,6 +43,11 @@ from daft.functions import (
     trunc,
     weekofyear,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from daft import Expression
 
 
 def test_temporal_arithmetic_with_same_type() -> None:
@@ -1169,6 +1175,59 @@ def test_add_months_null_propagation() -> None:
     df = daft.from_pydict({"d": [date(2021, 1, 15), None, date(2021, 1, 15)], "n": [1, 1, None]})
     df = df.with_column("result", add_months(col("d"), col("n")))
     assert df.to_pydict()["result"] == [date(2021, 2, 15), None, None]
+
+
+# --- a constant argument applies to every row ---
+
+_ROWS = {
+    "d": [date(2026, 1, 31), date(2026, 3, 15), date(2026, 7, 4)],
+    "e": [date(2026, 2, 28), date(2026, 4, 15), date(2026, 9, 4)],
+    "y": [2020, 2021, 2022],
+    "m": [1, 2, 3],
+    "day": [10, 11, 12],
+    "h": [1, 2, 3],
+    "mi": [4, 5, 6],
+    "s": [7.0, 8.0, 9.0],
+}
+_TIMESTAMP_PARTS = ["y", "m", "day", "h", "mi", "s"]
+
+
+@pytest.mark.parametrize(
+    ("function", "names", "constant_at"),
+    [
+        pytest.param(add_months, ["d", "m"], 1, id="add_months months"),
+        pytest.param(add_months, ["d", "m"], 0, id="add_months date"),
+        pytest.param(months_between, ["e", "d"], 1, id="months_between start"),
+        pytest.param(months_between, ["e", "d"], 0, id="months_between end"),
+        pytest.param(make_date, ["y", "m", "day"], 0, id="make_date year"),
+        pytest.param(make_date, ["y", "m", "day"], 2, id="make_date day"),
+        pytest.param(make_timestamp, _TIMESTAMP_PARTS, 0, id="make_timestamp year"),
+        pytest.param(make_timestamp, _TIMESTAMP_PARTS, 5, id="make_timestamp second"),
+        pytest.param(make_timestamp_ltz, _TIMESTAMP_PARTS, 3, id="make_timestamp_ltz hour"),
+    ],
+)
+def test_a_constant_argument_applies_to_every_row(
+    function: Callable[..., Expression], names: list[str], constant_at: int
+) -> None:
+    # The control holds the constant in a column; the call under test passes it as a literal.
+    constant = _ROWS[names[constant_at]][0]
+    df = daft.from_pydict({**_ROWS, names[constant_at]: [constant] * 3})
+    as_column = [col(name) for name in names]
+    as_literal = [daft.lit(constant) if i == constant_at else col(name) for i, name in enumerate(names)]
+
+    expected = df.select(function(*as_column).alias("r")).to_pydict()["r"]
+    observed = df.select(function(*as_literal).alias("r")).to_pydict()["r"]
+
+    assert observed == expected
+    assert len(set(observed)) == 3
+
+
+def test_a_constant_month_shift_shifts_each_date() -> None:
+    df = daft.from_pydict({"d": [date(2026, 1, 31), date(2026, 3, 15), date(2026, 7, 4)]})
+
+    shifted = df.select(add_months(col("d"), daft.lit(1)).alias("d")).to_pydict()["d"]
+
+    assert shifted == [date(2026, 2, 28), date(2026, 4, 15), date(2026, 8, 4)]
 
 
 # --- months_between ---

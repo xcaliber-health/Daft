@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 
 import daft
 import daft.exceptions
-from daft import col
+from daft import Expression, col
 from daft.functions import to_struct
 
 
@@ -53,3 +55,26 @@ def test_to_struct_empty_partition_with_literal():
     df = daft.from_pydict({"a": []})
     result = df.select(to_struct(col("a"), daft.lit("hello").alias("b"))).to_pydict()
     assert result["struct"] == []
+
+
+@pytest.mark.parametrize(
+    "parts",
+    [
+        pytest.param(lambda: [col("v") + 1, col("v") * 2], id="derived from one column"),
+        pytest.param(lambda: [col("v").alias("x"), (col("v") * 2).alias("x")], id="aliased alike"),
+        pytest.param(lambda: [daft.lit(1), daft.lit(2)], id="two constants"),
+    ],
+)
+def test_to_struct_refuses_two_fields_of_one_name(parts: Callable[[], list[Expression]]) -> None:
+    df = daft.from_pydict({"v": [2]})
+
+    with pytest.raises(daft.exceptions.DaftCoreException, match="two fields named"):
+        df.select(to_struct(*parts()).alias("s")).collect()
+
+
+def test_to_struct_keeps_every_field_named_apart() -> None:
+    df = daft.from_pydict({"v": [2]})
+
+    result = df.select(to_struct(col("v").alias("x"), (col("v") * 2).alias("y")).alias("s")).to_pydict()
+
+    assert result == {"s": [{"x": 2, "y": 4}]}

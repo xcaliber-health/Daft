@@ -7,6 +7,9 @@ snafu = {workspace = true}
 thiserror = {workspace = true}
 tokio = {workspace = true}
 
+[dev-dependencies]
+rstest = {workspace = true}
+
 [features]
 python = ["dep:pyo3"]
 

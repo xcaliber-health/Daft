@@ -1884,6 +1884,7 @@ dependencies = [
  "arrow-schema 59.0.0",
  "pyo3",
  "regex",
+ "rstest",
  "serde_json",
  "snafu",
  "thiserror 2.0.18",

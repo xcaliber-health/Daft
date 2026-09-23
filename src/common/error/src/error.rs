@@ -73,6 +73,23 @@ pub enum DaftError {
 }
 
 impl DaftError {
+    /// Returns the innermost of Daft's own errors this one carries, or itself.
+    ///
+    /// Errors raised while planning or running arrive wrapped in the context they
+    /// passed through; the kind of the failure is that of the error at the bottom.
+    #[must_use]
+    pub fn innermost(&self) -> &Self {
+        let mut innermost = self;
+        let mut next = std::error::Error::source(self);
+        while let Some(cause) = next {
+            if let Some(daft_error) = cause.downcast_ref::<Self>() {
+                innermost = daft_error;
+            }
+            next = cause.source();
+        }
+        innermost
+    }
+
     pub fn not_implemented<T: std::fmt::Display>(msg: T) -> Self {
         Self::NotImplemented(msg.to_string())
     }
@@ -106,5 +123,32 @@ macro_rules! value_err {
 impl<'py> From<pyo3::pyclass::PyClassGuardError<'_, 'py>> for DaftError {
     fn from(error: pyo3::pyclass::PyClassGuardError<'_, 'py>) -> Self {
         Self::PyO3Error(error.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[derive(Debug, Error)]
+    #[error("could not build the plan")]
+    struct Context {
+        #[source]
+        source: DaftError,
+    }
+
+    fn wrapped(kind: DaftError) -> DaftError {
+        DaftError::External(Box::new(Context { source: kind }))
+    }
+
+    #[rstest]
+    #[case::bare(DaftError::FieldNotFound("a".into()), "FieldNotFound")]
+    #[case::wrapped(wrapped(DaftError::FieldNotFound("a".into())), "FieldNotFound")]
+    #[case::wrapped_twice(wrapped(wrapped(DaftError::TypeError("t".into()))), "TypeError")]
+    #[case::wrapping_nothing_of_ours(DaftError::External("io".into()), "External")]
+    fn the_kind_is_that_of_the_innermost_error(#[case] err: DaftError, #[case] kind: &str) {
+        assert!(format!("{:?}", err.innermost()).starts_with(kind));
     }
 }

@@ -52,7 +52,7 @@ impl PhysicalWriterFactory {
                 Self::select_parquet_writer_type(output_file_info, file_schema, native_enabled)
             }
             FileFormat::Json => Self::select_json_writer_type(file_schema),
-            FileFormat::Csv => Self::select_csv_writer_type(file_schema),
+            FileFormat::Csv => Self::select_csv_writer_type(output_file_info, file_schema),
             _ => Ok(WriterType::Pyarrow), // Default to PyArrow for unsupported formats.
         }
     }
@@ -98,10 +98,17 @@ impl PhysicalWriterFactory {
         Ok(WriterType::Native)
     }
 
-    fn select_csv_writer_type(file_schema: &SchemaRef) -> DaftResult<WriterType> {
+    fn select_csv_writer_type(
+        output_file_info: &OutputFileInfo<BoundExpr>,
+        file_schema: &SchemaRef,
+    ) -> DaftResult<WriterType> {
         let native_supported = native_csv_writer_supported(file_schema)?;
         if native_supported {
             Ok(WriterType::Native)
+        } else if output_file_info.single_file {
+            Err(DaftError::NotImplemented(
+                "`single_file=True` is not supported for this schema (the native CSV writer fell back to PyArrow)".to_string(),
+            ))
         } else {
             // Currently, Both Pyarrow and native CSV writes don't support nested (struct/list/map) datatype, and since daft doesn't support convert
             // timestamp with timezone from arrow2 to arrow-rs, so native csv writer also doesn't support timestamp with timezone.
@@ -226,13 +233,16 @@ fn create_native_writer(
             create_native_json_writer(root_dir, file_idx, partition_values, io_config, json_option)
         }
         FileFormat::Csv => {
-            if single_file {
-                return Err(DaftError::NotImplemented(
-                    "`single_file=True` is not yet supported for CSV writes".to_string(),
-                ));
-            }
             let csv_option = format_option.map(|opt| opt.to_csv()).unwrap_or_default();
-            create_native_csv_writer(root_dir, file_idx, partition_values, io_config, csv_option)
+            create_native_csv_writer(
+                root_dir,
+                file_idx,
+                partition_values,
+                io_config,
+                csv_option,
+                single_file,
+                single_file && matches!(write_mode, WriteMode::Overwrite),
+            )
         }
         _ => Err(DaftError::ComputeError(
             "Unsupported file format for native write".to_string(),

@@ -103,7 +103,7 @@ pub(crate) fn create_native_json_writer(
     )?;
     match source_type {
         SourceType::File => {
-            let storage_backend = FileStorageBackend {};
+            let storage_backend = FileStorageBackend::default();
             Ok(Box::new(make_json_writer(
                 filename,
                 partition_values.cloned(),

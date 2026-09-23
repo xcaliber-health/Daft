@@ -1,6 +1,9 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
+use common_error::{DaftError, DaftResult};
+use common_file_formats::FileFormat;
 use daft_core::prelude::*;
+use daft_dsl::{Expr, ExprRef};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "python")]
@@ -11,6 +14,40 @@ use crate::{
     sink_info::SinkInfo,
     stats::{PlanStats, StatsState},
 };
+
+/// Refuses, before anything is written, a CSV write of a column no CSV file can hold.
+///
+/// A plain partition column is written as a directory name rather than into the
+/// files, so only the columns that reach the files are checked.
+fn ensure_csv_can_hold(schema: &Schema, partition_cols: Option<&[ExprRef]>) -> DaftResult<()> {
+    let in_paths: HashSet<&str> = partition_cols
+        .unwrap_or_default()
+        .iter()
+        .filter(|col| matches!(col.as_ref(), Expr::Column(_)))
+        .map(|col| col.name())
+        .collect();
+    let mut written = schema
+        .fields()
+        .iter()
+        .filter(|field| !in_paths.contains(field.name.as_ref()))
+        .peekable();
+    // When every column partitions the write, every column is written.
+    let unholdable = if written.peek().is_some() {
+        written.find(|field| field.dtype.is_nested() || field.dtype.is_python())
+    } else {
+        schema
+            .fields()
+            .iter()
+            .find(|field| field.dtype.is_nested() || field.dtype.is_python())
+    };
+    match unholdable {
+        Some(field) => Err(DaftError::NotImplemented(format!(
+            "CSV cannot hold the column {:?} of type {}; select or convert it before writing",
+            field.name, field.dtype
+        ))),
+        None => Ok(()),
+    }
+}
 
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(debug_assertions, derive(Debug))]
@@ -34,10 +71,26 @@ impl Sink {
 
         let fields = match sink_info.as_ref() {
             SinkInfo::OutputFileInfo(output_file_info) => {
-                let mut fields = vec![Field::new("path", DataType::Utf8)];
+                if output_file_info.file_format == FileFormat::Csv {
+                    ensure_csv_can_hold(&schema, output_file_info.partition_cols.as_deref())?;
+                }
+                // Each written file: where it is and how many rows it holds, then the
+                // partition values it was written for.
+                let mut fields = vec![
+                    Field::new("path", DataType::Utf8),
+                    Field::new("num_rows", DataType::Int64),
+                ];
                 if let Some(ref pcols) = output_file_info.partition_cols {
                     for pc in pcols {
-                        fields.push(pc.to_field(&schema)?);
+                        let field = pc.to_field(&schema)?;
+                        if fields.iter().any(|reported| reported.name == field.name) {
+                            return Err(DaftError::ValueError(format!(
+                                "cannot partition a write by a column named {:?}; the write reports that name for each file it writes",
+                                field.name
+                            ))
+                            .into());
+                        }
+                        fields.push(field);
                     }
                 }
                 fields

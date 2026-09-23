@@ -133,6 +133,16 @@ fn build_object_path(
     Ok(PathBuf::from(format!("{}/{}", bucket, key.display())))
 }
 
+/// Removes whatever occupies a local single-file target, so the file can take its place.
+pub(crate) fn remove_existing_local_target(filename: &Path) -> DaftResult<()> {
+    if filename.is_dir() {
+        std::fs::remove_dir_all(filename)?;
+    } else if filename.exists() {
+        std::fs::remove_file(filename)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

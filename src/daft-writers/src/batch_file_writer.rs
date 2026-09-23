@@ -10,6 +10,7 @@ use daft_recordbatch::RecordBatch;
 
 use crate::{
     AsyncFileWriter, RETURN_PATHS_COLUMN_NAME, WriteResult, storage_backend::StorageBackend,
+    utils::remove_existing_local_target, with_rows_written,
 };
 
 type WriteFn<W> = Arc<dyn Fn(&mut W, &[ArrowRecordBatch]) -> DaftResult<()> + Send + Sync>;
@@ -21,10 +22,12 @@ pub struct BatchFileWriter<B: StorageBackend, W> {
     storage_backend: B,
     file_writer: Option<W>,
     bytes_written: usize,
+    rows_written: usize,
     inflation_factor: f64,
     builder_fn: Arc<dyn Fn(B::Writer) -> W + Send + Sync>,
     write_fn: WriteFn<W>,
     close_fn: Option<CloseFn<W>>,
+    overwrite_existing_target: bool,
 }
 
 impl<B: StorageBackend, W> BatchFileWriter<B, W> {
@@ -43,11 +46,20 @@ impl<B: StorageBackend, W> BatchFileWriter<B, W> {
             storage_backend,
             file_writer: None,
             bytes_written: 0,
+            rows_written: 0,
             inflation_factor,
             builder_fn,
             write_fn,
             close_fn,
+            overwrite_existing_target: false,
         }
+    }
+
+    /// Replaces whatever occupies the local target when the file is first written.
+    #[must_use]
+    pub fn with_overwrite_existing_target(mut self, overwrite: bool) -> Self {
+        self.overwrite_existing_target = overwrite;
+        self
     }
 
     fn estimate_bytes_to_write(&self, data: &MicroPartition) -> DaftResult<usize> {
@@ -56,6 +68,9 @@ impl<B: StorageBackend, W> BatchFileWriter<B, W> {
     }
 
     async fn create_writer(&mut self) -> DaftResult<()> {
+        if self.overwrite_existing_target {
+            remove_existing_local_target(&self.filename)?;
+        }
         let backend_writer = self.storage_backend.create_writer(&self.filename).await?;
         let file_writer = (self.builder_fn)(backend_writer);
         self.file_writer = Some(file_writer);
@@ -93,6 +108,7 @@ impl<B: StorageBackend + Send + Sync, W: Send + Sync + 'static> AsyncFileWriter
         });
         let file_writer = handle.await??;
         self.file_writer.replace(file_writer);
+        self.rows_written += num_rows;
 
         Ok(WriteResult {
             bytes_written: est_bytes_to_write,
@@ -127,7 +143,10 @@ impl<B: StorageBackend + Send + Sync, W: Send + Sync + 'static> AsyncFileWriter
             } else {
                 record_batch
             };
-        Ok(Some(record_batch_with_partition_values))
+        Ok(Some(with_rows_written(
+            record_batch_with_partition_values,
+            self.rows_written,
+        )?))
     }
 
     fn bytes_written(&self) -> usize {

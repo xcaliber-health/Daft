@@ -114,6 +114,25 @@ class FileWriterBase(ABC):
             RecordBatch containing metadata about the written file, including path and partition values.
         """
 
+    def abort(self) -> None:
+        """Discard the file this writer began, without completing it.
+
+        Called when a write fails part way, so that a partial file is not left
+        behind looking like output. Write and close should not be called after abort.
+        """
+        self.is_closed = True
+        try:
+            self._release()
+        except (OSError, pa.ArrowException):
+            # The file is being discarded; a failure to close it cleanly changes nothing.
+            pass
+        if self.fs.get_file_info(self.full_path).type != pafs.FileType.NotFound:
+            self.fs.delete_file(self.full_path)
+
+    @abstractmethod
+    def _release(self) -> None:
+        """Release whatever the writer holds open, without completing the file."""
+
 
 class ParquetFileWriter(FileWriterBase):
     def __init__(
@@ -190,6 +209,10 @@ class ParquetFileWriter(FileWriterBase):
             return RecordBatch.from_pydict(metadata).slice(0, 0)
         self.current_writer.close()
         return RecordBatch.from_pydict(metadata)
+
+    def _release(self) -> None:
+        if self.current_writer is not None:
+            self.current_writer.close()
 
     def _resolve_column_compression(
         self,
@@ -322,6 +345,12 @@ class CSVFileWriter(FileWriterBase):
             return RecordBatch.from_pydict(metadata).slice(0, 0)
         self.current_writer.close()
         return RecordBatch.from_pydict(metadata)
+
+    def _release(self) -> None:
+        if self.current_writer is not None:
+            self.current_writer.close()
+        if self.file_handle is not None:
+            self.file_handle.close()
 
 
 _ICEBERG_COMPRESSION_TO_PARQUET = {

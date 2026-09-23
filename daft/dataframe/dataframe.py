@@ -178,6 +178,20 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _ensure_single_file_writable(
+    write_mode: str,
+    partition_cols: list[ColumnInputType] | None,
+) -> None:
+    """Refuse the write options a single output file cannot honor."""
+    if write_mode == "overwrite-partitions":
+        raise ValueError("`single_file=True` cannot be combined with `write_mode='overwrite-partitions'`.")
+    if partition_cols is not None:
+        raise ValueError("`single_file=True` cannot be combined with `partition_cols`.")
+    runner_type = get_or_infer_runner_type()
+    if runner_type != "native":
+        raise ValueError(f"`single_file=True` is only supported on the native runner, got '{runner_type}'.")
+
+
 class DataFrame:
     """A Daft DataFrame is a table of data.
 
@@ -1033,7 +1047,7 @@ class DataFrame:
             single_file (bool, optional): If True, coalesce all data into a single parquet file at `root_dir` (treated as the exact file path). Cannot be combined with `partition_cols` or `overwrite-partitions`. Only supported on the native runner. Defaults to False.
 
         Returns:
-            DataFrame: The filenames that were written out as strings.
+            DataFrame: The files that were written, with the number of rows in each.
 
         Note:
             This call is **blocking** and will execute the DataFrame when called
@@ -1052,16 +1066,10 @@ class DataFrame:
             raise ValueError(
                 f"Only support `append`, `overwrite`, or `overwrite-partitions` mode. {write_mode} is unsupported"
             )
-        if single_file and write_mode == "overwrite-partitions":
-            raise ValueError("`single_file=True` cannot be combined with `write_mode='overwrite-partitions'`.")
         if write_mode == "overwrite-partitions" and partition_cols is None:
             raise ValueError("Partition columns must be specified to use `overwrite-partitions` mode.")
-        if single_file and partition_cols is not None:
-            raise ValueError("`single_file=True` cannot be combined with `partition_cols`.")
         if single_file:
-            runner_type = get_or_infer_runner_type()
-            if runner_type != "native":
-                raise ValueError(f"`single_file=True` is only supported on the native runner, got '{runner_type}'.")
+            _ensure_single_file_writable(write_mode, partition_cols)
 
         io_config = get_context().daft_planning_config.default_io_config if io_config is None else io_config
 
@@ -1114,13 +1122,14 @@ class DataFrame:
         header: bool | None = True,
         date_format: str | None = None,
         timestamp_format: str | None = None,
+        single_file: bool = False,
     ) -> "DataFrame":
         r"""Writes the DataFrame as CSV files, returning a new DataFrame with paths to the files that were written.
 
         Files will be written to `<root_dir>/*` with randomly generated UUIDs as the file names.
 
         Args:
-            root_dir (str): root file path to write CSV files to.
+            root_dir (str): root file path to write CSV files to. When `single_file=True`, this is the exact file path to write to.
             write_mode (str, optional): Operation mode of the write. `append` will add new data, `overwrite` will replace the contents of the root directory with new data. `overwrite-partitions` will replace only the contents in the partitions that are being written to. Defaults to "append".
             partition_cols (Optional[List[ColumnInputType]], optional): How to subpartition each partition further. Defaults to None.
             io_config (Optional[IOConfig], optional): configurations to use when interacting with remote storage.
@@ -1130,9 +1139,10 @@ class DataFrame:
             header (Optional[bool], optional): Whether to write a header row with column names, default True.
             date_format (Optional[str], optional): Format string for date columns. Uses chrono strftime format (e.g., "%Y-%m-%d", "%d/%m/%Y"). Defaults to None (ISO 8601 format).
             timestamp_format (Optional[str], optional): Format string for timestamp columns. Uses chrono strftime format (e.g., "%Y-%m-%d %H:%M:%S", "%+"). Defaults to None (ISO 8601 format).
+            single_file (bool, optional): If True, write all data into a single CSV file at `root_dir` (treated as the exact file path). Cannot be combined with `partition_cols` or `overwrite-partitions`. Only supported on the native runner. Defaults to False.
 
         Returns:
-            DataFrame: The filenames that were written out as strings.
+            DataFrame: The files that were written, with the number of rows in each.
 
         Note:
             This call is **blocking** and will execute the DataFrame when called
@@ -1167,6 +1177,10 @@ class DataFrame:
             >>> df.write_csv("output_dir", timestamp_format="%+")  # doctest: +SKIP
             # Output: 2024-01-15T10:30:45+00:00
 
+            One file at an exact path:
+
+            >>> df.write_csv("output.csv", single_file=True)  # doctest: +SKIP
+
         Tip:
             See also [`df.write_parquet()`][daft.DataFrame.write_parquet] and [`df.write_json()`][daft.DataFrame.write_json]
             other formats for writing DataFrames
@@ -1178,6 +1192,8 @@ class DataFrame:
             )
         if write_mode == "overwrite-partitions" and partition_cols is None:
             raise ValueError("Partition columns must be specified to use `overwrite-partitions` mode.")
+        if single_file:
+            _ensure_single_file_writable(write_mode, partition_cols)
 
         io_config = get_context().daft_planning_config.default_io_config if io_config is None else io_config
 
@@ -1200,6 +1216,7 @@ class DataFrame:
             file_format=FileFormat.Csv,
             file_format_option=file_format_option,
             io_config=io_config,
+            single_file=single_file,
         )
 
         # Block and write, then retrieve data

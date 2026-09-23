@@ -79,6 +79,17 @@ impl Window {
             }
         }
 
+        if window_spec.frame.is_some()
+            && let Some(positional) = window_functions.iter().find_map(positional_function_name)
+        {
+            // These functions answer from a row's position within its partition, which a
+            // frame does not change; accepting one would suggest it did.
+            return Err(common_error::DaftError::ValueError(format!(
+                "{positional} does not take a frame (rows_between or range_between) in its window spec — use Window().partition_by(...).order_by(...) without a frame"
+            ))
+            .into());
+        }
+
         let input_schema = input.schema();
 
         let fields = input_schema
@@ -218,5 +229,91 @@ impl Window {
         }
 
         lines
+    }
+}
+
+/// The name of a window function that answers from a row's position alone, if `function` is one.
+fn positional_function_name(function: &WindowExpr) -> Option<&'static str> {
+    match function {
+        WindowExpr::RowNumber => Some("row_number()"),
+        WindowExpr::Rank => Some("rank()"),
+        WindowExpr::DenseRank => Some("dense_rank()"),
+        WindowExpr::Offset { offset, .. } if *offset < 0 => Some("lag()"),
+        WindowExpr::Offset { .. } => Some("lead()"),
+        WindowExpr::Agg(_) | WindowExpr::FirstValue(..) | WindowExpr::LastValue(..) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use daft_core::prelude::*;
+    use daft_dsl::{
+        WindowExpr,
+        expr::window::{WindowBoundary, WindowFrame, WindowSpec},
+        resolved_col,
+    };
+    use rstest::rstest;
+
+    use super::Window;
+    use crate::test::{dummy_scan_node, dummy_scan_operator};
+
+    fn spec(frame: Option<WindowFrame>) -> Arc<WindowSpec> {
+        Arc::new(WindowSpec {
+            partition_by: vec![resolved_col("g")],
+            order_by: vec![resolved_col("o")],
+            descending: vec![false],
+            nulls_first: vec![false],
+            frame,
+            ..Default::default()
+        })
+    }
+
+    fn running() -> Option<WindowFrame> {
+        Some(WindowFrame {
+            start: WindowBoundary::UnboundedPreceding,
+            end: WindowBoundary::Offset(0),
+        })
+    }
+
+    fn offset(by: isize) -> WindowExpr {
+        WindowExpr::Offset {
+            input: resolved_col("o"),
+            offset: by,
+            default: None,
+        }
+    }
+
+    #[rstest]
+    #[case::row_number(WindowExpr::RowNumber, running(), Some("row_number()"))]
+    #[case::rank(WindowExpr::Rank, running(), Some("rank()"))]
+    #[case::dense_rank(WindowExpr::DenseRank, running(), Some("dense_rank()"))]
+    #[case::lag(offset(-1), running(), Some("lag()"))]
+    #[case::lead(offset(1), running(), Some("lead()"))]
+    #[case::row_number_unframed(WindowExpr::RowNumber, None, None)]
+    fn a_positional_function_takes_no_frame(
+        #[case] function: WindowExpr,
+        #[case] frame: Option<WindowFrame>,
+        #[case] refused_as: Option<&str>,
+    ) {
+        let input = dummy_scan_node(dummy_scan_operator(vec![
+            Field::new("g", DataType::Int64),
+            Field::new("o", DataType::Int64),
+        ]))
+        .build();
+
+        let built = Window::try_new(input, vec![function], vec!["w".to_string()], spec(frame));
+
+        match refused_as {
+            Some(name) => {
+                let message = built.err().map(|e| e.to_string()).unwrap_or_default();
+                assert!(
+                    message.contains(&format!("{name} does not take a frame")),
+                    "{message}"
+                );
+            }
+            None => assert!(built.is_ok()),
+        }
     }
 }

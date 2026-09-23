@@ -45,7 +45,7 @@ use {
 
 use crate::{
     ExecutionRuntimeContext,
-    channel::{Sender, UnboundedSender, create_channel, create_unbounded_channel},
+    channel::{Sender, create_channel},
     pipeline::{
         BuilderContext, PipelineMessage, translate_physical_plan_to_pipeline, viz_pipeline_ascii,
         viz_pipeline_mermaid,
@@ -99,12 +99,15 @@ pub(crate) struct EnqueueInputMessage {
     /// Plan inputs grouped by source_id
     inputs: HashMap<SourceId, Input>,
     /// Sender for results of this input_id
-    result_sender: UnboundedSender<ExecutionEngineResultItem>,
+    result_sender: Sender<ExecutionEngineResultItem>,
 }
+
+/// A result the loop is waiting to hand to its consumer.
+type PendingDelivery = BoxFuture<'static, ()>;
 
 /// Routes pipeline messages to per-input_id channels.
 struct MessageRouter {
-    output_senders: HashMap<InputId, UnboundedSender<ExecutionEngineResultItem>>,
+    output_senders: HashMap<InputId, Sender<ExecutionEngineResultItem>>,
     /// Wall-clock start instant when each `input_id` was enqueued to the pipeline.
     input_start_times: HashMap<InputId, Instant>,
 }
@@ -117,37 +120,44 @@ impl MessageRouter {
         }
     }
 
-    /// Route a message to the appropriate channel based on its input_id.
-    fn route_message(&mut self, msg: PipelineMessage) {
-        match msg {
+    /// Routes a message to the channel of its input_id.
+    ///
+    /// Returns the delivery of a result, which completes once its consumer's
+    /// buffer has room; the caller awaits it before routing the next message,
+    /// so a full buffer holds the pipeline back and results keep their order.
+    /// A consumer that has gone away fails the delivery at once, dropping it.
+    fn route_message(&mut self, msg: PipelineMessage) -> Option<PendingDelivery> {
+        let (input_id, item) = match msg {
             PipelineMessage::Flush(input_id) => {
                 self.input_start_times.remove(&input_id);
                 self.output_senders.remove(&input_id);
+                return None;
             }
             PipelineMessage::Morsel {
                 input_id,
                 partition,
-            } => {
-                if let Some(sender) = self.output_senders.get(&input_id) {
-                    let _ = sender.send(ExecutionEngineResultItem::Partition(partition));
-                }
-            }
+            } => (input_id, ExecutionEngineResultItem::Partition(partition)),
             PipelineMessage::FlightPartitionRef {
                 input_id,
                 partition_ref,
-            } => {
-                if let Some(sender) = self.output_senders.get(&input_id) {
-                    let _ =
-                        sender.send(ExecutionEngineResultItem::FlightPartitionRef(partition_ref));
-                }
+            } => (
+                input_id,
+                ExecutionEngineResultItem::FlightPartitionRef(partition_ref),
+            ),
+        };
+        let sender = self.output_senders.get(&input_id)?.clone();
+        Some(
+            async move {
+                let _ = sender.send(item).await;
             }
-        }
+            .boxed(),
+        )
     }
 
     fn insert_output_sender(
         &mut self,
         input_id: InputId,
-        sender: UnboundedSender<ExecutionEngineResultItem>,
+        sender: Sender<ExecutionEngineResultItem>,
     ) {
         self.input_start_times.insert(input_id, Instant::now());
         self.output_senders.insert(input_id, sender);
@@ -298,7 +308,7 @@ fn next_auto_fingerprint() -> u64 {
 
 fn parse_context(
     ctx: Option<&HashMap<String, String>>,
-) -> (QueryID, u64, Option<u32>, Option<u64>) {
+) -> (QueryID, u64, Option<u32>, Option<u64>, Option<usize>) {
     let query_id = ctx
         .as_ref()
         .and_then(|c| c.get("query_id"))
@@ -319,8 +329,22 @@ fn parse_context(
         .as_ref()
         .and_then(|c| c.get("memory_cap_bytes"))
         .and_then(|s| s.parse::<u64>().ok());
+    // How many results may wait for the caller before the pipeline is held back.
+    // Absent, results never wait: a distributed worker shares one pipeline across
+    // tasks, and holding it for one task's reader could stall the others.
+    let result_buffer_size = ctx
+        .as_ref()
+        .and_then(|c| c.get("result_buffer_size"))
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|size| size.max(1));
 
-    (query_id, fingerprint, task_id, memory_cap)
+    (
+        query_id,
+        fingerprint,
+        task_id,
+        memory_cap,
+        result_buffer_size,
+    )
 }
 
 // TODO: fix configuration for events
@@ -356,6 +380,7 @@ async fn run_execution_loop(
     let mut message_router = MessageRouter::new();
     let mut input_senders = Some(input_senders);
     let mut input_exhausted = false;
+    let mut pending_delivery: Option<PendingDelivery> = None;
 
     let (result, finish_status) = loop {
         tokio::select! {
@@ -392,10 +417,14 @@ async fn run_execution_loop(
                     input_exhausted = true;
                 }
             }
-            msg = output_receiver.recv() => {
+            () = async { pending_delivery.as_mut().expect("guarded by is_some").await }, if pending_delivery.is_some() => {
+                pending_delivery = None;
+            }
+            // Nothing more is taken from the pipeline while a result waits for room.
+            msg = output_receiver.recv(), if pending_delivery.is_none() => {
                 match msg {
                     Some(msg) => {
-                        message_router.route_message(msg);
+                        pending_delivery = message_router.route_message(msg);
                     }
                     None => {
                         // Pipeline finished. Close result channels so waiters
@@ -465,7 +494,7 @@ impl NativeExecutor {
         input_id: InputId,
         maintain_order: bool,
     ) -> DaftResult<(u64, BoxFuture<'static, DaftResult<ExecutionEngineResult>>)> {
-        let (query_id, fingerprint, task_id, memory_cap) =
+        let (query_id, fingerprint, task_id, memory_cap, result_buffer_size) =
             parse_context(additional_context.as_ref());
 
         if self.is_flotilla_worker {
@@ -555,7 +584,9 @@ impl NativeExecutor {
         Ok((
             fingerprint,
             async move {
-                let (result_tx, result_rx) = create_unbounded_channel();
+                let (result_tx, result_rx) = create_channel(
+                    result_buffer_size.unwrap_or(tokio::sync::Semaphore::MAX_PERMITS),
+                );
                 let enqueue_msg = EnqueueInputMessage {
                     input_id,
                     inputs,
@@ -689,7 +720,7 @@ impl Drop for NativeExecutor {
 }
 
 pub struct ExecutionEngineResult {
-    receiver: crate::channel::UnboundedReceiver<ExecutionEngineResultItem>,
+    receiver: crate::channel::Receiver<ExecutionEngineResultItem>,
 }
 
 impl ExecutionEngineResult {
@@ -800,5 +831,57 @@ fn dispatch_task_start_event(subscribers: &[Arc<dyn Subscriber>], event: &Event)
         if let Err(e) = subscriber.on_event(event.clone()) {
             log::debug!("Failed to dispatch task start event: {}", e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use daft_micropartition::MicroPartition;
+    use futures::poll;
+
+    use super::{ExecutionEngineResultItem, MessageRouter};
+    use crate::{channel::create_channel, pipeline::PipelineMessage};
+
+    fn morsel() -> PipelineMessage {
+        PipelineMessage::Morsel {
+            input_id: 0,
+            partition: MicroPartition::empty(None),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_result_waits_for_room_in_its_consumers_buffer() {
+        let (tx, mut rx) = create_channel::<ExecutionEngineResultItem>(1);
+        let mut router = MessageRouter::new();
+        router.insert_output_sender(0, tx);
+
+        router.route_message(morsel()).expect("a delivery").await;
+        let mut second = router.route_message(morsel()).expect("a delivery");
+
+        assert!(poll!(&mut second).is_pending());
+        assert!(rx.recv().await.is_some());
+        second.await;
+        assert!(rx.recv().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_result_for_a_departed_consumer_is_dropped() {
+        let (tx, rx) = create_channel::<ExecutionEngineResultItem>(1);
+        let mut router = MessageRouter::new();
+        router.insert_output_sender(0, tx);
+        drop(rx);
+
+        router.route_message(morsel()).expect("a delivery").await;
+        router.route_message(morsel()).expect("a delivery").await;
+    }
+
+    #[tokio::test]
+    async fn nothing_is_delivered_for_an_input_after_its_flush() {
+        let (tx, _rx) = create_channel::<ExecutionEngineResultItem>(1);
+        let mut router = MessageRouter::new();
+        router.insert_output_sender(0, tx);
+
+        assert!(router.route_message(PipelineMessage::Flush(0)).is_none());
+        assert!(router.route_message(morsel()).is_none());
     }
 }

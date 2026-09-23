@@ -165,6 +165,8 @@ pub fn resolve_exec_config(request: &QueryRequest) -> ServeResult<Arc<DaftExecut
 pub struct QueryBounds {
     pub timeout_secs: u64,
     pub memory_cap_bytes: Option<u64>,
+    /// Results the engine may hold for the response stream before it pauses.
+    pub result_buffer_size: usize,
 }
 
 /// Runs one admitted query, sending encoded messages into `tx`.
@@ -184,7 +186,7 @@ pub async fn run_query(
     bounds: QueryBounds,
 ) {
     let query_id = request.query_id.clone();
-    let inner = run_query_inner(request, sql_session, &cancel, &tx, bounds.memory_cap_bytes);
+    let inner = run_query_inner(request, sql_session, &cancel, &tx, bounds);
     let result = if bounds.timeout_secs > 0 {
         match tokio::time::timeout(std::time::Duration::from_secs(bounds.timeout_secs), inner).await
         {
@@ -215,7 +217,7 @@ async fn run_query_inner(
     sql_session: Option<Arc<Py<PyAny>>>,
     cancel: &CancellationToken,
     tx: &async_channel::Sender<Result<FlightData, Status>>,
-    memory_cap_bytes: Option<u64>,
+    bounds: QueryBounds,
 ) -> ServeResult<()> {
     let exec_config = resolve_exec_config(&request)?;
     let maintain_order = exec_config.maintain_order;
@@ -281,8 +283,16 @@ async fn run_query_inner(
     let ctx = daft_context::get_context();
     let subscribers = ctx.subscribers();
     let mut executor = NativeExecutor::new(false, "");
-    let mut context = HashMap::from([("query_id".to_string(), query_id.clone())]);
-    if let Some(cap) = memory_cap_bytes {
+    let mut context = HashMap::from([
+        ("query_id".to_string(), query_id.clone()),
+        // The engine pauses while this many results wait on a slow client, rather
+        // than holding everything it produces until the client catches up.
+        (
+            "result_buffer_size".to_string(),
+            bounds.result_buffer_size.to_string(),
+        ),
+    ]);
+    if let Some(cap) = bounds.memory_cap_bytes {
         // Server-resolved ceiling; deliberately not part of the
         // client-shipped configuration so callers cannot lift their own
         // limits.

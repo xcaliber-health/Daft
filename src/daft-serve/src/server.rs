@@ -395,6 +395,7 @@ impl FlightService for DaftServeService {
         let bounds = execute::QueryBounds {
             timeout_secs: limits.query_timeout_secs,
             memory_cap_bytes: limits.memory_cap_bytes,
+            result_buffer_size: buffer,
         };
         let task = common_runtime::get_io_runtime(true).spawn(async move {
             execute::run_query(query, sql_session, cancel, permit, guard, tx, bounds).await;

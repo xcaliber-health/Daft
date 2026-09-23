@@ -400,8 +400,8 @@ mod tests {
         let plan = dummy_scan_node(scan_op)
             .aggregate(
                 vec![
-                    unresolved_col("a").count(CountMode::All),
-                    unresolved_col("a").sum(),
+                    unresolved_col("a").count(CountMode::All).alias("count"),
+                    unresolved_col("a").sum().alias("sum"),
                 ],
                 vec![],
             )?

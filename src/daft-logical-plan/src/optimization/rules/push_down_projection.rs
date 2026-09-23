@@ -4,7 +4,8 @@ use common_error::DaftResult;
 use common_treenode::{DynTreeNode, Transformed, TreeNode};
 use daft_core::prelude::*;
 use daft_dsl::{
-    Column, Expr, ExprRef, ResolvedColumn, optimization::replace_columns_with_expressions,
+    Column, Expr, ExprRef, ResolvedColumn,
+    optimization::{get_required_columns, replace_columns_with_expressions},
     resolved_col,
 };
 use daft_scan::ScanState;
@@ -13,7 +14,7 @@ use indexmap::IndexSet;
 use super::OptimizerRule;
 use crate::{
     LogicalPlan, LogicalPlanRef,
-    ops::{Aggregate, Join, Pivot, Project, UDFProject},
+    ops::{Aggregate, Join, Pivot, Project, UDFProject, Window},
     source_info::SourceInfo,
 };
 
@@ -226,12 +227,20 @@ impl PushDownProjection {
             LogicalPlan::Aggregate(aggregate) => {
                 // Prune unnecessary columns from the child aggregate.
                 let required_columns = plan.required_columns().single();
-                let pruned_aggregate_exprs = aggregate
+                let mut pruned_aggregate_exprs = aggregate
                     .aggregations
                     .iter()
                     .filter(|&e| required_columns.contains(e.name()))
                     .cloned()
                     .collect::<Vec<_>>();
+                // An aggregate without grouping answers one row only while it computes
+                // something; with nothing left it would pass its input's rows through.
+                if pruned_aggregate_exprs.is_empty()
+                    && aggregate.groupby.is_empty()
+                    && let Some(kept) = aggregate.aggregations.first()
+                {
+                    pruned_aggregate_exprs.push(kept.clone());
+                }
 
                 if pruned_aggregate_exprs.len() < aggregate.aggregations.len() {
                     let new_upstream: LogicalPlan = Aggregate::try_new(
@@ -513,9 +522,71 @@ impl PushDownProjection {
                 // Cannot push down past a Pivot/MonotonicallyIncreasingId because it changes the schema.
                 Ok(Transformed::no(plan))
             }
-            LogicalPlan::Window(_) => {
-                // Cannot push down past a Window because it changes the window calculation results
-                Ok(Transformed::no(plan))
+            LogicalPlan::Window(window) => {
+                // A window passes every input column through and appends its results, so
+                // the input may be pruned to what is read above plus what the window
+                // itself reads; the rows, and so the results, stay the same.
+                let required_columns = plan.required_columns().single();
+                let (kept_functions, kept_aliases): (Vec<_>, Vec<_>) = window
+                    .window_functions
+                    .iter()
+                    .zip(&window.aliases)
+                    .filter(|(_, alias)| required_columns.contains(alias.as_str()))
+                    .map(|(function, alias)| (function.clone(), alias.clone()))
+                    .unzip();
+
+                if kept_functions.is_empty() {
+                    // Nothing reads the window's results, and it keeps every row.
+                    let new_plan =
+                        Arc::new(plan.with_new_children(std::slice::from_ref(&window.input)));
+                    return Ok(self
+                        .try_optimize_node(new_plan.clone())?
+                        .or(Transformed::yes(new_plan)));
+                }
+
+                let window_reads = window
+                    .window_spec
+                    .partition_by
+                    .iter()
+                    .chain(&window.window_spec.order_by)
+                    .cloned()
+                    .chain(kept_functions.iter().map(ExprRef::from))
+                    .flat_map(|expr| get_required_columns(&expr));
+                let needed = required_columns
+                    .into_iter()
+                    .chain(window_reads)
+                    .collect::<IndexSet<_>>();
+                let input_schema = window.input.schema();
+                let kept_inputs = input_schema
+                    .field_names()
+                    .filter(|name| needed.contains(*name))
+                    .map(resolved_col)
+                    .collect::<Vec<_>>();
+
+                let prunes_functions = kept_functions.len() < window.window_functions.len();
+                let prunes_inputs = kept_inputs.len() < input_schema.len();
+                if !prunes_functions && !prunes_inputs {
+                    return Ok(Transformed::no(plan));
+                }
+
+                let new_input = if prunes_inputs {
+                    LogicalPlan::from(Project::try_new(window.input.clone(), kept_inputs)?).arced()
+                } else {
+                    window.input.clone()
+                };
+                let new_window: LogicalPlan = Window::try_new(
+                    new_input,
+                    kept_functions,
+                    kept_aliases,
+                    window.window_spec.clone(),
+                )?
+                .into();
+
+                let new_plan = Arc::new(plan.with_new_children(&[new_window.into()]));
+                // Retry optimization now that the upstream node is different.
+                Ok(self
+                    .try_optimize_node(new_plan.clone())?
+                    .or(Transformed::yes(new_plan)))
             }
             LogicalPlan::Sink(_) => {
                 panic!("Bad projection due to upstream sink node: {:?}", projection)
@@ -692,13 +763,13 @@ mod tests {
 
     use common_error::DaftResult;
     use daft_core::prelude::*;
-    use daft_dsl::{lit, resolved_col, unresolved_col};
+    use daft_dsl::{WindowExpr, expr::window::WindowSpec, lit, resolved_col, unresolved_col};
     use daft_scan::Pushdowns;
 
     use crate::{
         LogicalPlan,
         builder::LogicalPlanBuilder,
-        ops::{Project, Unpivot},
+        ops::{Project, Unpivot, Window},
         optimization::{
             optimizer::{RuleBatch, RuleExecutionStrategy},
             rules::PushDownProjection,
@@ -896,6 +967,130 @@ mod tests {
         assert_optimized_plan_eq(plan, expected)?;
 
         Ok(())
+    }
+
+    /// Projection<-Aggregation keeps one aggregation of a global aggregate whose
+    /// outputs nothing reads, so that it still answers one row.
+    #[test]
+    fn test_projection_unread_global_aggregation() -> DaftResult<()> {
+        let scan_op = dummy_scan_operator(vec![
+            Field::new("a", DataType::Int64),
+            Field::new("b", DataType::Int64),
+        ]);
+        let plan = dummy_scan_node(scan_op.clone())
+            .aggregate(
+                vec![unresolved_col("a").sum(), unresolved_col("b").max()],
+                vec![],
+            )?
+            .select(vec![lit(1).alias("one")])?
+            .build();
+
+        let expected = dummy_scan_node_with_pushdowns(
+            scan_op,
+            Pushdowns::default().with_columns(Some(Arc::new(vec!["a".to_string()]))),
+        )
+        .aggregate(vec![unresolved_col("a").sum()], vec![])?
+        .select(vec![lit(1).alias("one")])?
+        .build();
+
+        assert_optimized_plan_eq(plan, expected)?;
+
+        Ok(())
+    }
+
+    fn four_column_scan() -> daft_scan::ScanOperatorRef {
+        dummy_scan_operator(vec![
+            Field::new("a", DataType::Int64),
+            Field::new("b", DataType::Int64),
+            Field::new("c", DataType::Int64),
+            Field::new("d", DataType::Int64),
+        ])
+    }
+
+    /// Builds `scan -> Window[functions over partition c] -> Project(projection)`, where
+    /// `w1` sums its input and any other alias takes the minimum, and the scan reads
+    /// `columns` when given.
+    fn window_plan(
+        scan_op: &daft_scan::ScanOperatorRef,
+        projection: Vec<daft_dsl::ExprRef>,
+        functions: &[(&str, &str)],
+        columns: Option<&[&str]>,
+    ) -> DaftResult<Arc<LogicalPlan>> {
+        let scan = match columns {
+            Some(columns) => dummy_scan_node_with_pushdowns(
+                scan_op.clone(),
+                Pushdowns::default().with_columns(Some(Arc::new(
+                    columns.iter().map(ToString::to_string).collect(),
+                ))),
+            ),
+            None => dummy_scan_node(scan_op.clone()),
+        };
+        let window_spec = Arc::new(WindowSpec {
+            partition_by: vec![resolved_col("c")],
+            ..Default::default()
+        });
+        let (window_functions, aliases): (Vec<WindowExpr>, Vec<String>) = functions
+            .iter()
+            .map(|(alias, input)| {
+                let function = match *alias {
+                    "w1" => resolved_col(*input).sum(),
+                    _ => resolved_col(*input).min(),
+                };
+                Ok((function.try_into()?, (*alias).to_string()))
+            })
+            .collect::<DaftResult<Vec<_>>>()?
+            .into_iter()
+            .unzip();
+        let window = Window::try_new(scan.build(), window_functions, aliases, window_spec)?;
+        Ok(LogicalPlan::from(Project::try_new(
+            LogicalPlan::from(window).arced(),
+            projection,
+        )?)
+        .arced())
+    }
+
+    /// Projection<-Window prunes the input to the columns read above and by the window.
+    #[test]
+    fn test_projection_window_prunes_its_input() -> DaftResult<()> {
+        let scan_op = four_column_scan();
+        let projection = vec![resolved_col("a"), resolved_col("w1")];
+        let plan = window_plan(&scan_op, projection.clone(), &[("w1", "b")], None)?;
+
+        let expected = window_plan(&scan_op, projection, &[("w1", "b")], Some(&["a", "b", "c"]))?;
+
+        assert_optimized_plan_eq(plan, expected)
+    }
+
+    /// Projection<-Window drops a window result nothing reads, and the column only it read.
+    #[test]
+    fn test_projection_window_drops_an_unread_result() -> DaftResult<()> {
+        let scan_op = four_column_scan();
+        let projection = vec![resolved_col("a"), resolved_col("w1")];
+        let plan = window_plan(
+            &scan_op,
+            projection.clone(),
+            &[("w1", "b"), ("w2", "d")],
+            None,
+        )?;
+
+        let expected = window_plan(&scan_op, projection, &[("w1", "b")], Some(&["a", "b", "c"]))?;
+
+        assert_optimized_plan_eq(plan, expected)
+    }
+
+    /// Projection<-Window removes a window none of whose results are read.
+    #[test]
+    fn test_projection_window_removed_when_unread() -> DaftResult<()> {
+        let scan_op = four_column_scan();
+        let plan = window_plan(&scan_op, vec![resolved_col("a")], &[("w1", "b")], None)?;
+
+        let expected = dummy_scan_node_with_pushdowns(
+            scan_op,
+            Pushdowns::default().with_columns(Some(Arc::new(vec!["a".to_string()]))),
+        )
+        .build();
+
+        assert_optimized_plan_eq(plan, expected)
     }
 
     /// Projection<-X pushes down the combined required columns

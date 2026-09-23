@@ -17,6 +17,22 @@ use daft_dsl::{
 
 use crate::LogicalPlanRef;
 
+/// Whether `expr` is `count(*)` in the mode that counts every row, possibly aliased.
+fn counts_every_row(expr: &ExprRef) -> bool {
+    let counted = match expr.as_ref() {
+        Expr::Alias(inner, _) => inner,
+        _ => expr,
+    };
+    matches!(
+        counted.as_ref(),
+        Expr::Agg(AggExpr::Count(input, daft_core::count_mode::CountMode::All))
+            if matches!(
+                input.as_ref(),
+                Expr::Column(Column::Unresolved(UnresolvedColumn { name, .. })) if name.as_ref() == "*"
+            )
+    )
+}
+
 /// Duplicate an expression tree for each wildcard match in a column or struct get.
 fn expand_wildcard(expr: ExprRef, plan: LogicalPlanRef) -> DaftResult<Vec<ExprRef>> {
     let mut wildcard_expansion = None;
@@ -92,6 +108,13 @@ fn expand_wildcard(expr: ExprRef, plan: LogicalPlanRef) -> DaftResult<Vec<ExprRe
     })?;
 
     if let Some(expansion) = wildcard_expansion {
+        // Counting every row reads no values, so any one column stands for all of them;
+        // expanding to each column would compute the same count once per column.
+        let expansion = if counts_every_row(&expr) {
+            expansion.into_iter().take(1).collect()
+        } else {
+            expansion
+        };
         expansion
             .into_iter()
             .map(|new_name| {
@@ -235,6 +258,25 @@ fn resolve_list_evals(expr: ExprRef) -> DaftResult<ExprRef> {
 
 fn resolve_to_basic_and_outer_cols(expr: ExprRef, plan: &LogicalPlanRef) -> DaftResult<ExprRef> {
     expr.transform(|e| {
+        // A window's partitioning and ordering are not children of its expression, so
+        // they are resolved here, against the same input as the rest of the expression.
+        if let Expr::Over(window_expr, window_spec) = e.as_ref() {
+            let resolve = |exprs: &[ExprRef]| {
+                exprs
+                    .iter()
+                    .map(|expr| resolve_to_basic_and_outer_cols(expr.clone(), plan))
+                    .collect::<DaftResult<Vec<_>>>()
+            };
+            let window_spec = WindowSpec {
+                partition_by: resolve(&window_spec.partition_by)?,
+                order_by: resolve(&window_spec.order_by)?,
+                ..window_spec.as_ref().clone()
+            };
+            return Ok(Transformed::yes(Arc::new(Expr::Over(
+                window_expr.clone(),
+                Arc::new(window_spec),
+            ))));
+        }
         if let Expr::Column(Column::Unresolved(column)) = e.as_ref() {
             if col_resolves_to_plan(column, plan)? {
                 Ok(Transformed::yes(resolved_col(column.name.clone())))

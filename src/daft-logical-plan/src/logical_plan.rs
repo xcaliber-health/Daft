@@ -378,7 +378,9 @@ impl LogicalPlan {
                     .partition_by
                     .iter()
                     .chain(window.window_spec.order_by.iter())
-                    .flat_map(get_required_columns)
+                    .cloned()
+                    .chain(window.window_functions.iter().map(ExprRef::from))
+                    .flat_map(|expr| get_required_columns(&expr))
                     .collect();
                 RequiredCols::new(res, None)
             }

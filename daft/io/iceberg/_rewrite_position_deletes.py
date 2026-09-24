@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 from daft.io.iceberg._common import (
     CommitRetryExhausted,
     MaintenanceOptions,
+    begin_transaction,
     branch_ancestry,
     commit_with_retry,
     option_bool,
@@ -542,7 +543,7 @@ def _commit_batch(
             raise RewriteConflict(
                 f"rewrite_position_delete_files: {len(missing)} input delete file(s) are no longer live"
             )
-        tx = table.transaction()
+        tx = begin_transaction(table)
         producer = _delete_rewrite_producer_class()(
             operation=Operation.REPLACE,
             transaction=tx,

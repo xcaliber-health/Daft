@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, TypeAlias, TypeVar
 from daft.io.iceberg._common import (
     CommitRetryExhausted,
     MaintenanceOptions,
+    begin_transaction,
     branch_ancestry,
     commit_with_retry,
     manifest_writer_for,
@@ -373,7 +374,7 @@ def _commit_attempt(
     }
 
     producer_cls = _producer_class()
-    with table.transaction() as txn:
+    with begin_transaction(table) as txn:
         producer = producer_cls(
             operation=operation,
             transaction=txn,

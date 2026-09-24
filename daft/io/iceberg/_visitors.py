@@ -24,10 +24,11 @@ from pyiceberg.expressions import (
     StartsWith,
 )
 from pyiceberg.expressions.literals import DateLiteral, Literal, StringLiteral, TimestampLiteral, literal
+from pyiceberg.expressions.visitors import bind
 from pyiceberg.types import TimestampType, TimestamptzType
 from pyiceberg.utils.datetime import date_to_days, datetime_to_micros, days_to_date
 
-from daft.expressions.visitor import PredicateVisitor
+from daft.expressions.visitor import ExpressionVisitor, PredicateVisitor
 
 if TYPE_CHECKING:
     from pyiceberg.schema import Schema as IcebergSchema
@@ -70,10 +71,10 @@ class IcebergPredicateVisitor(PredicateVisitor[BooleanExpression]):
         return self.visit(expr)
 
     def visit_cast(self, expr: Expression, dtype: DataType) -> BooleanExpression:
-        return self.visit(expr)
+        return self._visit_converted(expr, dtype, strict=True)
 
     def visit_try_cast(self, expr: Expression, dtype: DataType) -> BooleanExpression:
-        return self.visit(expr)
+        return self._visit_converted(expr, dtype, strict=False)
 
     def visit_function(self, name: str, args: list[Expression]) -> BooleanExpression:
         # `is_nan`/`not_nan` have no dedicated `visit_*` hook on the base visitor,
@@ -160,6 +161,42 @@ class IcebergPredicateVisitor(PredicateVisitor[BooleanExpression]):
     # Helpers
     ##
 
+    def _visit_converted(self, expr: Expression, dtype: DataType, *, strict: bool) -> BooleanExpression:
+        """Translate a conversion only where the translation selects the same rows.
+
+        A table predicate is evaluated against stored values, so a conversion of
+        a column cannot simply be dropped: ``cast(x, int64) == 74`` holds for a
+        stored ``74.5``, while ``x == 74`` does not, and pruning by the latter
+        skips files that hold matching rows. A conversion is therefore kept only
+        when it is a no-op on the stored column, or when it applies to a constant
+        and can be folded into the constant it produces. Anything else is
+        refused, which leaves that part of the filter to be applied after reading.
+        """
+        constant = _ConstantVisitor().converted(expr, dtype, strict=strict)
+        if constant is not _NOT_CONSTANT:
+            return self.visit_lit(constant)
+        inner = self.visit(expr)
+        if isinstance(inner, Reference) and self._stored_type(inner.name) == dtype:
+            return inner
+        raise ValueError(f"Iceberg cannot prune by a column converted to {dtype}")
+
+    def _stored_type(self, name: str) -> DataType | None:
+        """Return the type a column is read as, or ``None`` when it is not known."""
+        if self._schema is None:
+            return None
+        from pyiceberg.io.pyarrow import schema_to_pyarrow
+        from pyiceberg.schema import Schema
+
+        from daft.datatype import DataType
+
+        try:
+            field = self._schema.find_field(name)
+        except ValueError:
+            return None
+        if not field.field_type.is_primitive:
+            return None
+        return DataType.from_arrow_type(schema_to_pyarrow(Schema(field)).field(0).type)
+
     def coerce(self, ref: Reference, lit: Literal) -> Literal:
         """Coerce a literal to match the referenced column's type when pyiceberg can't."""
         if self._schema is None:
@@ -209,3 +246,85 @@ class IcebergPredicateVisitor(PredicateVisitor[BooleanExpression]):
         if not isinstance(result, Literal):
             raise ValueError(f"Expected a literal value, got {type(result).__name__}")
         return result
+
+
+class IcebergPruningVisitor(IcebergPredicateVisitor):
+    """Translate a filter into a predicate that holds for at least the rows it keeps.
+
+    Such a predicate may only prune files, never rows the filter keeps, so a
+    conjunct that cannot be translated or bound is dropped from an ``AND`` rather
+    than losing the whole predicate. Dropping is sound only where weakening a
+    part weakens the whole: under a ``NOT`` it would strengthen it, so there the
+    translation is strict.
+    """
+
+    def __init__(self, schema: IcebergSchema | None = None) -> None:
+        super().__init__(schema)
+        self._weakening = True
+
+    def visit_and(self, left: Expression, right: Expression) -> BooleanExpression:
+        if not self._weakening:
+            return super().visit_and(left, right)
+        sides = [side for side in (self._bound_or_none(left), self._bound_or_none(right)) if side is not None]
+        if not sides:
+            raise ValueError("No part of the conjunction can be expressed as a table predicate")
+        return sides[0] if len(sides) == 1 else And(left=sides[0], right=sides[1])
+
+    def visit_not(self, expr: Expression) -> BooleanExpression:
+        weakening, self._weakening = self._weakening, False
+        try:
+            return super().visit_not(expr)
+        finally:
+            self._weakening = weakening
+
+    def _bound_or_none(self, expr: Expression) -> BooleanExpression | None:
+        """Return the translated part if the table can bind it, else ``None``."""
+        try:
+            predicate = self.visit(expr)
+            if self._schema is not None:
+                bind(self._schema, predicate, case_sensitive=True)
+        except (ValueError, TypeError, NotImplementedError):
+            return None
+        return predicate
+
+
+_NOT_CONSTANT = object()
+
+
+class _ConstantVisitor(ExpressionVisitor[Any]):
+    """Return the value of a constant expression, or a sentinel when it is not one.
+
+    Only literals and conversions of literals are constants here; that is the
+    shape a typed constant takes in a filter.
+    """
+
+    def visit_col(self, name: str) -> Any:
+        return _NOT_CONSTANT
+
+    def visit_lit(self, value: Any) -> Any:
+        return value
+
+    def visit_alias(self, expr: Expression, alias: str) -> Any:
+        return self.visit(expr)
+
+    def visit_cast(self, expr: Expression, dtype: DataType) -> Any:
+        return self.converted(expr, dtype, strict=True)
+
+    def visit_try_cast(self, expr: Expression, dtype: DataType) -> Any:
+        return self.converted(expr, dtype, strict=False)
+
+    def visit_function(self, name: str, args: list[Expression]) -> Any:
+        return _NOT_CONSTANT
+
+    def visit_coalesce(self, args: list[Expression]) -> Any:
+        return _NOT_CONSTANT
+
+    def converted(self, expr: Expression, dtype: DataType, *, strict: bool) -> Any:
+        """Return the value of ``expr`` converted to ``dtype``, or the sentinel."""
+        from daft.series import Series
+
+        value = self.visit(expr)
+        if value is _NOT_CONSTANT:
+            return _NOT_CONSTANT
+        source = Series.from_pylist([value])
+        return (source.cast(dtype) if strict else source.try_cast(dtype)).to_pylist()[0]

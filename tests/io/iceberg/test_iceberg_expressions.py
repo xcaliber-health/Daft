@@ -38,7 +38,7 @@ from pyiceberg.utils.datetime import datetime_to_micros
 
 import daft
 from daft.datatype import DataType
-from daft.io.iceberg._expressions import convert_expression_to_iceberg
+from daft.io.iceberg._expressions import convert_expression_to_iceberg, convert_filter
 from daft.io.iceberg._visitors import IcebergPredicateVisitor
 
 try:
@@ -193,10 +193,58 @@ def test_alias_ignored() -> None:
     assert result.term.name == "x"
 
 
-def test_cast_ignored() -> None:
-    result = convert_expression_to_iceberg(daft.col("x").cast(DataType.int64()) == daft.lit(5))
+@pytest.mark.parametrize(
+    "expr",
+    [
+        pytest.param(daft.col("x").cast(DataType.int64()) == daft.lit(5), id="cast"),
+        pytest.param(daft.col("x").try_cast(DataType.int64()) == daft.lit(5), id="try_cast"),
+    ],
+)
+def test_converted_column_refused(expr: Any) -> None:
+    # Pruning by the unconverted column would skip files holding matching rows.
+    with pytest.raises(ValueError, match="converted"):
+        convert_expression_to_iceberg(expr)
+
+
+def test_converted_constant_folded() -> None:
+    result = convert_expression_to_iceberg(daft.col("x") == daft.lit("5").cast(DataType.int64()))
     assert isinstance(result, EqualTo)
     assert result.term.name == "x"
+    assert result.literal.value == 5
+
+
+def test_column_converted_to_its_own_type_kept(schema: Schema) -> None:
+    result = convert_expression_to_iceberg(daft.col("x").cast(DataType.int32()) == daft.lit(5), schema)
+    assert isinstance(result, EqualTo)
+    assert result.term.name == "x"
+
+
+_CONVERTED = daft.col("x").cast(DataType.string()) == daft.lit("1")
+
+
+@pytest.mark.parametrize(
+    ("expr", "expected"),
+    [
+        pytest.param(_CONVERTED & (daft.col("x") > 2), GreaterThan, id="conjunction keeps its translatable side"),
+        pytest.param((daft.col("x") > 2) & _CONVERTED, GreaterThan, id="from either side"),
+        pytest.param((daft.col("x") == 1) & (daft.col("x") > 2), And, id="both sides kept"),
+    ],
+)
+def test_pruning_filter_weakens_a_conjunction(schema: Schema, expr: Any, expected: type) -> None:
+    assert isinstance(convert_filter(expr._expr, schema), expected)
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        pytest.param(_CONVERTED | (daft.col("x") > 2), id="disjunction"),
+        pytest.param(~(_CONVERTED & (daft.col("x") > 2)), id="negated conjunction"),
+        pytest.param(_CONVERTED, id="lone conversion"),
+        pytest.param(daft.col("name") == daft.lit(5), id="unbindable comparison"),
+    ],
+)
+def test_pruning_filter_refuses_what_it_cannot_weaken(schema: Schema, expr: Any) -> None:
+    assert convert_filter(expr._expr, schema) is None
 
 
 def test_function_raises() -> None:

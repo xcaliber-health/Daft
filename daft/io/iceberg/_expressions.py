@@ -5,11 +5,12 @@ from typing import TYPE_CHECKING
 
 from pyiceberg.expressions import AlwaysTrue
 from pyiceberg.expressions import BooleanExpression as IcebergBooleanExpression
+from pyiceberg.expressions.visitors import bind
 
 from daft.daft import PyExpr
 from daft.expressions.expressions import Expression
 from daft.expressions.visitor import _ColumnVisitor
-from daft.io.iceberg._visitors import IcebergPredicateVisitor
+from daft.io.iceberg._visitors import IcebergPredicateVisitor, IcebergPruningVisitor
 
 if TYPE_CHECKING:
     from pyiceberg.schema import Schema as IcebergSchema
@@ -110,14 +111,22 @@ def convert_partition_filter(
 
 
 def convert_filter(filter: PyExpr | None, schema: IcebergSchema) -> IcebergBooleanExpression | None:
-    """Convert a Daft expression to an Iceberg expression for a row filter pushdown."""
+    """Convert a filter into a predicate the table may prune files by.
+
+    The predicate holds for every row the filter keeps, and may hold for more:
+    parts of a conjunction that cannot be expressed are left out, and the filter
+    itself is still applied to the rows read. A predicate the table cannot bind
+    is dropped here, so pruning is skipped rather than the read failing.
+    """
     if filter is None:
         return None
     try:
-        return convert_expression_to_iceberg(filter, schema)
+        predicate = IcebergPruningVisitor(schema).visit(Expression._from_pyexpr(filter))
+        bind(schema, predicate, case_sensitive=True)
     except Exception as e:
         logger.warning("Could not convert filter to Iceberg expression, skipping pushdown: %s", e)
         return None
+    return predicate
 
 
 def retarget_references(

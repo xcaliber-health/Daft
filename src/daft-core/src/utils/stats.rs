@@ -252,7 +252,7 @@ mod decimal_percentile_tests {
     #[case::median_of_an_odd_count(vec![300, 100, 200], 0.5, Some(200))]
     #[case::lowest(vec![300, 100, 200], 0.0, Some(100))]
     #[case::highest(vec![300, 100, 200], 1.0, Some(300))]
-    // Rank 0.9 × 10 = 9 exactly; the binary 0.9 would land just past index 9.
+    // Rank 0.9 × 10 = 9 exactly; 0.9 taken at its exact binary value would land just past index 9.
     #[case::percentage_read_as_written(
         (0..=10).map(|v| v * 100).collect(), 0.9, Some(900)
     )]

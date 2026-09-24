@@ -164,7 +164,7 @@ def test_a_decimal_median_is_exact(values: list[str], expected: Decimal) -> None
 
 
 def test_a_decimal_percentile_reads_the_percentage_as_written() -> None:
-    # 0.9 x 10 is exactly rank 9; read as its binary value it would interpolate past 9.00.
+    # 0.9 x 10 is exactly rank 9; 0.9 taken at its exact binary value would land just past it.
     df = _decimals([f"{i}.00" for i in range(11)])
 
     answered = df.agg(col("v").percentile(0.9).alias("p90")).to_pydict()["p90"]

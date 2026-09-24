@@ -218,16 +218,18 @@ impl ScalarUDF for AddMonths {
         ctx: &daft_dsl::functions::scalar::EvalContext,
     ) -> DaftResult<Series> {
         let AddMonthsArgs { input, months } = inputs.try_into()?;
-        let [input, months] = align_to_rows(self.name(), [input, months], ctx.row_count)?;
-        let date_series = input.cast(&DataType::Date)?;
-        let months_i32 = months.cast(&DataType::Int32)?;
+        let [date_series, months_i32] = align_to_rows(
+            self.name(),
+            [input.cast(&DataType::Date)?, months.cast(&DataType::Int32)?],
+            ctx.row_count,
+        )?;
         let date_arr = date_series.date()?;
         let dates = date_arr.as_arrow()?;
         let months_arr = months_i32
             .downcast::<daft_core::array::DataArray<Int32Type>>()?
             .as_arrow()?;
 
-        let values: Vec<Option<i32>> = dates
+        let shifted: Date32Array = dates
             .iter()
             .zip(months_arr.iter())
             .map(|(opt_days, opt_months)| match (opt_days, opt_months) {
@@ -236,7 +238,7 @@ impl ScalarUDF for AddMonths {
             })
             .collect();
 
-        let arrow_arr: arrow_array::ArrayRef = Arc::new(Date32Array::from(values));
+        let arrow_arr: arrow_array::ArrayRef = Arc::new(shifted);
         Series::from_arrow(
             Arc::new(Field::new(date_arr.name().to_string(), DataType::Date)),
             arrow_arr,
@@ -353,23 +355,23 @@ impl ScalarUDF for MonthsBetween {
             end_date,
             start_date,
         } = inputs.try_into()?;
-        let [end_date, start_date] =
-            align_to_rows(self.name(), [end_date, start_date], ctx.row_count)?;
-
         // Cast both inputs to a tz-naive microsecond Timestamp. Casting strips the
         // timezone label without shifting the underlying i64, so the comparison is
         // always evaluated in UTC. Daft has no session-timezone concept, so this
         // matches Spark when the session is UTC.
         let ts_dtype = DataType::Timestamp(TimeUnit::Microseconds, None);
-        let end_ts = end_date.cast(&ts_dtype)?;
-        let start_ts = start_date.cast(&ts_dtype)?;
+        let [end_ts, start_ts] = align_to_rows(
+            self.name(),
+            [end_date.cast(&ts_dtype)?, start_date.cast(&ts_dtype)?],
+            ctx.row_count,
+        )?;
 
         let end_ts_arr = end_ts.timestamp()?;
         let start_ts_arr = start_ts.timestamp()?;
         let end_arr = end_ts_arr.as_arrow()?;
         let start_arr = start_ts_arr.as_arrow()?;
 
-        let values: Vec<Option<f64>> = end_arr
+        let months: Float64Array = end_arr
             .iter()
             .zip(start_arr.iter())
             .map(|(opt_e, opt_s)| match (opt_e, opt_s) {
@@ -382,7 +384,7 @@ impl ScalarUDF for MonthsBetween {
             })
             .collect();
 
-        let arrow_arr: arrow_array::ArrayRef = Arc::new(Float64Array::from(values));
+        let arrow_arr: arrow_array::ArrayRef = Arc::new(months);
         Series::from_arrow(
             Arc::new(Field::new(end_ts_arr.name().to_string(), DataType::Float64)),
             arrow_arr,

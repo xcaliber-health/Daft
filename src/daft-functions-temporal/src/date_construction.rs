@@ -36,10 +36,15 @@ impl ScalarUDF for MakeDate {
         ctx: &daft_dsl::functions::scalar::EvalContext,
     ) -> DaftResult<Series> {
         let MakeDateArgs { year, month, day } = inputs.try_into()?;
-        let [year, month, day] = align_to_rows(self.name(), [year, month, day], ctx.row_count)?;
-        let year_i32 = year.cast(&DataType::Int32)?;
-        let month_i32 = month.cast(&DataType::Int32)?;
-        let day_i32 = day.cast(&DataType::Int32)?;
+        let [year_i32, month_i32, day_i32] = align_to_rows(
+            self.name(),
+            [
+                year.cast(&DataType::Int32)?,
+                month.cast(&DataType::Int32)?,
+                day.cast(&DataType::Int32)?,
+            ],
+            ctx.row_count,
+        )?;
 
         let year_arr = year_i32.i32()?;
         let month_arr = month_i32.i32()?;
@@ -47,7 +52,7 @@ impl ScalarUDF for MakeDate {
 
         let field_name = year_arr.name().to_string();
 
-        let values: Vec<Option<i32>> = year_arr
+        let dates: Date32Array = year_arr
             .into_iter()
             .zip(month_arr.into_iter())
             .zip(day_arr.into_iter())
@@ -58,7 +63,7 @@ impl ScalarUDF for MakeDate {
             })
             .collect();
 
-        let arrow_arr: arrow_array::ArrayRef = Arc::new(Date32Array::from(values));
+        let arrow_arr: arrow_array::ArrayRef = Arc::new(dates);
         Series::from_arrow(Arc::new(Field::new(field_name, DataType::Date)), arrow_arr)
     }
 
@@ -127,18 +132,25 @@ impl ScalarUDF for MakeTimestamp {
             second,
             timezone,
         } = inputs.try_into()?;
-        let [year, month, day, hour, minute, second] = align_to_rows(
+        let [
+            year_i32,
+            month_i32,
+            day_i32,
+            hour_i32,
+            minute_i32,
+            second_f64,
+        ] = align_to_rows(
             self.name(),
-            [year, month, day, hour, minute, second],
+            [
+                year.cast(&DataType::Int32)?,
+                month.cast(&DataType::Int32)?,
+                day.cast(&DataType::Int32)?,
+                hour.cast(&DataType::Int32)?,
+                minute.cast(&DataType::Int32)?,
+                second.cast(&DataType::Float64)?,
+            ],
             ctx.row_count,
         )?;
-
-        let year_i32 = year.cast(&DataType::Int32)?;
-        let month_i32 = month.cast(&DataType::Int32)?;
-        let day_i32 = day.cast(&DataType::Int32)?;
-        let hour_i32 = hour.cast(&DataType::Int32)?;
-        let minute_i32 = minute.cast(&DataType::Int32)?;
-        let second_f64 = second.cast(&DataType::Float64)?;
 
         let year_arr = year_i32.i32()?;
         let month_arr = month_i32.i32()?;
@@ -157,7 +169,7 @@ impl ScalarUDF for MakeTimestamp {
             None => None,
         };
 
-        let values: Vec<Option<i64>> = year_arr
+        let timestamps: TimestampMicrosecondArray = year_arr
             .into_iter()
             .zip(month_arr.into_iter())
             .zip(day_arr.into_iter())
@@ -195,7 +207,7 @@ impl ScalarUDF for MakeTimestamp {
             })
             .collect();
 
-        let arrow_arr: arrow_array::ArrayRef = Arc::new(TimestampMicrosecondArray::from(values));
+        let arrow_arr: arrow_array::ArrayRef = Arc::new(timestamps);
         Series::from_arrow(
             Arc::new(Field::new(
                 field_name,
@@ -299,18 +311,25 @@ impl ScalarUDF for MakeTimestampLtz {
             second,
             timezone,
         } = inputs.try_into()?;
-        let [year, month, day, hour, minute, second] = align_to_rows(
+        let [
+            year_i32,
+            month_i32,
+            day_i32,
+            hour_i32,
+            minute_i32,
+            second_f64,
+        ] = align_to_rows(
             self.name(),
-            [year, month, day, hour, minute, second],
+            [
+                year.cast(&DataType::Int32)?,
+                month.cast(&DataType::Int32)?,
+                day.cast(&DataType::Int32)?,
+                hour.cast(&DataType::Int32)?,
+                minute.cast(&DataType::Int32)?,
+                second.cast(&DataType::Float64)?,
+            ],
             ctx.row_count,
         )?;
-
-        let year_i32 = year.cast(&DataType::Int32)?;
-        let month_i32 = month.cast(&DataType::Int32)?;
-        let day_i32 = day.cast(&DataType::Int32)?;
-        let hour_i32 = hour.cast(&DataType::Int32)?;
-        let minute_i32 = minute.cast(&DataType::Int32)?;
-        let second_f64 = second.cast(&DataType::Float64)?;
 
         let year_arr = year_i32.i32()?;
         let month_arr = month_i32.i32()?;
@@ -329,7 +348,7 @@ impl ScalarUDF for MakeTimestampLtz {
             None => None,
         };
 
-        let values: Vec<Option<i64>> = year_arr
+        let timestamps: TimestampMicrosecondArray = year_arr
             .into_iter()
             .zip(month_arr.into_iter())
             .zip(day_arr.into_iter())
@@ -367,7 +386,7 @@ impl ScalarUDF for MakeTimestampLtz {
             })
             .collect();
 
-        let arrow_arr: arrow_array::ArrayRef = Arc::new(TimestampMicrosecondArray::from(values));
+        let arrow_arr: arrow_array::ArrayRef = Arc::new(timestamps);
         Series::from_arrow(
             Arc::new(Field::new(
                 field_name,

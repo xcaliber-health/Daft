@@ -4578,6 +4578,8 @@ class DataFrame:
             return expr.mean()
         elif op == "any_value":
             return expr.any_value()
+        elif op == "single_value":
+            return expr.single_value()
         elif op == "list":
             return expr.list_agg()
         elif op == "set":
@@ -4863,6 +4865,34 @@ class DataFrame:
             (Showing first 1 of 1 rows)
         """
         return self._apply_agg_fn(Expression.any_value, cols)
+
+    @DataframePublicAPI
+    def single_value(self, *cols: ColumnInputType) -> "DataFrame":
+        """Returns the value of the only row of this DataFrame.
+
+        Two or more rows fail the query with
+        [`DaftCardinalityError`][daft.exceptions.DaftCardinalityError]; no rows answer null.
+
+        Args:
+            *cols (Union[str, Expression]): columns to take the value from
+        Returns:
+            DataFrame: DataFrame with one row holding each column's value.
+
+        Examples:
+            >>> import daft
+            >>> df = daft.from_pydict({"col_a": [7]})
+            >>> df.single_value("col_a").show()
+            ╭───────╮
+            │ col_a │
+            │ ---   │
+            │ Int64 │
+            ╞═══════╡
+            │ 7     │
+            ╰───────╯
+            <BLANKLINE>
+            (Showing first 1 of 1 rows)
+        """
+        return self._apply_agg_fn(Expression.single_value, cols)
 
     @DataframePublicAPI
     def count_distinct(self, *cols: ColumnInputType) -> "DataFrame":
@@ -6345,6 +6375,20 @@ class GroupedDataFrame:
             DataFrame: DataFrame with any values.
         """
         return self.df._apply_agg_fn(Expression.any_value, cols, self.group_by)
+
+    def single_value(self, *cols: ColumnInputType) -> DataFrame:
+        """Returns the value of each group's only row on this GroupedDataFrame.
+
+        A group of two or more rows fails the query with
+        [`DaftCardinalityError`][daft.exceptions.DaftCardinalityError].
+
+        Args:
+            *cols (Union[str, Expression]): columns to take the value from
+
+        Returns:
+            DataFrame: DataFrame with one row per group.
+        """
+        return self.df._apply_agg_fn(Expression.single_value, cols, self.group_by)
 
     def count(self, *cols: ColumnInputType) -> DataFrame:
         """Performs grouped count on this GroupedDataFrame.

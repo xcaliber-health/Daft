@@ -15,6 +15,10 @@ pub enum DaftError {
     TypeError(String),
     #[error("DaftError::ComputeError {0}")]
     ComputeError(String),
+    /// A value that must come from exactly one row came from several, such as a
+    /// group's single value.
+    #[error("DaftError::CardinalityViolation {0}")]
+    CardinalityViolation(String),
     #[error("DaftError::ArrowRsError {0}")]
     ArrowRsError(#[from] arrow_schema::ArrowError),
     // TODO(desmond): We can't currently implement this as a From<parquet::errors::ParquetError>

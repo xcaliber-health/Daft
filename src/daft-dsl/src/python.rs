@@ -576,6 +576,10 @@ impl PyExpr {
         Ok(self.expr.clone().any_value(ignore_nulls).into())
     }
 
+    pub fn single_value(&self) -> PyResult<Self> {
+        Ok(self.expr.clone().single_value().into())
+    }
+
     pub fn first_value(&self, ignore_nulls: bool) -> PyResult<Self> {
         Ok(self.expr.clone().first_value(ignore_nulls).into())
     }

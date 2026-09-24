@@ -16,7 +16,7 @@ use crate::{
     count_mode::CountMode,
     datatypes::*,
     series::{Series, array_impl::IntoSeries},
-    utils::{decimal::Percentage, stats},
+    utils::{cardinality::several_rows_in_a_group, decimal::Percentage, stats},
     with_match_physical_daft_types,
 };
 
@@ -417,6 +417,29 @@ impl Series {
         self.take(&indices)
     }
 
+    /// The value of each group's only row, or null for a group of none.
+    ///
+    /// Rows are counted, not values: two rows holding the same value, or two nulls,
+    /// are still two rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaftError::CardinalityViolation`] when a group holds two or more rows.
+    pub fn single_value(&self, groups: Option<&GroupIndices>) -> DaftResult<Self> {
+        let holds_several = match groups {
+            Some(groups) => groups.iter().any(|group| group.len() > 1),
+            None => self.len() > 1,
+        };
+        if holds_several {
+            return Err(several_rows_in_a_group());
+        }
+        match groups {
+            // A lone row is already the answer.
+            None if self.len() == 1 => Ok(self.clone()),
+            _ => self.any_value(groups, false),
+        }
+    }
+
     pub fn agg_list(&self, groups: Option<&GroupIndices>) -> DaftResult<Self> {
         self.inner.agg_list(groups)
     }
@@ -607,5 +630,80 @@ impl DaftSetAggable for Series {
         );
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use common_error::{DaftError, DaftResult};
+    use rstest::rstest;
+    use smallvec::smallvec;
+
+    use crate::{
+        array::ops::GroupIndices,
+        datatypes::{Int64Array, Utf8Array},
+        series::{IntoSeries, Series},
+    };
+
+    fn strings(values: &[Option<&str>]) -> Series {
+        Utf8Array::from_iter("v", values.iter().copied()).into_series()
+    }
+
+    fn values_of(series: &Series) -> DaftResult<Vec<Option<String>>> {
+        Ok(series
+            .utf8()?
+            .into_iter()
+            .map(|v| v.map(str::to_string))
+            .collect())
+    }
+
+    #[rstest]
+    #[case::one_row(&[Some("a")], vec![Some("a")])]
+    #[case::one_null_row(&[None], vec![None])]
+    #[case::no_rows(&[], vec![None])]
+    fn the_only_row_is_the_answer(
+        #[case] rows: &[Option<&str>],
+        #[case] expected: Vec<Option<&str>>,
+    ) -> DaftResult<()> {
+        let answer = strings(rows).single_value(None)?;
+
+        let expected: Vec<Option<String>> = expected
+            .into_iter()
+            .map(|v| v.map(str::to_string))
+            .collect();
+        assert_eq!(values_of(&answer)?, expected);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::distinct_values(&[Some("a"), Some("b")])]
+    #[case::equal_values(&[Some("a"), Some("a")])]
+    #[case::two_nulls(&[None, None])]
+    fn a_second_row_is_refused(#[case] rows: &[Option<&str>]) {
+        let refused = strings(rows).single_value(None);
+
+        assert!(matches!(refused, Err(DaftError::CardinalityViolation(_))));
+    }
+
+    #[test]
+    fn each_group_answers_its_own_row_in_group_order() -> DaftResult<()> {
+        let values = Int64Array::from_slice("v", &[10, 20, 30]).into_series();
+        let groups: GroupIndices = vec![smallvec![2], smallvec![0], smallvec![1]];
+
+        let answer = values.single_value(Some(&groups))?;
+
+        let observed: Vec<Option<i64>> = answer.i64()?.into_iter().collect();
+        assert_eq!(observed, vec![Some(30), Some(10), Some(20)]);
+        Ok(())
+    }
+
+    #[test]
+    fn one_group_of_two_rows_refuses_every_group() {
+        let values = Int64Array::from_slice("v", &[10, 20, 30]).into_series();
+        let groups: GroupIndices = vec![smallvec![0], smallvec![1, 2]];
+
+        let refused = values.single_value(Some(&groups));
+
+        assert!(matches!(refused, Err(DaftError::CardinalityViolation(_))));
     }
 }

@@ -35,6 +35,10 @@ class DaftComputeError(DaftCoreException):
     """A computation could not be carried out on its inputs."""
 
 
+class DaftCardinalityError(DaftComputeError):
+    """A value that must come from exactly one row came from several."""
+
+
 class DaftNotImplementedError(DaftCoreException):
     """The requested operation is not supported."""
 

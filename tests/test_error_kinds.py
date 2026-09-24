@@ -7,12 +7,14 @@ import pytest
 import daft
 from daft import DataType, Window, col
 from daft.exceptions import (
+    DaftCardinalityError,
+    DaftComputeError,
     DaftCoreException,
     DaftFieldNotFoundError,
     DaftTypeError,
     DaftValueError,
 )
-from daft.functions import first_value, year
+from daft.functions import first_value, single_value, year
 
 
 def _frame() -> daft.DataFrame:
@@ -36,6 +38,11 @@ def _frame() -> daft.DataFrame:
             DaftTypeError,
             id="wrong type while running",
         ),
+        pytest.param(
+            lambda df: df.groupby("g").agg(single_value(col("a"))).collect(),
+            DaftCardinalityError,
+            id="several rows where one was required",
+        ),
     ],
 )
 def test_a_failure_arrives_as_its_kind(
@@ -47,7 +54,7 @@ def test_a_failure_arrives_as_its_kind(
 
 @pytest.mark.parametrize(
     "kind",
-    [DaftFieldNotFoundError, DaftTypeError, DaftValueError],
+    [DaftFieldNotFoundError, DaftTypeError, DaftValueError, DaftCardinalityError],
 )
 def test_every_kind_is_still_a_core_exception_and_a_value_error(kind: type[DaftCoreException]) -> None:
     assert issubclass(kind, DaftCoreException)
@@ -57,3 +64,7 @@ def test_every_kind_is_still_a_core_exception_and_a_value_error(kind: type[DaftC
 def test_a_failure_keeps_its_message() -> None:
     with pytest.raises(DaftFieldNotFoundError, match="missing"):
         _frame().select(col("missing"))
+
+
+def test_a_cardinality_failure_is_a_compute_failure() -> None:
+    assert issubclass(DaftCardinalityError, DaftComputeError)

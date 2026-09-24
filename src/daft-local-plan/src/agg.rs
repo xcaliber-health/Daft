@@ -286,6 +286,13 @@ pub fn populate_aggregation_stages_bound_with_schema(
                 let global_any_col = second_stage!(AggExpr::AnyValue(any_col, *ignore_nulls));
                 final_stage(global_any_col);
             }
+            // Each partition answers its group's single row, so a group whose rows
+            // arrive from two partitions is caught when the answers are combined.
+            AggExpr::SingleValue(expr) => {
+                let single_col = first_stage!(AggExpr::SingleValue(expr.clone()));
+                let global_single_col = second_stage!(AggExpr::SingleValue(single_col));
+                final_stage(global_single_col);
+            }
             AggExpr::List(expr) => {
                 let list_col = first_stage!(AggExpr::List(expr.clone()));
                 let concat_col = second_stage!(AggExpr::Concat(list_col, None));

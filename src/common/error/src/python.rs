@@ -9,6 +9,7 @@ import_exception!(daft.exceptions, DaftAmbiguousReferenceError);
 import_exception!(daft.exceptions, DaftSchemaMismatchError);
 import_exception!(daft.exceptions, DaftValueError);
 import_exception!(daft.exceptions, DaftComputeError);
+import_exception!(daft.exceptions, DaftCardinalityError);
 import_exception!(daft.exceptions, DaftNotImplementedError);
 import_exception!(daft.exceptions, DaftInvalidArgumentError);
 import_exception!(daft.exceptions, ConnectTimeoutError);
@@ -51,6 +52,7 @@ fn error_of_kind(kind: &DaftError, message: String) -> pyo3::PyErr {
         DaftError::TypeError(_) => DaftTypeError::new_err(message),
         DaftError::ValueError(_) => DaftValueError::new_err(message),
         DaftError::ComputeError(_) => DaftComputeError::new_err(message),
+        DaftError::CardinalityViolation(_) => DaftCardinalityError::new_err(message),
         DaftError::NotImplemented(_) => DaftNotImplementedError::new_err(message),
         DaftError::InvalidArgumentError(_) => DaftInvalidArgumentError::new_err(message),
         _ => DaftCoreException::new_err(message),

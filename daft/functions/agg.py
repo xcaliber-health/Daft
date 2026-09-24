@@ -290,6 +290,43 @@ def any_value(expr: Expression, ignore_nulls: bool = False) -> Expression:
     return Expression._from_pyexpr(expr._expr.any_value(ignore_nulls))
 
 
+def single_value(expr: Expression) -> Expression:
+    """Returns the value of each group's only row.
+
+    A group of two or more rows fails the query with
+    [`DaftCardinalityError`][daft.exceptions.DaftCardinalityError]. Rows are counted,
+    not values: two rows holding the same value, or two nulls, still fail. A group of
+    no rows answers null.
+
+    The check is made wherever the value is read. A value the query never reads may
+    be left uncomputed, and then nothing is checked.
+
+    Args:
+        expr (Expression): The input expression to take the value from.
+
+    Returns:
+        Expression: An aggregation of the same type as ``expr``.
+
+    Examples:
+        >>> import daft
+        >>> from daft.functions import single_value
+        >>> df = daft.from_pydict({"k": [1, 2], "v": ["a", "b"]})
+        >>> df.groupby("k").agg(single_value(df["v"])).sort("k").show()
+        ╭───────┬────────╮
+        │ k     ┆ v      │
+        │ ---   ┆ ---    │
+        │ Int64 ┆ String │
+        ╞═══════╪════════╡
+        │ 1     ┆ a      │
+        ├╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┤
+        │ 2     ┆ b      │
+        ╰───────┴────────╯
+        <BLANKLINE>
+        (Showing first 2 of 2 rows)
+    """
+    return Expression._from_pyexpr(expr._expr.single_value())
+
+
 def skew(expr: Expression) -> Expression:
     """Calculates the skewness of the values from the expression."""
     return Expression._from_pyexpr(expr._expr.skew())

@@ -10,7 +10,10 @@ use daft_core::{
     count_mode::CountMode,
     datatypes::*,
     series::{IntoSeries, Series},
-    utils::identity_hash_set::{IdentityBuildHasher, IndexHash},
+    utils::{
+        cardinality::several_rows_in_a_group,
+        identity_hash_set::{IdentityBuildHasher, IndexHash},
+    },
 };
 use daft_dsl::{
     AggExpr,
@@ -468,6 +471,46 @@ define_any_value_accum!(AnyValueAccumU64, UInt64Type, u64);
 define_any_value_accum!(AnyValueAccumF32, Float32Type, f32);
 define_any_value_accum!(AnyValueAccumF64, Float64Type, f64);
 
+// SingleValue: the first row of each group, provided no group holds a second.
+// Every group is formed from the rows of the batch being aggregated, so each holds
+// at least one; one holds two or more exactly when there are more rows than groups.
+struct SingleValueAccum {
+    first_row: Box<AggAccumulator>,
+    num_groups: usize,
+    holds_several: bool,
+}
+
+impl SingleValueAccum {
+    fn new(first_row: AggAccumulator) -> Self {
+        Self {
+            first_row: Box::new(first_row),
+            num_groups: 0,
+            holds_several: false,
+        }
+    }
+
+    fn init_groups(&mut self, n: usize) {
+        self.num_groups = n;
+        // `n` came from a `u32` group count, so it always converts back.
+        self.first_row
+            .init_groups(u32::try_from(n).unwrap_or(u32::MAX));
+    }
+
+    fn update_batch(&mut self, group_ids: &[u32]) {
+        self.holds_several |= group_ids.len() > self.num_groups;
+        if !self.holds_several {
+            self.first_row.update_batch(group_ids);
+        }
+    }
+
+    fn finalize(self, name: &str) -> DaftResult<Series> {
+        if self.holds_several {
+            return Err(several_rows_in_a_group());
+        }
+        self.first_row.finalize(name)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AggAccumulator enum — eliminates vtable dispatch in the hot loop
 // ---------------------------------------------------------------------------
@@ -552,6 +595,7 @@ define_agg_accumulator_enum!(
     AnyValueU64(AnyValueAccumU64),
     AnyValueF32(AnyValueAccumF32),
     AnyValueF64(AnyValueAccumF64),
+    SingleValue(SingleValueAccum),
     BoolAnd(BoolAndAccum),
     BoolOr(BoolOrAccum),
 );
@@ -593,6 +637,39 @@ macro_rules! dispatch_typed_accum {
             _ => Ok(None),
         }
     };
+}
+
+/// Builds the accumulator that keeps each group's first row (or first non-null row
+/// when `ignore_nulls`), or `None` when `evaluated`'s type has no inline accumulator.
+fn any_value_accumulator(
+    evaluated: &Series,
+    ignore_nulls: bool,
+) -> DaftResult<Option<AggAccumulator>> {
+    macro_rules! any_value_of {
+        ($($dtype:ident => $arr_ty:ident => $variant:ident($accum:ident)),+ $(,)?) => {
+            match evaluated.data_type() {
+                $(
+                    DataType::$dtype => Some(AggAccumulator::$variant($accum::new(
+                        evaluated.downcast::<$arr_ty>()?.clone(),
+                        ignore_nulls,
+                    ))),
+                )+
+                _ => None,
+            }
+        };
+    }
+    Ok(any_value_of!(
+        Int8 => Int8Array => AnyValueI8(AnyValueAccumI8),
+        Int16 => Int16Array => AnyValueI16(AnyValueAccumI16),
+        Int32 => Int32Array => AnyValueI32(AnyValueAccumI32),
+        Int64 => Int64Array => AnyValueI64(AnyValueAccumI64),
+        UInt8 => UInt8Array => AnyValueU8(AnyValueAccumU8),
+        UInt16 => UInt16Array => AnyValueU16(AnyValueAccumU16),
+        UInt32 => UInt32Array => AnyValueU32(AnyValueAccumU32),
+        UInt64 => UInt64Array => AnyValueU64(AnyValueAccumU64),
+        Float32 => Float32Array => AnyValueF32(AnyValueAccumF32),
+        Float64 => Float64Array => AnyValueF64(AnyValueAccumF64),
+    ))
 }
 
 fn try_create_accumulator(
@@ -719,103 +796,17 @@ fn try_create_accumulator(
         &AggExpr::AnyValue(ref expr, ignore_nulls) => {
             let evaluated = source.eval_agg_child(expr)?;
             let name = evaluated.name().to_string();
-            match evaluated.data_type() {
-                DataType::Int8 => {
-                    let arr = evaluated.downcast::<Int8Array>()?;
-                    Ok(Some((
-                        AggAccumulator::AnyValueI8(AnyValueAccumI8::new(arr.clone(), ignore_nulls)),
-                        name,
-                    )))
-                }
-                DataType::Int16 => {
-                    let arr = evaluated.downcast::<Int16Array>()?;
-                    Ok(Some((
-                        AggAccumulator::AnyValueI16(AnyValueAccumI16::new(
-                            arr.clone(),
-                            ignore_nulls,
-                        )),
-                        name,
-                    )))
-                }
-                DataType::Int32 => {
-                    let arr = evaluated.downcast::<Int32Array>()?;
-                    Ok(Some((
-                        AggAccumulator::AnyValueI32(AnyValueAccumI32::new(
-                            arr.clone(),
-                            ignore_nulls,
-                        )),
-                        name,
-                    )))
-                }
-                DataType::Int64 => {
-                    let arr = evaluated.downcast::<Int64Array>()?;
-                    Ok(Some((
-                        AggAccumulator::AnyValueI64(AnyValueAccumI64::new(
-                            arr.clone(),
-                            ignore_nulls,
-                        )),
-                        name,
-                    )))
-                }
-                DataType::UInt8 => {
-                    let arr = evaluated.downcast::<UInt8Array>()?;
-                    Ok(Some((
-                        AggAccumulator::AnyValueU8(AnyValueAccumU8::new(arr.clone(), ignore_nulls)),
-                        name,
-                    )))
-                }
-                DataType::UInt16 => {
-                    let arr = evaluated.downcast::<UInt16Array>()?;
-                    Ok(Some((
-                        AggAccumulator::AnyValueU16(AnyValueAccumU16::new(
-                            arr.clone(),
-                            ignore_nulls,
-                        )),
-                        name,
-                    )))
-                }
-                DataType::UInt32 => {
-                    let arr = evaluated.downcast::<UInt32Array>()?;
-                    Ok(Some((
-                        AggAccumulator::AnyValueU32(AnyValueAccumU32::new(
-                            arr.clone(),
-                            ignore_nulls,
-                        )),
-                        name,
-                    )))
-                }
-                DataType::UInt64 => {
-                    let arr = evaluated.downcast::<UInt64Array>()?;
-                    Ok(Some((
-                        AggAccumulator::AnyValueU64(AnyValueAccumU64::new(
-                            arr.clone(),
-                            ignore_nulls,
-                        )),
-                        name,
-                    )))
-                }
-                DataType::Float32 => {
-                    let arr = evaluated.downcast::<Float32Array>()?;
-                    Ok(Some((
-                        AggAccumulator::AnyValueF32(AnyValueAccumF32::new(
-                            arr.clone(),
-                            ignore_nulls,
-                        )),
-                        name,
-                    )))
-                }
-                DataType::Float64 => {
-                    let arr = evaluated.downcast::<Float64Array>()?;
-                    Ok(Some((
-                        AggAccumulator::AnyValueF64(AnyValueAccumF64::new(
-                            arr.clone(),
-                            ignore_nulls,
-                        )),
-                        name,
-                    )))
-                }
-                _ => Ok(None),
-            }
+            Ok(any_value_accumulator(&evaluated, ignore_nulls)?.map(|acc| (acc, name)))
+        }
+        AggExpr::SingleValue(expr) => {
+            let evaluated = source.eval_agg_child(expr)?;
+            let name = evaluated.name().to_string();
+            Ok(any_value_accumulator(&evaluated, false)?.map(|first_row| {
+                (
+                    AggAccumulator::SingleValue(SingleValueAccum::new(first_row)),
+                    name,
+                )
+            }))
         }
         AggExpr::BoolAnd(expr) => {
             let evaluated = source.eval_agg_child(expr)?;
@@ -856,8 +847,10 @@ fn try_create_accumulator(
 /// Returns true if all agg expressions can be handled by the inline path.
 ///
 /// Requirements:
-/// 1. All agg expressions are Count, Sum, Product, Min, Max, AnyValue, BoolAnd, or BoolOr.
-/// 2. For Sum/Product/Min/Max/AnyValue, the value column dtype must be a supported numeric type.
+/// 1. All agg expressions are Count, Sum, Product, Min, Max, AnyValue, SingleValue, BoolAnd,
+///    or BoolOr.
+/// 2. For Sum/Product/Min/Max/AnyValue/SingleValue, the value column dtype must be a supported
+///    numeric type.
 /// 3. For BoolAnd/BoolOr, the value column dtype must be Boolean.
 ///
 /// Uses schema-level type inference (`to_field`) instead of expression evaluation
@@ -873,6 +866,7 @@ pub(super) fn can_inline_agg(to_agg: &[BoundAggExpr], source: &RecordBatch) -> b
                 | AggExpr::Min(..)
                 | AggExpr::Max(..)
                 | AggExpr::AnyValue(..)
+                | AggExpr::SingleValue(..)
                 | AggExpr::BoolAnd(..)
                 | AggExpr::BoolOr(..)
         )
@@ -886,7 +880,8 @@ pub(super) fn can_inline_agg(to_agg: &[BoundAggExpr], source: &RecordBatch) -> b
         | AggExpr::Product(expr)
         | AggExpr::Min(expr)
         | AggExpr::Max(expr)
-        | AggExpr::AnyValue(expr, _) => {
+        | AggExpr::AnyValue(expr, _)
+        | AggExpr::SingleValue(expr) => {
             if let Ok(field) = expr.to_field(&source.schema) {
                 matches!(
                     field.dtype,
@@ -3333,5 +3328,75 @@ mod tests {
         let inline_result = rb.agg_groupby_inline(&bound_agg, &group_by).unwrap();
         let fallback_result = rb.agg_groupby_fallback(&bound_agg, &group_by).unwrap();
         assert_batches_equal_multi_key(&inline_result, &fallback_result, &["key1", "key2"]);
+    }
+
+    // --- SingleValue tests ---
+
+    /// One row per key, so every group holds a single row; the values include a null.
+    fn make_unique_key_test_batch(key_dtype: &DataType) -> (RecordBatch, Vec<BoundExpr>, Schema) {
+        let keys = Int64Array::from_slice("key", &[3, 1, 2])
+            .into_series()
+            .cast(key_dtype)
+            .unwrap();
+        let vals = Int64Array::from_iter(
+            Field::new("val", DataType::Int64),
+            vec![Some(30), None, Some(20)],
+        )
+        .into_series();
+        let schema = Schema::new(vec![
+            Field::new("key", key_dtype.clone()),
+            Field::new("val", DataType::Int64),
+        ]);
+        let rb = RecordBatch::from_nonempty_columns(vec![keys, vals]).unwrap();
+        let group_by = vec![BoundExpr::try_new(resolved_col("key"), &schema).unwrap()];
+        (rb, group_by, schema)
+    }
+
+    fn single_value_with_others(schema: &Schema) -> Vec<BoundAggExpr> {
+        [
+            AggExpr::SingleValue(resolved_col("val")),
+            AggExpr::Count(resolved_col("val"), CountMode::All),
+            AggExpr::Sum(resolved_col("val")),
+        ]
+        .into_iter()
+        .map(|agg| BoundAggExpr::try_new(agg, schema).unwrap())
+        .collect()
+    }
+
+    #[rstest::rstest]
+    #[case::integer_keys(DataType::Int64)]
+    #[case::string_keys(DataType::Utf8)]
+    fn test_inline_single_value_matches_fallback(#[case] key_dtype: DataType) {
+        let (rb, group_by, schema) = make_unique_key_test_batch(&key_dtype);
+        let bound_agg = single_value_with_others(&schema);
+
+        assert!(super::can_inline_agg(&bound_agg, &rb));
+        let inline_result = rb.agg_groupby_inline(&bound_agg, &group_by).unwrap();
+        let fallback_result = rb.agg_groupby_fallback(&bound_agg, &group_by).unwrap();
+
+        assert_batches_equal(&inline_result, &fallback_result);
+    }
+
+    #[rstest::rstest]
+    #[case::integer_keys(make_int_key_test_batch())]
+    #[case::string_keys(make_test_batch())]
+    #[case::null_keys(make_int_key_with_nulls_test_batch())]
+    fn test_inline_single_value_refuses_a_group_of_two_rows(
+        #[case] batch: (RecordBatch, Vec<BoundExpr>, Schema),
+    ) {
+        let (rb, group_by, schema) = batch;
+        let bound_agg = single_value_with_others(&schema);
+
+        let inline_result = rb.agg_groupby_inline(&bound_agg, &group_by);
+        let fallback_result = rb.agg_groupby_fallback(&bound_agg, &group_by);
+
+        assert!(matches!(
+            inline_result,
+            Err(common_error::DaftError::CardinalityViolation(_))
+        ));
+        assert!(matches!(
+            fallback_result,
+            Err(common_error::DaftError::CardinalityViolation(_))
+        ));
     }
 }

@@ -444,6 +444,7 @@ Example:
 
     pub(crate) const PERCENTILE_DOCSTRING: &str =
         "Calculates the exact percentile of non-null elements in the input expression.
+A decimal(p, s) input answers an exact decimal(38, min(38, s + 4)), cut toward zero; other inputs answer Float64.
 
 Example:
 
@@ -482,6 +483,7 @@ Example:
 
     pub(crate) const MEDIAN_DOCSTRING: &str =
         "Calculates the median (50th percentile) of non-null elements in the input expression.
+A decimal(p, s) input answers an exact decimal(38, min(38, s + 4)), cut toward zero; other inputs answer Float64.
 
 Example:
 

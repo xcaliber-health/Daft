@@ -142,7 +142,12 @@ def approx_percentiles(expr: Expression, percentiles: float | list[float]) -> Ex
 
 
 def percentile(expr: Expression, percentage: float) -> Expression:
-    """Calculates the exact percentile for a column of numeric values.
+    """Calculates the exact percentile for a column of numeric or decimal values.
+
+    Values are interpolated linearly between the two nearest ranks. A decimal
+    ``decimal(p, s)`` is interpolated exactly and answers ``decimal(38, min(38, s + 4))``,
+    the type its mean answers, cut toward zero; ``percentage`` is read as the decimal
+    it prints as. Every other input answers ``float64``.
 
     Args:
         percentage: Percentage at which to compute the exact value. Must be between 0 and 1.
@@ -156,7 +161,11 @@ def mean(expr: Expression) -> Expression:
 
 
 def median(expr: Expression) -> Expression:
-    """Calculates the median of the values in the expression."""
+    """Calculates the median of the values in the expression.
+
+    Answers as ``percentile(expr, 0.5)`` does: a decimal stays an exact decimal of its
+    mean's type, and every other input answers ``float64``.
+    """
     return Expression._from_pyexpr(expr._expr.median())
 
 

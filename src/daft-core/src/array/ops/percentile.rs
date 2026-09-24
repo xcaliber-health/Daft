@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
 use arrow::array::Float64Builder;
-use common_error::DaftResult;
+use common_error::{DaftError, DaftResult};
 
 use crate::{
     array::{
         ListArray,
         ops::{DaftPercentileAggable, GroupIndices},
     },
-    datatypes::{DataType, Field, Float64Array},
+    datatypes::{DataType, Decimal128Array, Field, Float64Array},
     utils::stats,
 };
 
@@ -67,6 +67,31 @@ impl DaftPercentileAggable for ListArray {
     }
 }
 
+/// Returns the child positions of the values in `rows` of `list_array`, skipping null rows.
+fn child_positions(
+    list_array: &ListArray,
+    rows: &mut dyn Iterator<Item = u64>,
+) -> DaftResult<Vec<usize>> {
+    let offsets = list_array.offsets();
+    let mut positions = Vec::new();
+    for row_idx in rows {
+        let row_idx = row_idx as usize;
+        if let Some(nulls) = list_array.nulls()
+            && !nulls.is_valid(row_idx)
+        {
+            continue;
+        }
+        let (Some(&start), Some(&end)) = (offsets.get(row_idx), offsets.get(row_idx + 1)) else {
+            return Err(DaftError::InternalError(format!(
+                "list row {row_idx} has no offsets in an array of {} rows",
+                list_array.len()
+            )));
+        };
+        positions.extend(start as usize..end as usize);
+    }
+    Ok(positions)
+}
+
 fn percentile_for_rows(
     list_array: &ListArray,
     rows: &mut dyn Iterator<Item = u64>,
@@ -75,20 +100,8 @@ fn percentile_for_rows(
 ) -> DaftResult<Option<f64>> {
     let child = list_array.flat_child.f64()?;
     let mut values_builder = Float64Builder::with_capacity(capacity);
-
-    for row_idx in rows {
-        let row_idx = row_idx as usize;
-        if let Some(nulls) = list_array.nulls()
-            && !nulls.is_valid(row_idx)
-        {
-            continue;
-        }
-
-        let start = *list_array.offsets().get(row_idx).unwrap() as usize;
-        let end = *list_array.offsets().get(row_idx + 1).unwrap() as usize;
-        for value_idx in start..end {
-            values_builder.append_option(child.get(value_idx));
-        }
+    for position in child_positions(list_array, rows)? {
+        values_builder.append_option(child.get(position));
     }
 
     let values = Float64Array::from_arrow(
@@ -96,4 +109,66 @@ fn percentile_for_rows(
         Arc::new(values_builder.finish()),
     )?;
     stats::exact_percentile(&values, percentage)
+}
+
+fn decimal_percentile_for_rows(
+    list_array: &ListArray,
+    rows: &mut dyn Iterator<Item = u64>,
+    percentage: f64,
+) -> DaftResult<Option<i128>> {
+    let child = list_array.flat_child.decimal128()?;
+    let positions = child_positions(list_array, rows)?;
+    stats::exact_decimal_percentile(positions.into_iter().map(|p| child.get(p)), percentage)
+}
+
+impl DaftPercentileAggable for Decimal128Array {
+    type Output = DaftResult<Self>;
+
+    fn percentile(&self, percentage: f64) -> Self::Output {
+        let answer = stats::exact_decimal_percentile(self, percentage)?;
+        Ok(Self::from_iter(self.field.clone(), std::iter::once(answer)))
+    }
+
+    fn grouped_percentile(&self, groups: &GroupIndices, percentage: f64) -> Self::Output {
+        let answers = groups
+            .iter()
+            .map(|group| {
+                stats::exact_decimal_percentile(
+                    group.iter().map(|&index| self.get(index as usize)),
+                    percentage,
+                )
+            })
+            .collect::<DaftResult<Vec<_>>>()?;
+        Ok(Self::from_iter(self.field.clone(), answers))
+    }
+}
+
+impl ListArray {
+    /// The percentile of all values in the list, whose items are decimals of the answer's type.
+    pub fn decimal_percentile(
+        &self,
+        answer: Field,
+        percentage: f64,
+    ) -> DaftResult<Decimal128Array> {
+        let mut rows = (0..self.len()).map(|i| i as u64);
+        let percentile = decimal_percentile_for_rows(self, &mut rows, percentage)?;
+        Ok(Decimal128Array::from_iter(
+            Arc::new(answer),
+            std::iter::once(percentile),
+        ))
+    }
+
+    /// The percentile of the values in each group's lists, whose items are decimals of the answer's type.
+    pub fn grouped_decimal_percentile(
+        &self,
+        answer: Field,
+        groups: &GroupIndices,
+        percentage: f64,
+    ) -> DaftResult<Decimal128Array> {
+        let answers = groups
+            .iter()
+            .map(|group| decimal_percentile_for_rows(self, &mut group.iter().copied(), percentage))
+            .collect::<DaftResult<Vec<_>>>()?;
+        Ok(Decimal128Array::from_iter(Arc::new(answer), answers))
+    }
 }

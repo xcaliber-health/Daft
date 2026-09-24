@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from decimal import Decimal
+
 import pytest
 
 import daft
-from daft import DataType, col
+from daft import DataType, Expression, col
 
 
 @pytest.mark.parametrize(
@@ -123,23 +126,87 @@ _DECIMALS = daft.from_pydict({"g": [1, 1, 2, 2], "v": ["1.25", "2.50", "3.00", "
 )
 
 
+def _decimals(values: list[str], precision: int = 18, scale: int = 2) -> daft.DataFrame:
+    return daft.from_pydict({"v": values}).with_column("v", col("v").cast(DataType.decimal128(precision, scale)))
+
+
 @pytest.mark.parametrize("partitions", [1, 3])
-def test_percentile_of_a_decimal_is_a_float(partitions: int) -> None:
-    df = _DECIMALS.where(col("g") == 1).repartition(partitions)
+@pytest.mark.parametrize(
+    "aggregate",
+    [pytest.param(lambda v: v.percentile(0.5), id="percentile"), pytest.param(lambda v: v.median(), id="median")],
+)
+def test_a_percentile_of_a_decimal_is_an_exact_decimal(
+    partitions: int, aggregate: Callable[[Expression], Expression]
+) -> None:
+    df = _DECIMALS.where(col("g") == 1).into_partitions(partitions)
 
-    actual = df.agg(col("v").percentile(0.5).alias("p50")).to_pydict()
+    answered = df.agg(aggregate(col("v")).alias("p50"))
 
-    assert actual == {"p50": [1.875]}
-    assert df.agg(col("v").percentile(0.5)).schema()["v"].dtype == DataType.float64()
+    # Typed as the decimal's mean is: decimal(38, s + 4).
+    assert answered.schema()["p50"].dtype == DataType.decimal128(38, 6)
+    assert answered.to_pydict() == {"p50": [Decimal("1.875000")]}
+
+
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    [
+        # As floats these interpolate to 6.404999999999999 and 6.279999999999999.
+        pytest.param(["6.14", "6.67"], Decimal("6.405000"), id="no float drift below"),
+        pytest.param(["6.21", "6.35"], Decimal("6.280000"), id="a threshold is met exactly"),
+        # -1.00 + 0.5 x (0.01 - -1.00) = -0.495 exactly, well within scale 6.
+        pytest.param(["-1.00", "0.01"], Decimal("-0.495000"), id="negative values"),
+    ],
+)
+def test_a_decimal_median_is_exact(values: list[str], expected: Decimal) -> None:
+    answered = _decimals(values).agg(col("v").median().alias("m")).to_pydict()["m"]
+
+    assert answered == [expected]
+
+
+def test_a_decimal_percentile_reads_the_percentage_as_written() -> None:
+    # 0.9 x 10 is exactly rank 9; 0.9 taken at its exact binary value would land just past it.
+    df = _decimals([f"{i}.00" for i in range(11)])
+
+    answered = df.agg(col("v").percentile(0.9).alias("p90")).to_pydict()["p90"]
+
+    assert answered == [Decimal("9.000000")]
+
+
+def test_a_decimal_percentile_cuts_toward_zero_at_the_widened_scale() -> None:
+    # 1/3 of the way from 0.0000 to 0.0001 is 0.0000333..., cut to 0.00003333 at scale 4 + 4.
+    df = _decimals(["0.0000", "0.0001", "0.0001", "0.0001"], precision=10, scale=4)
+
+    answered = df.agg(col("v").percentile(1 / 9).alias("p")).to_pydict()["p"]
+
+    assert answered == [Decimal("0.00003333")]
 
 
 @pytest.mark.parametrize("partitions", [1, 3])
 def test_percentile_of_a_decimal_by_group(partitions: int) -> None:
-    df = _DECIMALS.repartition(partitions)
+    df = _DECIMALS.into_partitions(partitions)
 
     actual = df.groupby("g").agg(col("v").percentile(0.5).alias("p50")).sort("g").to_pydict()
 
-    assert actual == {"g": [1, 2], "p50": [1.875, 4.0]}
+    assert actual == {"g": [1, 2], "p50": [Decimal("1.875000"), Decimal("4.000000")]}
+
+
+def test_percentile_of_decimal_lists_is_an_exact_decimal() -> None:
+    df = daft.from_pydict({"v": [["1.25", "2.50"], ["3.00"]]}).with_column(
+        "v", col("v").cast(DataType.list(DataType.decimal128(18, 2)))
+    )
+
+    answered = df.agg(col("v").percentile(0.5).alias("p50")).to_pydict()["p50"]
+
+    assert answered == [Decimal("2.500000")]
+
+
+def test_percentile_of_a_float_is_still_a_float() -> None:
+    df = daft.from_pydict({"v": [1.25, 2.5]})
+
+    answered = df.agg(col("v").percentile(0.5).alias("p50"))
+
+    assert answered.schema()["p50"].dtype == DataType.float64()
+    assert answered.to_pydict() == {"p50": [1.875]}
 
 
 @pytest.mark.parametrize("partitions", [1, 3])

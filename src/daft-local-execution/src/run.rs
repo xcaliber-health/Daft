@@ -45,7 +45,7 @@ use {
 
 use crate::{
     ExecutionRuntimeContext,
-    channel::{Sender, create_channel},
+    channel::{Sender, UnboundedSender, create_channel, create_unbounded_channel},
     pipeline::{
         BuilderContext, PipelineMessage, translate_physical_plan_to_pipeline, viz_pipeline_ascii,
         viz_pipeline_mermaid,
@@ -99,7 +99,53 @@ pub(crate) struct EnqueueInputMessage {
     /// Plan inputs grouped by source_id
     inputs: HashMap<SourceId, Input>,
     /// Sender for results of this input_id
-    result_sender: Sender<ExecutionEngineResultItem>,
+    result_sender: ResultSender,
+}
+
+/// Where one input's results go.
+///
+/// A bounded channel holds the pipeline back while its reader falls behind; an
+/// unbounded one, for a caller that takes everything, never waits and costs no
+/// more than a plain send.
+#[derive(Clone)]
+enum ResultSender {
+    Bounded(Sender<ExecutionEngineResultItem>),
+    Unbounded(UnboundedSender<ExecutionEngineResultItem>),
+}
+
+/// The reading end of a [`ResultSender`].
+enum ResultReceiver {
+    Bounded(crate::channel::Receiver<ExecutionEngineResultItem>),
+    Unbounded(crate::channel::UnboundedReceiver<ExecutionEngineResultItem>),
+}
+
+impl ResultReceiver {
+    async fn recv(&mut self) -> Option<ExecutionEngineResultItem> {
+        match self {
+            Self::Bounded(receiver) => receiver.recv().await,
+            Self::Unbounded(receiver) => receiver.recv().await,
+        }
+    }
+}
+
+/// A channel for one input's results, bounded to `buffer_size` results when one is given.
+fn result_channel(buffer_size: Option<usize>) -> (ResultSender, ResultReceiver) {
+    match buffer_size {
+        Some(size) => {
+            let (sender, receiver) = create_channel(size);
+            (
+                ResultSender::Bounded(sender),
+                ResultReceiver::Bounded(receiver),
+            )
+        }
+        None => {
+            let (sender, receiver) = create_unbounded_channel();
+            (
+                ResultSender::Unbounded(sender),
+                ResultReceiver::Unbounded(receiver),
+            )
+        }
+    }
 }
 
 /// A result the loop is waiting to hand to its consumer.
@@ -107,7 +153,7 @@ type PendingDelivery = BoxFuture<'static, ()>;
 
 /// Routes pipeline messages to per-input_id channels.
 struct MessageRouter {
-    output_senders: HashMap<InputId, Sender<ExecutionEngineResultItem>>,
+    output_senders: HashMap<InputId, ResultSender>,
     /// Wall-clock start instant when each `input_id` was enqueued to the pipeline.
     input_start_times: HashMap<InputId, Instant>,
 }
@@ -145,20 +191,24 @@ impl MessageRouter {
                 ExecutionEngineResultItem::FlightPartitionRef(partition_ref),
             ),
         };
-        let sender = self.output_senders.get(&input_id)?.clone();
-        Some(
-            async move {
-                let _ = sender.send(item).await;
+        match self.output_senders.get(&input_id)? {
+            ResultSender::Unbounded(sender) => {
+                let _ = sender.send(item);
+                None
             }
-            .boxed(),
-        )
+            ResultSender::Bounded(sender) => {
+                let sender = sender.clone();
+                Some(
+                    async move {
+                        let _ = sender.send(item).await;
+                    }
+                    .boxed(),
+                )
+            }
+        }
     }
 
-    fn insert_output_sender(
-        &mut self,
-        input_id: InputId,
-        sender: Sender<ExecutionEngineResultItem>,
-    ) {
+    fn insert_output_sender(&mut self, input_id: InputId, sender: ResultSender) {
         self.input_start_times.insert(input_id, Instant::now());
         self.output_senders.insert(input_id, sender);
     }
@@ -357,6 +407,10 @@ pub fn task_events_enabled() -> bool {
     }
 }
 
+/// How long the remaining tasks of a failed pipeline may take to end on their own
+/// before they are aborted.
+const FAILURE_WIND_DOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The core execution loop that drives a pipeline to completion.
 /// Receives inputs via `enqueue_input_rx`, routes pipeline outputs to
 /// per-input_id channels, and runs until the pipeline finishes, errors,
@@ -398,6 +452,13 @@ async fn run_execution_loop(
                     if matches!(&e, common_error::DaftError::JoinError(source) if source.is_cancelled()) {
                         break (Ok(()), QueryEndState::Canceled);
                     }
+                    // Close the pipeline's inputs and stop taking its output, so the remaining
+                    // tasks end on their own and release what they hold (an unfinished output
+                    // file among it) before the failure is reported.
+                    input_senders.take();
+                    pending_delivery.take();
+                    output_receiver.close();
+                    runtime_handle.wind_down(FAILURE_WIND_DOWN_GRACE).await;
                     break (Err(e), QueryEndState::Failed);
                 }
             }
@@ -584,9 +645,7 @@ impl NativeExecutor {
         Ok((
             fingerprint,
             async move {
-                let (result_tx, result_rx) = create_channel(
-                    result_buffer_size.unwrap_or(tokio::sync::Semaphore::MAX_PERMITS),
-                );
+                let (result_tx, result_rx) = result_channel(result_buffer_size);
                 let enqueue_msg = EnqueueInputMessage {
                     input_id,
                     inputs,
@@ -720,7 +779,7 @@ impl Drop for NativeExecutor {
 }
 
 pub struct ExecutionEngineResult {
-    receiver: crate::channel::Receiver<ExecutionEngineResultItem>,
+    receiver: ResultReceiver,
 }
 
 impl ExecutionEngineResult {
@@ -839,8 +898,11 @@ mod tests {
     use daft_micropartition::MicroPartition;
     use futures::poll;
 
-    use super::{ExecutionEngineResultItem, MessageRouter};
-    use crate::{channel::create_channel, pipeline::PipelineMessage};
+    use super::{ExecutionEngineResultItem, MessageRouter, ResultSender};
+    use crate::{
+        channel::{create_channel, create_unbounded_channel},
+        pipeline::PipelineMessage,
+    };
 
     fn morsel() -> PipelineMessage {
         PipelineMessage::Morsel {
@@ -853,7 +915,7 @@ mod tests {
     async fn a_result_waits_for_room_in_its_consumers_buffer() {
         let (tx, mut rx) = create_channel::<ExecutionEngineResultItem>(1);
         let mut router = MessageRouter::new();
-        router.insert_output_sender(0, tx);
+        router.insert_output_sender(0, ResultSender::Bounded(tx));
 
         router.route_message(morsel()).expect("a delivery").await;
         let mut second = router.route_message(morsel()).expect("a delivery");
@@ -868,7 +930,7 @@ mod tests {
     async fn a_result_for_a_departed_consumer_is_dropped() {
         let (tx, rx) = create_channel::<ExecutionEngineResultItem>(1);
         let mut router = MessageRouter::new();
-        router.insert_output_sender(0, tx);
+        router.insert_output_sender(0, ResultSender::Bounded(tx));
         drop(rx);
 
         router.route_message(morsel()).expect("a delivery").await;
@@ -879,9 +941,21 @@ mod tests {
     async fn nothing_is_delivered_for_an_input_after_its_flush() {
         let (tx, _rx) = create_channel::<ExecutionEngineResultItem>(1);
         let mut router = MessageRouter::new();
-        router.insert_output_sender(0, tx);
+        router.insert_output_sender(0, ResultSender::Bounded(tx));
 
         assert!(router.route_message(PipelineMessage::Flush(0)).is_none());
         assert!(router.route_message(morsel()).is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unbounded_result_is_delivered_at_once() {
+        let (tx, mut rx) = create_unbounded_channel::<ExecutionEngineResultItem>();
+        let mut router = MessageRouter::new();
+        router.insert_output_sender(0, ResultSender::Unbounded(tx));
+
+        assert!(router.route_message(morsel()).is_none());
+        assert!(router.route_message(morsel()).is_none());
+        assert!(rx.recv().await.is_some());
+        assert!(rx.recv().await.is_some());
     }
 }

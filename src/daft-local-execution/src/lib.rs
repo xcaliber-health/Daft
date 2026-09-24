@@ -89,6 +89,21 @@ impl<T> Future for SpawnedTask<T> {
     }
 }
 
+/// Waits up to `grace` for every task in `set` to finish, then aborts the rest.
+///
+/// Answers whether every task finished on its own. The tasks' own results are
+/// discarded: the caller already holds the failure it will report.
+async fn drain_within<T: Send + 'static>(set: &mut JoinSet<T>, grace: std::time::Duration) -> bool {
+    let drained = tokio::time::timeout(grace, async { while set.join_next().await.is_some() {} })
+        .await
+        .is_ok();
+    if !drained {
+        set.abort_all();
+        while set.join_next().await.is_some() {}
+    }
+    drained
+}
+
 pub(crate) struct ExecutionRuntimeContext {
     worker_set: JoinSet<Result<()>>,
     memory_scope: QueryMemoryScope,
@@ -122,6 +137,16 @@ impl ExecutionRuntimeContext {
             Some(Err(e)) => Some(Err(e)),
             None => None,
         }
+    }
+
+    /// Waits up to `grace` for every task to finish on its own, then aborts what remains.
+    ///
+    /// Once a task has failed and the pipeline's channels are closed, the others end
+    /// on their own: a node below the failure drains the work it began and releases
+    /// what it holds, an unfinished output file among it. Waiting for that, rather than
+    /// aborting, lets it happen before the failure is reported.
+    pub async fn wind_down(&mut self, grace: std::time::Duration) {
+        drain_within(&mut self.worker_set, grace).await;
     }
 
     pub async fn shutdown(&mut self) -> DaftResult<()> {
@@ -313,4 +338,43 @@ pub fn register_modules(parent: &Bound<PyModule>) -> PyResult<()> {
 
     parent.add_class::<PyNativeExecutor>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
+
+    use common_runtime::JoinSet;
+
+    use super::drain_within;
+
+    #[tokio::test]
+    async fn tasks_that_end_within_the_grace_are_left_to_finish() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let mut set = JoinSet::new();
+        let flag = finished.clone();
+        set.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        assert!(drain_within(&mut set, Duration::from_secs(5)).await);
+        assert!(finished.load(Ordering::SeqCst));
+        assert!(set.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_task_that_never_ends_is_aborted_after_the_grace() {
+        let mut set = JoinSet::new();
+        set.spawn(std::future::pending::<()>());
+
+        assert!(!drain_within(&mut set, Duration::from_millis(20)).await);
+        assert!(set.is_empty());
+    }
 }

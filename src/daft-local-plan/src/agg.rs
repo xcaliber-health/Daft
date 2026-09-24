@@ -281,9 +281,12 @@ pub fn populate_aggregation_stages_bound_with_schema(
                 let global_bool_or_col = second_stage!(AggExpr::BoolOr(bool_or_col.clone()));
                 final_stage(global_bool_or_col);
             }
+            // The partials are combined ignoring nulls: a global partial over no rows still
+            // answers one null row, which must not stand for the input's value. A null that a
+            // row held is still found when every partial answers null.
             AggExpr::AnyValue(expr, ignore_nulls) => {
                 let any_col = first_stage!(AggExpr::AnyValue(expr.clone(), *ignore_nulls));
-                let global_any_col = second_stage!(AggExpr::AnyValue(any_col, *ignore_nulls));
+                let global_any_col = second_stage!(AggExpr::AnyValue(any_col, true));
                 final_stage(global_any_col);
             }
             AggExpr::List(expr) => {

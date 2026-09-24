@@ -39,12 +39,17 @@ impl ScalarUDF for MergeMeanFunction {
             )));
         }
         match sum.data_type() {
+            // The sum is divided at its own scale into the wider answer, so it is never
+            // widened out of range before the division.
             DataType::Decimal128(p, s) => {
-                let new_type = DataType::Decimal128(*p, std::cmp::min(*p, s + Self::EXTRA_SCALE));
-                let sum_array = sum.cast(&new_type)?;
-                let sum_array = sum_array.decimal128()?;
-                let count_array = counts.u64()?;
-                Ok(sum_array.merge_mean(count_array)?.into_series())
+                let answer = Field::new(
+                    sum.name(),
+                    DataType::Decimal128(*p, std::cmp::min(*p, s + Self::EXTRA_SCALE)),
+                );
+                Ok(sum
+                    .decimal128()?
+                    .merge_mean(counts.u64()?, answer)?
+                    .into_series())
             }
             _ => sum / counts,
         }

@@ -33,12 +33,20 @@ def count_distinct(expr: Expression) -> Expression:
 
 
 def sum(expr: Expression) -> Expression:
-    """Calculates the sum of the values in the expression."""
+    """Calculates the sum of the values in the expression.
+
+    A decimal ``decimal(p, s)`` sums exactly to ``decimal(38, s)``; a sum that does
+    not fit raises an error rather than wrapping.
+    """
     return Expression._from_pyexpr(expr._expr.sum())
 
 
 def product(expr: Expression) -> Expression:
-    """Calculates the product of the values in the expression."""
+    """Calculates the product of the values in the expression.
+
+    A decimal answers ``float64``: each factor adds its scale to the product, so no
+    decimal type of fixed scale holds it exactly.
+    """
     return Expression._from_pyexpr(expr._expr.product())
 
 
@@ -145,9 +153,10 @@ def percentile(expr: Expression, percentage: float) -> Expression:
     """Calculates the exact percentile for a column of numeric or decimal values.
 
     Values are interpolated linearly between the two nearest ranks. A decimal
-    ``decimal(p, s)`` is interpolated exactly and answers ``decimal(38, min(38, s + 4))``,
-    the type its mean answers, cut toward zero; ``percentage`` is read as the decimal
-    it prints as. Every other input answers ``float64``.
+    ``decimal(p, s)`` is interpolated exactly at its own scale and answers
+    ``decimal(38, min(38, s + 4))``, the type its mean answers, rounded half away
+    from zero; ``percentage`` is read as the decimal it prints as. A decimal answer
+    that does not fit its type raises an error. Every other input answers ``float64``.
 
     Args:
         percentage: Percentage at which to compute the exact value. Must be between 0 and 1.
@@ -156,7 +165,12 @@ def percentile(expr: Expression, percentage: float) -> Expression:
 
 
 def mean(expr: Expression) -> Expression:
-    """Calculates the mean of the values in the expression."""
+    """Calculates the mean of the values in the expression.
+
+    A decimal ``decimal(p, s)`` answers ``decimal(38, min(38, s + 4))``: its exact sum,
+    divided by its count and rounded half away from zero. A mean, or a sum, that does
+    not fit its decimal type raises an error.
+    """
     return Expression._from_pyexpr(expr._expr.mean())
 
 

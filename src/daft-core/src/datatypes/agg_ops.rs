@@ -30,7 +30,8 @@ pub fn try_product_supertype(dtype: &DataType) -> DaftResult<DataType> {
         DataType::Float32 => Ok(DataType::Float32),
         DataType::Float16 => Ok(DataType::Float16),
         DataType::Float64 => Ok(DataType::Float64),
-        DataType::Decimal128(_, s) => Ok(DataType::Decimal128(38, *s)),
+        // A product of decimals has no fixed scale, so it answers a float.
+        DataType::Decimal128(..) => Ok(DataType::Float64),
         other => Err(DaftError::TypeError(format!(
             "Invalid argument to product supertype: {}",
             other

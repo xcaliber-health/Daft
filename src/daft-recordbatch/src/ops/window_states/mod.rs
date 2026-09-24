@@ -1,5 +1,6 @@
 mod count;
 mod count_distinct;
+mod decimal;
 mod first_last_value;
 mod mean;
 mod minmax;

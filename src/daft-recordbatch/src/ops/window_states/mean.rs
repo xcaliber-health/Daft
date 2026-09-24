@@ -3,7 +3,9 @@ use std::ops::{AddAssign, SubAssign};
 use arrow::array::ArrowPrimitiveType;
 use common_error::{DaftError, DaftResult};
 use daft_core::{
-    datatypes::{DaftPrimitiveType, NumericNative, try_mean_aggregation_supertype},
+    datatypes::{
+        DaftPrimitiveType, NumericNative, try_mean_aggregation_supertype, try_sum_supertype,
+    },
     prelude::*,
 };
 use num_traits::Zero;
@@ -11,7 +13,7 @@ use num_traits::Zero;
 use super::WindowAggStateOps;
 use crate::{
     RecordBatch,
-    ops::window_states::{CountWindowState, SumWindowState},
+    ops::window_states::{CountWindowState, SumWindowState, decimal::DecimalMeanWindowState},
 };
 
 pub struct MeanWindowState<T>
@@ -75,15 +77,7 @@ where
         let sum_series = self.sum.build()?;
         let count_series = self.count.build()?;
 
-        match sum_series.data_type() {
-            // A decimal mean keeps its sum's type, as the grouped mean does; dividing by
-            // the count as a decimal would widen past what a decimal can hold.
-            DataType::Decimal128(..) => Ok(sum_series
-                .decimal128()?
-                .merge_mean(count_series.u64()?)?
-                .into_series()),
-            _ => sum_series / count_series,
-        }
+        sum_series / count_series
     }
 }
 
@@ -105,12 +99,14 @@ pub fn create_for_type(
                 total_length,
             ))))
         }
+        // A decimal's frame is summed exactly at its own scale, then divided into the wider answer.
         DataType::Decimal128(_, _) => {
-            let casted = source.cast(&target_type)?;
-            Ok(Some(Box::new(MeanWindowState::<Decimal128Type>::new(
+            let casted = source.cast(&try_sum_supertype(source.data_type())?)?;
+            Ok(Some(Box::new(DecimalMeanWindowState::new(
                 &casted,
+                target_type,
                 total_length,
-            ))))
+            )?)))
         }
         dt => Err(DaftError::TypeError(format!(
             "Cannot run Mean over type {}",

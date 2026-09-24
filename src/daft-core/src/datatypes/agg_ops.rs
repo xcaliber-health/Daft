@@ -107,21 +107,22 @@ pub fn try_skew_aggregation_supertype(dtype: &DataType) -> DaftResult<DataType> 
 }
 
 /// Whether percentile-like aggregations accept values of `dtype`.
-///
-/// Decimals are accepted and answered as `Float64`, like every other input:
-/// an interpolated percentile generally has more fractional digits than its
-/// inputs, so it is not a value of the input's decimal type.
 #[must_use]
 pub fn is_percentile_input(dtype: &DataType) -> bool {
     dtype.is_numeric() || matches!(dtype, DataType::Decimal128(..))
 }
 
 /// Get the data type that percentile-like aggregations should be casted to.
+///
+/// A decimal stays a decimal, settled as its mean is: an interpolated value needs
+/// more places than the input keeps, so the scale widens as the mean's does. Every
+/// other accepted input answers `Float64`.
 pub fn try_percentile_aggregation_supertype(dtype: &DataType) -> DaftResult<DataType> {
     match dtype {
+        DataType::Decimal128(..) => try_mean_aggregation_supertype(dtype),
         d if is_percentile_input(d) => Ok(DataType::Float64),
         DataType::List(inner) | DataType::FixedSizeList(inner, _) if is_percentile_input(inner) => {
-            Ok(DataType::Float64)
+            try_percentile_aggregation_supertype(inner)
         }
         other => Err(DaftError::TypeError(format!(
             "Invalid argument to percentile supertype: {other}"

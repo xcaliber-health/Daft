@@ -273,7 +273,32 @@ impl Series {
             )));
         }
 
+        let answer_type = try_percentile_aggregation_supertype(self.data_type())?;
         match self.data_type() {
+            // A decimal is interpolated exactly, in the type its mean would answer.
+            DataType::Decimal128(..) => {
+                let casted = self.cast(&answer_type)?;
+                let casted = casted.decimal128()?;
+                let result = match groups {
+                    Some(groups) => casted.grouped_percentile(groups, percentage),
+                    None => casted.percentile(percentage),
+                }?;
+                Ok(result.into_series())
+            }
+            DataType::List(inner_dtype) | DataType::FixedSizeList(inner_dtype, _)
+                if matches!(inner_dtype.as_ref(), DataType::Decimal128(..)) =>
+            {
+                let casted = self.cast(&DataType::List(Box::new(answer_type.clone())))?;
+                let downcasted = casted.downcast::<ListArray>()?;
+                let answer = Field::new(self.name(), answer_type);
+                let result = match groups {
+                    Some(groups) => {
+                        downcasted.grouped_decimal_percentile(answer, groups, percentage)
+                    }
+                    None => downcasted.decimal_percentile(answer, percentage),
+                }?;
+                Ok(result.into_series())
+            }
             dt if is_percentile_input(dt) => {
                 let casted = self.cast(&DataType::Float64)?;
                 let casted = casted.f64()?;

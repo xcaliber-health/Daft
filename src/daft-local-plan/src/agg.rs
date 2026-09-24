@@ -1,5 +1,8 @@
 use common_error::DaftResult;
-use daft_core::prelude::{CountMode, DataType, Field, Schema};
+use daft_core::{
+    datatypes::is_percentile_input,
+    prelude::{CountMode, DataType, Field, Schema},
+};
 use daft_dsl::{
     AggExpr, ApproxPercentileParams, ExprRef, SketchType, bound_col,
     expr::bound_expr::{BoundAggExpr, BoundExpr},
@@ -165,7 +168,7 @@ pub fn populate_aggregation_stages_bound_with_schema(
             AggExpr::Median(expr) => {
                 let median_input = match expr.to_field(schema)?.dtype {
                     DataType::List(inner_dtype) | DataType::FixedSizeList(inner_dtype, _)
-                        if inner_dtype.is_numeric() =>
+                        if is_percentile_input(&inner_dtype) =>
                     {
                         first_stage!(AggExpr::Concat(expr.clone(), None))
                     }
@@ -177,7 +180,7 @@ pub fn populate_aggregation_stages_bound_with_schema(
             AggExpr::Percentile(expr, percentage) => {
                 let percentile_input = match expr.to_field(schema)?.dtype {
                     DataType::List(inner_dtype) | DataType::FixedSizeList(inner_dtype, _)
-                        if inner_dtype.is_numeric() =>
+                        if is_percentile_input(&inner_dtype) =>
                     {
                         first_stage!(AggExpr::Concat(expr.clone(), None))
                     }

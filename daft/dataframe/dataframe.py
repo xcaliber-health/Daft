@@ -1501,6 +1501,8 @@ class DataFrame:
         if parse(pyiceberg.__version__) >= parse("0.7.0"):
             from pyiceberg.table import ALWAYS_TRUE, TableProperties
 
+            from daft.io.iceberg._common import begin_transaction
+
             if parse(pyiceberg.__version__) >= parse("0.8.0"):
                 from pyiceberg.utils.properties import property_as_bool
 
@@ -1510,7 +1512,7 @@ class DataFrame:
 
                 property_as_bool = PropertyUtil.property_as_bool
 
-            tx = table.transaction()
+            tx = begin_transaction(table)
             snapshot_properties = snapshot_properties or {}
 
             if mode == "overwrite":
@@ -1606,6 +1608,7 @@ class DataFrame:
 
         from daft import from_pydict
         from daft.dataframe._checkpoint_commit import decode_file_metadata
+        from daft.io.iceberg._common import begin_transaction
 
         store = checkpoint.store
         idempotence_key = checkpoint.idempotence_key
@@ -1707,7 +1710,7 @@ class DataFrame:
                 return _build_result(data_files)
 
             try:
-                tx = table.transaction()
+                tx = begin_transaction(table)
                 update_snapshot = tx.update_snapshot(snapshot_properties=full_props)
                 manifest_merge_enabled = property_as_bool(
                     tx.table_metadata.properties,

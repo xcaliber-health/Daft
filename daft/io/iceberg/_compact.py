@@ -14,6 +14,7 @@ from daft.daft import _iceberg as _rust_iceberg
 from daft.io.iceberg._common import (
     CommitRetryExhausted,
     MaintenanceOptions,
+    begin_transaction,
     branch_ancestry,
     commit_with_retry,
     manifest_writer_for,
@@ -1250,7 +1251,7 @@ def _commit_batch(
             removed_paths=set(input_paths),
             added_sequence_number=starting_sequence_number,
         )
-        tx = table.transaction()
+        tx = begin_transaction(table)
         producer = _compaction_producer_class()(
             operation=Operation.REPLACE,
             transaction=tx,
@@ -1567,7 +1568,7 @@ def _remove_dangling_deletes(
         to_remove = _dangling_delete_files(table, branch)
         if not to_remove:
             return 0, None
-        tx = table.transaction()
+        tx = begin_transaction(table)
         producer = _compaction_producer_class()(
             operation=Operation.REPLACE,
             transaction=tx,

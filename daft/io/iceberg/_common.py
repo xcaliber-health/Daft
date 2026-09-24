@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from pyiceberg.manifest import ManifestContent, ManifestWriter
     from pyiceberg.partitioning import PartitionSpec
     from pyiceberg.table import Table as PyIcebergTable
+    from pyiceberg.table import Transaction
     from pyiceberg.table.snapshots import Snapshot
     from pyiceberg.table.update.snapshot import _SnapshotProducer
 
@@ -243,7 +244,15 @@ def declare_equality_ids_as_ints() -> None:
     manifest.data_file_with_partition = _data_file_with_int_equality_ids
 
 
-declare_equality_ids_as_ints()
+def begin_transaction(table: PyIcebergTable) -> Transaction:
+    """Open a transaction on ``table`` whose manifests are written as the specification requires.
+
+    Every commit Daft makes to a table begins here. The manifest correction is
+    applied at this point, not when Daft is imported, so that importing Daft
+    neither requires the catalog library nor pays for loading it.
+    """
+    declare_equality_ids_as_ints()
+    return table.transaction()
 
 
 def manifest_writer_for(producer: _SnapshotProducer, content: ManifestContent, spec: PartitionSpec) -> ManifestWriter:
@@ -254,6 +263,8 @@ def manifest_writer_for(producer: _SnapshotProducer, content: ManifestContent, s
     written by a writer that declares delete content.
     """
     from pyiceberg.manifest import ManifestContent, ManifestWriterV2, write_manifest
+
+    declare_equality_ids_as_ints()
 
     metadata = producer._transaction.table_metadata
     if content != ManifestContent.DELETES:

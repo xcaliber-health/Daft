@@ -776,6 +776,7 @@ impl RecordBatch {
             &AggExpr::AnyValue(ref expr, ignore_nulls) => {
                 self.eval_agg_child(expr)?.any_value(groups, ignore_nulls)
             }
+            AggExpr::SingleValue(expr) => self.eval_agg_child(expr)?.single_value(groups),
             AggExpr::List(expr) => self.eval_agg_child(expr)?.agg_list(groups),
             AggExpr::Set(expr) => self.eval_agg_child(expr)?.agg_set(groups),
             AggExpr::Concat(expr, delimiter) => self

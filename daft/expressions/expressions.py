@@ -1163,6 +1163,16 @@ class Expression:
 
         return any_value(self, ignore_nulls=ignore_nulls)
 
+    def single_value(self) -> Expression:
+        """Returns the value of each group's only row; two or more rows fail the query.
+
+        Tip: See Also
+            [`daft.functions.single_value`](https://docs.daft.ai/en/stable/api/functions/single_value/)
+        """
+        from daft.functions import single_value
+
+        return single_value(self)
+
     def skew(self) -> Expression:
         """Calculates the skewness of the values from the expression.
 

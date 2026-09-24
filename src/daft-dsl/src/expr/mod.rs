@@ -445,6 +445,11 @@ pub enum AggExpr {
     #[display("any_value({_0}, ignore_nulls={_1})")]
     AnyValue(ExprRef, bool),
 
+    /// The value of a group's only row. A group of two or more rows is a
+    /// cardinality violation; a group of none answers null.
+    #[display("single_value({_0})")]
+    SingleValue(ExprRef),
+
     #[display("list({_0})")]
     List(ExprRef),
 
@@ -599,6 +604,7 @@ impl AggExpr {
             Self::BoolAnd(_) => "Bool And",
             Self::BoolOr(_) => "Bool Or",
             Self::AnyValue(_, _) => "Any Value",
+            Self::SingleValue(_) => "Single Value",
             Self::List(_) => "List",
             Self::Set(_) => "Set",
             Self::Concat(_, _) => "Concat",
@@ -631,6 +637,7 @@ impl AggExpr {
             | Self::BoolAnd(expr)
             | Self::BoolOr(expr)
             | Self::AnyValue(expr, _)
+            | Self::SingleValue(expr)
             | Self::List(expr)
             | Self::Set(expr)
             | Self::Concat(expr, _)
@@ -730,6 +737,10 @@ impl AggExpr {
                     "{child_id}.local_any_value(ignore_nulls={ignore_nulls})"
                 ))
             }
+            Self::SingleValue(expr) => {
+                let child_id = expr.semantic_id(schema);
+                FieldID::new(format!("{child_id}.local_single_value()"))
+            }
             Self::List(expr) => {
                 let child_id = expr.semantic_id(schema);
                 FieldID::new(format!("{child_id}.local_list()"))
@@ -801,6 +812,7 @@ impl AggExpr {
             | Self::BoolAnd(expr)
             | Self::BoolOr(expr)
             | Self::AnyValue(expr, _)
+            | Self::SingleValue(expr)
             | Self::List(expr)
             | Self::Set(expr)
             | Self::Concat(expr, _)
@@ -838,6 +850,7 @@ impl AggExpr {
             Self::BoolAnd(_) => Self::BoolAnd(first_child()),
             Self::BoolOr(_) => Self::BoolOr(first_child()),
             Self::AnyValue(_, ignore_nulls) => Self::AnyValue(first_child(), *ignore_nulls),
+            Self::SingleValue(_) => Self::SingleValue(first_child()),
             Self::List(_) => Self::List(first_child()),
             Self::Set(_expr) => Self::Set(first_child()),
             Self::Concat(_, delimiter) => Self::Concat(first_child(), delimiter.clone()),
@@ -1009,7 +1022,10 @@ impl AggExpr {
                 ))
             }
 
-            Self::Min(expr) | Self::Max(expr) | Self::AnyValue(expr, _) => {
+            Self::Min(expr)
+            | Self::Max(expr)
+            | Self::AnyValue(expr, _)
+            | Self::SingleValue(expr) => {
                 let field = expr.to_field(schema)?;
                 Ok(Field::new(field.name.as_ref(), field.dtype))
             }
@@ -1417,6 +1433,11 @@ impl Expr {
 
     pub fn any_value(self: ExprRef, ignore_nulls: bool) -> ExprRef {
         Self::Agg(AggExpr::AnyValue(self, ignore_nulls)).into()
+    }
+
+    /// The value of each group's only row; two or more rows fail the query.
+    pub fn single_value(self: ExprRef) -> ExprRef {
+        Self::Agg(AggExpr::SingleValue(self)).into()
     }
 
     pub fn first_value(self: ExprRef, ignore_nulls: bool) -> ExprRef {

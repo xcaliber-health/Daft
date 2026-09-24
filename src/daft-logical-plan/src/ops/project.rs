@@ -654,6 +654,10 @@ fn replace_column_with_semantic_id_aggexpr(
                 |_| e,
             )
         }
+        AggExpr::SingleValue(ref child) => {
+            replace_column_with_semantic_id(child.clone(), subexprs_to_replace, schema)
+                .map_yes_no(AggExpr::SingleValue, |_| e)
+        }
         AggExpr::List(ref child) => {
             replace_column_with_semantic_id(child.clone(), subexprs_to_replace, schema)
                 .map_yes_no(AggExpr::List, |_| e)

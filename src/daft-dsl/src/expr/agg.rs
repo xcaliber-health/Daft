@@ -49,6 +49,9 @@ pub fn extract_agg_expr(expr: &ExprRef) -> DaftResult<AggExpr> {
                 AggExpr::AnyValue(e, ignore_nulls) => {
                     AggExpr::AnyValue(Expr::Alias(e, name.clone()).into(), ignore_nulls)
                 }
+                AggExpr::SingleValue(e) => {
+                    AggExpr::SingleValue(Expr::Alias(e, name.clone()).into())
+                }
                 AggExpr::List(e) => AggExpr::List(Expr::Alias(e, name.clone()).into()),
                 AggExpr::Set(e) => AggExpr::Set(Expr::Alias(e, name.clone()).into()),
                 AggExpr::Concat(e, delimiter) => {

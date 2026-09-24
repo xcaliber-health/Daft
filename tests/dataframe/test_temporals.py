@@ -1230,6 +1230,26 @@ def test_a_constant_month_shift_shifts_each_date() -> None:
     assert shifted == [date(2026, 2, 28), date(2026, 4, 15), date(2026, 8, 4)]
 
 
+@pytest.mark.parametrize(
+    ("function", "names", "constant_at", "dtype"),
+    [
+        pytest.param(add_months, ["d", "m"], 1, DataType.int32(), id="add_months months"),
+        pytest.param(months_between, ["e", "d"], 1, DataType.date(), id="months_between start"),
+        pytest.param(make_date, ["y", "m", "day"], 2, DataType.int64(), id="make_date day"),
+        pytest.param(make_timestamp, _TIMESTAMP_PARTS, 5, DataType.float64(), id="make_timestamp second"),
+    ],
+)
+def test_a_null_constant_argument_makes_every_row_null(
+    function: Callable[..., Expression], names: list[str], constant_at: int, dtype: DataType
+) -> None:
+    df = daft.from_pydict(_ROWS)
+    args = [daft.lit(None).cast(dtype) if i == constant_at else col(name) for i, name in enumerate(names)]
+
+    observed = df.select(function(*args).alias("r")).to_pydict()["r"]
+
+    assert observed == [None, None, None]
+
+
 # --- months_between ---
 
 

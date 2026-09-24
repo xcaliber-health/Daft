@@ -99,7 +99,7 @@ class NativeRunner(Runner[MicroPartition]):
         # only matter when a subscriber is listening; skip their per-query
         # cost entirely otherwise.
         if not ctx.has_subscribers():
-            return (yield from self._optimize_and_execute(builder, query_id))
+            return (yield from self._optimize_and_execute(builder, query_id, results_buffer_size))
 
         entrypoint = "python " + " ".join(sys.argv)
         python_version = platform.python_version()
@@ -130,12 +130,12 @@ class NativeRunner(Runner[MicroPartition]):
         heartbeat.start()
 
         try:
-            return (yield from self._optimize_and_execute(builder, query_id))
+            return (yield from self._optimize_and_execute(builder, query_id, results_buffer_size))
         finally:
             heartbeat.stop()
 
     def _optimize_and_execute(
-        self, builder: LogicalPlanBuilder, query_id: str
+        self, builder: LogicalPlanBuilder, query_id: str, results_buffer_size: int | None = None
     ) -> Generator[LocalMaterializedResult, None, ExecutionMetadata]:
         ctx = get_context()
 
@@ -161,11 +161,15 @@ class NativeRunner(Runner[MicroPartition]):
         }
         plan, inputs = LocalPhysicalPlan.from_logical_plan_builder(builder._builder, psets)
 
+        context = {"query_id": query_id}
+        if results_buffer_size is not None:
+            # Execution pauses while this many results wait to be consumed.
+            context["result_buffer_size"] = str(results_buffer_size)
         results_gen = self.native_executor.run(
             plan,
             inputs,
             ctx,
-            {"query_id": query_id},
+            context,
         )
 
         try:

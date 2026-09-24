@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import time
+from pathlib import Path
+
 import numpy as np
 import pyarrow as pa
 import pytest
@@ -213,3 +216,49 @@ def test_iter_partitions_exception(make_df, dynamic_batching):
             res = list(it)
             if get_tests_daft_runner_name() == "ray":
                 ray.get(res)
+
+
+_PRODUCED: list[int] = []
+_FILES, _ROWS_PER_FILE = 20, 10_000
+
+
+@daft.func
+def _produce(v: int) -> int:
+    _PRODUCED.append(v)
+    return v
+
+
+def _rows_produced_while_the_first_result_is_held(directory: Path, results_buffer_size: int | None) -> int:
+    _PRODUCED.clear()
+    with daft.execution_config_ctx(default_morsel_size=1_000):
+        df = daft.read_parquet(str(directory)).with_column("v", _produce(daft.col("v")))
+        results = df.iter_partitions(results_buffer_size=results_buffer_size)
+        next(results)
+        time.sleep(1.0)
+        produced = len(_PRODUCED)
+        for _ in results:
+            pass
+    return produced
+
+
+@pytest.fixture
+def many_small_files(tmp_path: Path) -> Path:
+    for f in range(_FILES):
+        rows = range(f * _ROWS_PER_FILE, (f + 1) * _ROWS_PER_FILE)
+        daft.from_arrow(pa.table({"v": list(rows)})).write_parquet(str(tmp_path), write_mode="append")
+    return tmp_path
+
+
+@pytest.mark.skipif(get_tests_daft_runner_name() != "native", reason="the buffer bounds the native runner")
+def test_a_bounded_buffer_pauses_execution_until_results_are_consumed(many_small_files: Path) -> None:
+    held = _rows_produced_while_the_first_result_is_held(many_small_files, results_buffer_size=1)
+
+    assert held < _FILES * _ROWS_PER_FILE // 4
+    assert len(_PRODUCED) == _FILES * _ROWS_PER_FILE
+
+
+@pytest.mark.skipif(get_tests_daft_runner_name() != "native", reason="the buffer bounds the native runner")
+def test_an_unbounded_buffer_runs_ahead_of_its_consumer(many_small_files: Path) -> None:
+    held = _rows_produced_while_the_first_result_is_held(many_small_files, results_buffer_size=None)
+
+    assert held == _FILES * _ROWS_PER_FILE

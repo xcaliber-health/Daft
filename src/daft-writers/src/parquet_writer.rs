@@ -1,10 +1,4 @@
-use std::{
-    collections::VecDeque,
-    future::Future,
-    path::{Path, PathBuf},
-    pin::Pin,
-    sync::Arc,
-};
+use std::{collections::VecDeque, future::Future, path::PathBuf, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
 use common_error::{DaftError, DaftResult};
@@ -30,7 +24,8 @@ use parquet::{
 use crate::{
     AsyncFileWriter, WriteResult,
     storage_backend::{FileStorageBackend, ObjectStorageBackend, StorageBackend},
-    utils::{build_filename, build_filename_single},
+    utils::{build_filename, build_filename_single, remove_existing_local_target},
+    with_rows_written,
 };
 
 type ColumnWriterFuture = dyn Future<Output = DaftResult<ArrowColumnChunk>> + Send;
@@ -151,7 +146,7 @@ pub(crate) fn create_native_parquet_writer(
 
     match source_type {
         SourceType::File => {
-            let storage_backend = FileStorageBackend {};
+            let storage_backend = FileStorageBackend::default();
             Ok(Box::new(ParquetWriter::new(
                 filename,
                 Arc::new(writer_properties),
@@ -184,15 +179,6 @@ pub(crate) fn create_native_parquet_writer(
     }
 }
 
-fn remove_existing_local_target(filename: &Path) -> DaftResult<()> {
-    if filename.is_dir() {
-        std::fs::remove_dir_all(filename)?;
-    } else if filename.exists() {
-        std::fs::remove_file(filename)?;
-    }
-    Ok(())
-}
-
 struct ParquetWriter<B: StorageBackend> {
     filename: PathBuf,
     writer_properties: Arc<WriterProperties>,
@@ -202,6 +188,7 @@ struct ParquetWriter<B: StorageBackend> {
     storage_backend: B,
     file_writer: Option<SerializedFileWriter<B::Writer>>,
     total_bytes_written: usize,
+    total_rows_written: usize,
     overwrite_existing_target: bool,
 }
 
@@ -226,6 +213,7 @@ impl<B: StorageBackend> ParquetWriter<B> {
             storage_backend,
             file_writer: None,
             total_bytes_written: 0,
+            total_rows_written: 0,
             overwrite_existing_target,
         }
     }
@@ -404,6 +392,7 @@ impl<B: StorageBackend> AsyncFileWriter for ParquetWriter<B> {
         let bytes_written = file_writer.bytes_written() - self.total_bytes_written;
         self.total_bytes_written = file_writer.bytes_written();
         self.file_writer.replace(file_writer);
+        self.total_rows_written += num_rows;
 
         Ok(WriteResult {
             bytes_written,
@@ -452,7 +441,10 @@ impl<B: StorageBackend> AsyncFileWriter for ParquetWriter<B> {
             } else {
                 record_batch
             };
-        Ok(Some(record_batch_with_partition_values))
+        Ok(Some(with_rows_written(
+            record_batch_with_partition_values,
+            self.total_rows_written,
+        )?))
     }
 
     fn bytes_written(&self) -> usize {

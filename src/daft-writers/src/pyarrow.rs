@@ -8,7 +8,7 @@ use pyo3::{
     types::{PyAnyMethods, PyDict},
 };
 
-use crate::{AsyncFileWriter, WriteResult};
+use crate::{AsyncFileWriter, WriteResult, with_rows_written};
 
 /// Table-level identifiers stamped on every file a catalog writer produces.
 ///
@@ -25,6 +25,10 @@ pub struct PyArrowWriter {
     py_writer: pyo3::Py<pyo3::PyAny>,
     is_closed: bool,
     bytes_written: usize,
+    rows_written: usize,
+    /// Whether the result reports each file's rows, as a plain file write's does;
+    /// a catalog write reports what its catalog commits instead.
+    reports_rows: bool,
 }
 
 impl PyArrowWriter {
@@ -82,6 +86,8 @@ impl PyArrowWriter {
                 py_writer: py_writer.into(),
                 is_closed: false,
                 bytes_written: 0,
+                rows_written: 0,
+                reports_rows: true,
             })
         })
     }
@@ -130,6 +136,8 @@ impl PyArrowWriter {
                 py_writer: py_writer.into(),
                 is_closed: false,
                 bytes_written: 0,
+                rows_written: 0,
+                reports_rows: true,
             })
         })
     }
@@ -174,6 +182,8 @@ impl PyArrowWriter {
                 py_writer: py_writer.into(),
                 is_closed: false,
                 bytes_written: 0,
+                rows_written: 0,
+                reports_rows: false,
             })
         })
     }
@@ -215,8 +225,28 @@ impl PyArrowWriter {
                 py_writer: py_writer.into(),
                 is_closed: false,
                 bytes_written: 0,
+                rows_written: 0,
+                reports_rows: false,
             })
         })
+    }
+}
+
+impl Drop for PyArrowWriter {
+    fn drop(&mut self) {
+        if self.is_closed {
+            return;
+        }
+        // A writer dropped before it was closed belongs to a write that failed or was
+        // abandoned; its partial file is discarded rather than left looking like output.
+        let aborted = Python::try_attach(|py| {
+            self.py_writer
+                .call_method0(py, pyo3::intern!(py, "abort"))
+                .map(|_| ())
+        });
+        if let Some(Err(err)) = aborted {
+            log::warn!("Could not discard an unfinished file: {err}");
+        }
     }
 }
 
@@ -239,6 +269,7 @@ impl AsyncFileWriter for PyArrowWriter {
                 .extract::<usize>(py)
         })?;
         self.bytes_written += bytes_written;
+        self.rows_written += rows_written;
         Ok(WriteResult {
             bytes_written,
             rows_written,
@@ -260,7 +291,12 @@ impl AsyncFileWriter for PyArrowWriter {
                 .py_writer
                 .call_method0(py, pyo3::intern!(py, "close"))?
                 .getattr(py, pyo3::intern!(py, "_recordbatch"))?;
-            Ok(Some(result.extract::<PyRecordBatch>(py)?.into()))
+            let result: RecordBatch = result.extract::<PyRecordBatch>(py)?.into();
+            if self.reports_rows {
+                Ok(Some(with_rows_written(result, self.rows_written)?))
+            } else {
+                Ok(Some(result))
+            }
         })
     }
 }

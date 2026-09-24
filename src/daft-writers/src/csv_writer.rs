@@ -90,7 +90,7 @@ use crate::{
     AsyncFileWriter,
     batch_file_writer::BatchFileWriter,
     storage_backend::{FileStorageBackend, ObjectStorageBackend, StorageBackend},
-    utils::build_filename,
+    utils::{build_filename, build_filename_single},
 };
 
 /// Returns true if this type is nested (List, FixedSizeList, LargeList, Struct, Union, or Map), or a dictionary of a nested type
@@ -118,30 +118,43 @@ pub(crate) fn native_csv_writer_supported(file_schema: &SchemaRef) -> DaftResult
         .all(native_csv_field_supported))
 }
 
+/// Creates a native CSV writer for one file.
+///
+/// With `single_file`, the file is written at `root_dir` itself rather than inside
+/// it, and `overwrite_single_file_target` replaces whatever occupies that local path.
 pub(crate) fn create_native_csv_writer(
     root_dir: &str,
     file_idx: usize,
     partition_values: Option<&RecordBatch>,
     io_config: Option<IOConfig>,
     csv_option: CsvFormatOption,
+    single_file: bool,
+    overwrite_single_file_target: bool,
 ) -> DaftResult<Box<dyn AsyncFileWriter<Input = MicroPartition, Result = Option<RecordBatch>>>> {
     let (source_type, root_dir) = parse_url(root_dir)?;
-    let filename = build_filename(
-        &source_type,
-        root_dir.as_ref(),
-        partition_values,
-        file_idx,
-        "csv",
-    )?;
+    let filename = if single_file {
+        build_filename_single(&source_type, root_dir.as_ref())?
+    } else {
+        build_filename(
+            &source_type,
+            root_dir.as_ref(),
+            partition_values,
+            file_idx,
+            "csv",
+        )?
+    };
     match source_type {
         SourceType::File => {
-            let storage_backend = FileStorageBackend {};
-            Ok(Box::new(make_csv_writer(
-                filename,
-                partition_values.cloned(),
-                storage_backend,
-                csv_option,
-            )))
+            let storage_backend = FileStorageBackend::default();
+            Ok(Box::new(
+                make_csv_writer(
+                    filename,
+                    partition_values.cloned(),
+                    storage_backend,
+                    csv_option,
+                )
+                .with_overwrite_existing_target(overwrite_single_file_target),
+            ))
         }
         source if source.supports_native_writer() => {
             let ObjectPath { scheme, .. } = daft_io::utils::parse_object_url(root_dir.as_ref())?;

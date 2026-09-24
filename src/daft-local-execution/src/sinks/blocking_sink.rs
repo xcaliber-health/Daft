@@ -464,25 +464,12 @@ impl<Op: BlockingSink + 'static> BlockingSinkNode<Op> {
                     }
                 }
                 PipelineEvent::InputClosed => {
-                    for per_input in inputs.values_mut() {
-                        per_input.flushed = true;
-                    }
-                    let ready: Vec<_> = inputs
-                        .keys()
-                        .filter(|id| inputs[id].ready_to_finalize())
-                        .copied()
-                        .collect();
-                    for input_id in ready {
-                        Self::spawn_finalize(
-                            op.clone(),
-                            inputs.remove(&input_id).unwrap(),
-                            input_id,
-                            finalize_spawner.clone(),
-                            output_tx.clone(),
-                            &mut tasks,
-                            checkpoint.clone(),
-                        );
-                    }
+                    // Every input that completed was flushed first, and is finalized from
+                    // that flush. An input still unflushed here belongs to a child that
+                    // stopped without completing, so it is never finalized: finalizing it
+                    // would present the rows that happened to arrive as the whole result,
+                    // and would complete the files a write had begun. Its state is dropped
+                    // once its running tasks drain, which discards what it began.
                 }
             }
         }

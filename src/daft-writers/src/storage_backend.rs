@@ -1,7 +1,7 @@
 use std::{
     io::{BufWriter, Write},
     num::NonZeroUsize,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -24,11 +24,33 @@ pub(crate) trait StorageBackend: Send + Sync + 'static {
     async fn finalize(&mut self) -> DaftResult<()>;
 }
 
-pub(crate) struct FileStorageBackend {}
+/// Writes one local file.
+///
+/// A file created but never finalized belongs to a write that failed or was
+/// abandoned, so it is removed when the backend is dropped rather than left
+/// behind looking like output.
+#[derive(Default)]
+pub(crate) struct FileStorageBackend {
+    unfinished: Option<PathBuf>,
+}
 
 impl FileStorageBackend {
     // Buffer potentially small writes for highly compressed columns.
     const DEFAULT_WRITE_BUFFER_SIZE: usize = 4 * 1024;
+}
+
+impl Drop for FileStorageBackend {
+    fn drop(&mut self) {
+        if let Some(path) = self.unfinished.take()
+            && let Err(err) = std::fs::remove_file(&path)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            log::warn!(
+                "Could not remove the unfinished file {}: {err}",
+                path.display()
+            );
+        }
+    }
 }
 
 #[async_trait]
@@ -41,13 +63,15 @@ impl StorageBackend for FileStorageBackend {
             std::fs::create_dir_all(parent)?;
         }
         let file = std::fs::File::create(filename)?;
+        self.unfinished = Some(filename.to_path_buf());
         Ok(BufWriter::with_capacity(
             Self::DEFAULT_WRITE_BUFFER_SIZE,
             file,
         ))
     }
     async fn finalize(&mut self) -> DaftResult<()> {
-        // Nothing needed for finalizing file storage.
+        // The file is complete; it is output now.
+        self.unfinished = None;
         Ok(())
     }
 }
@@ -210,5 +234,41 @@ impl GravitinoStorageBackend {
                 root_dir
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::{FileStorageBackend, StorageBackend};
+
+    #[tokio::test]
+    async fn an_unfinished_local_file_is_removed_when_its_backend_is_dropped() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("part.csv");
+        let mut backend = FileStorageBackend::default();
+        let mut writer = backend.create_writer(&path).await.expect("writer");
+        writer.write_all(b"a,b\n").expect("write");
+        drop(writer);
+
+        drop(backend);
+
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_finalized_local_file_is_kept() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("whole.csv");
+        let mut backend = FileStorageBackend::default();
+        let mut writer = backend.create_writer(&path).await.expect("writer");
+        writer.write_all(b"a,b\n").expect("write");
+        drop(writer);
+
+        backend.finalize().await.expect("finalize");
+        drop(backend);
+
+        assert!(path.exists());
     }
 }

@@ -36,7 +36,10 @@ use batch::TargetBatchWriterFactory;
 use common_daft_config::DaftExecutionConfig;
 use common_error::{DaftError, DaftResult};
 use common_file_formats::FileFormat;
-use daft_core::prelude::{Schema, SchemaRef};
+use daft_core::{
+    prelude::{Int64Array, Schema, SchemaRef},
+    series::IntoSeries,
+};
 use daft_dsl::{Expr, expr::bound_expr::BoundExpr};
 use daft_logical_plan::OutputFileInfo;
 use daft_micropartition::MicroPartition;
@@ -53,6 +56,31 @@ use pyo3::prelude::*;
 pub use sink::make_data_sink_writer_factory;
 
 pub const RETURN_PATHS_COLUMN_NAME: &str = "path";
+pub const RETURN_ROWS_COLUMN_NAME: &str = "num_rows";
+
+/// Adds, after each written file's path, how many rows that file holds.
+///
+/// `result` is a file writer's result: one row per file, its path first. Every
+/// row of it describes the same file, so each is given `rows_written`.
+pub(crate) fn with_rows_written(
+    result: RecordBatch,
+    rows_written: usize,
+) -> DaftResult<RecordBatch> {
+    let rows = i64::try_from(rows_written).map_err(|_| {
+        DaftError::ValueError(format!("{rows_written} rows do not fit a row count"))
+    })?;
+    let counts =
+        Int64Array::from_vec(RETURN_ROWS_COLUMN_NAME, vec![rows; result.len()]).into_series();
+    let mut fields = result.schema.fields().to_vec();
+    let mut columns = result
+        .columns()
+        .iter()
+        .map(|column| column.as_materialized_series().clone())
+        .collect::<Vec<_>>();
+    fields.insert(1, counts.field().clone());
+    columns.insert(1, counts);
+    RecordBatch::new_with_size(Schema::new(fields), columns, result.len())
+}
 
 pub struct WriteResult {
     pub bytes_written: usize,
@@ -188,6 +216,12 @@ pub fn make_physical_writer_factory(
                 cfg.csv_target_filesize,
                 cfg.csv_inflation_factor,
             );
+
+            if file_info.single_file {
+                return Ok(Arc::new(SingleFileWriterFactory::new(Arc::new(
+                    base_writer_factory,
+                ))));
+            }
 
             let file_writer_factory = TargetFileSizeWriterFactory::new(
                 Arc::new(base_writer_factory),
@@ -402,5 +436,31 @@ impl TargetInMemorySizeBytesCalculator {
         };
 
         state.estimated_inflation_factor = new_factor;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use daft_core::prelude::{DataType, Utf8Array};
+
+    use super::*;
+
+    #[test]
+    fn each_file_reports_its_rows_after_its_path() -> DaftResult<()> {
+        let paths = Utf8Array::from_slice(RETURN_PATHS_COLUMN_NAME, &["a.csv"]).into_series();
+        let partition = Int64Array::from_vec("k", vec![7]).into_series();
+        let result = RecordBatch::from_nonempty_columns(vec![paths, partition])?;
+
+        let reported = with_rows_written(result, 42)?;
+
+        let names = reported.schema.field_names().collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [RETURN_PATHS_COLUMN_NAME, RETURN_ROWS_COLUMN_NAME, "k"]
+        );
+        let rows = reported.get_column(1);
+        assert_eq!(*rows.data_type(), DataType::Int64);
+        assert_eq!(rows.i64()?.get(0), Some(42));
+        Ok(())
     }
 }

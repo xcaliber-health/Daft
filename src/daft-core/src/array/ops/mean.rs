@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
-use common_error::DaftResult;
+use common_error::{DaftError, DaftResult};
 
-use super::{DaftCountAggable, DaftSumAggable};
 use crate::{
     array::ops::{DaftMeanAggable, GroupIndices},
     datatypes::*,
-    prelude::CountMode,
-    utils::stats,
+    utils::{
+        decimal::{DecimalAnswer, exact_decimal_mean},
+        stats,
+    },
 };
 
 impl DaftMeanAggable for DataArray<Float64Type> {
@@ -29,31 +30,28 @@ impl DaftMeanAggable for DataArray<Float64Type> {
 }
 
 impl DataArray<Decimal128Type> {
-    pub fn merge_mean(&self, counts: &DataArray<UInt64Type>) -> DaftResult<Self> {
-        assert_eq!(self.len(), counts.len());
+    /// Divides these sums by `counts` into the `answer` field's decimal type.
+    ///
+    /// Each sum stays at its own scale until it is divided, so a sum is never widened
+    /// out of range before the division brings it back. The mean is rounded half away
+    /// from zero; a group without values answers null.
+    ///
+    /// # Errors
+    ///
+    /// Returns a compute error when a mean does not fit `answer`.
+    pub fn merge_mean(&self, counts: &DataArray<UInt64Type>, answer: Field) -> DaftResult<Self> {
+        let DataType::Decimal128(_, sum_scale) = *self.data_type() else {
+            return Err(DaftError::TypeError(format!(
+                "A decimal mean divides decimal sums, not {}",
+                self.data_type()
+            )));
+        };
+        let answer_type = DecimalAnswer::of(&answer.dtype)?;
         let means = self
             .into_iter()
             .zip(counts)
-            .map(|(sum, count)| sum.zip(count).map(|(s, c)| s / (c as i128)));
-        Ok(Self::from_iter(self.field.clone(), means))
-    }
-}
-
-impl DaftMeanAggable for DataArray<Decimal128Type> {
-    type Output = DaftResult<Self>;
-
-    fn mean(&self) -> Self::Output {
-        let count = self.count(CountMode::Valid)?.get(0);
-        let sum = self.sum()?.get(0);
-
-        let val = sum.zip(count).map(|(s, c)| s / (c as i128));
-
-        Ok(Self::from_iter(self.field.clone(), std::iter::once(val)))
-    }
-
-    fn grouped_mean(&self, groups: &GroupIndices) -> Self::Output {
-        let grouped_sum = self.grouped_sum(groups)?;
-        let grouped_count = self.grouped_count(groups, CountMode::Valid)?;
-        grouped_sum.merge_mean(&grouped_count)
+            .map(|(sum, count)| exact_decimal_mean(sum, sum_scale, count.unwrap_or(0), answer_type))
+            .collect::<DaftResult<Vec<_>>>()?;
+        Ok(Self::from_iter(Arc::new(answer), means))
     }
 }

@@ -9,7 +9,12 @@ use crate::{
         ops::{DaftPercentileAggable, GroupIndices},
     },
     datatypes::{DataType, Decimal128Array, Field, Float64Array},
-    utils::stats,
+    utils::{
+        decimal::{
+            DecimalAnswer, Percentage, exact_decimal_percentile, exact_decimal_percentile_of,
+        },
+        stats,
+    },
 };
 
 impl DaftPercentileAggable for Float64Array {
@@ -67,13 +72,13 @@ impl DaftPercentileAggable for ListArray {
     }
 }
 
-/// Returns the child positions of the values in `rows` of `list_array`, skipping null rows.
-fn child_positions(
+/// Calls `visit` with the child position of every value in `rows` of `list_array`, skipping null rows.
+fn visit_child_positions(
     list_array: &ListArray,
     rows: &mut dyn Iterator<Item = u64>,
-) -> DaftResult<Vec<usize>> {
+    mut visit: impl FnMut(usize),
+) -> DaftResult<()> {
     let offsets = list_array.offsets();
-    let mut positions = Vec::new();
     for row_idx in rows {
         let row_idx = row_idx as usize;
         if let Some(nulls) = list_array.nulls()
@@ -87,9 +92,9 @@ fn child_positions(
                 list_array.len()
             )));
         };
-        positions.extend(start as usize..end as usize);
+        (start as usize..end as usize).for_each(&mut visit);
     }
-    Ok(positions)
+    Ok(())
 }
 
 fn percentile_for_rows(
@@ -100,9 +105,9 @@ fn percentile_for_rows(
 ) -> DaftResult<Option<f64>> {
     let child = list_array.flat_child.f64()?;
     let mut values_builder = Float64Builder::with_capacity(capacity);
-    for position in child_positions(list_array, rows)? {
+    visit_child_positions(list_array, rows, |position| {
         values_builder.append_option(child.get(position));
-    }
+    })?;
 
     let values = Float64Array::from_arrow(
         Field::new(list_array.name(), DataType::Float64),
@@ -114,61 +119,107 @@ fn percentile_for_rows(
 fn decimal_percentile_for_rows(
     list_array: &ListArray,
     rows: &mut dyn Iterator<Item = u64>,
-    percentage: f64,
+    percentage: Percentage,
+    input_scale: usize,
+    answer: DecimalAnswer,
 ) -> DaftResult<Option<i128>> {
     let child = list_array.flat_child.decimal128()?;
-    let positions = child_positions(list_array, rows)?;
-    stats::exact_decimal_percentile(positions.into_iter().map(|p| child.get(p)), percentage)
+    let mut values = Vec::new();
+    visit_child_positions(list_array, rows, |position| {
+        values.extend(child.get(position));
+    })?;
+    exact_decimal_percentile_of(values, percentage, input_scale, answer)
 }
 
-impl DaftPercentileAggable for Decimal128Array {
-    type Output = DaftResult<Self>;
+/// The scale of the decimal values a percentile reads.
+fn decimal_scale(dtype: &DataType) -> DaftResult<usize> {
+    match dtype {
+        DataType::Decimal128(_, scale) => Ok(*scale),
+        other => Err(DaftError::TypeError(format!(
+            "A decimal percentile reads decimals, not {other}"
+        ))),
+    }
+}
 
-    fn percentile(&self, percentage: f64) -> Self::Output {
-        let answer = stats::exact_decimal_percentile(self, percentage)?;
-        Ok(Self::from_iter(self.field.clone(), std::iter::once(answer)))
+impl Decimal128Array {
+    /// The exact percentile of these decimals, as the `answer` field's decimal type.
+    pub fn decimal_percentile(&self, percentage: Percentage, answer: Field) -> DaftResult<Self> {
+        let answer_type = DecimalAnswer::of(&answer.dtype)?;
+        let percentile = exact_decimal_percentile(
+            self,
+            percentage,
+            decimal_scale(self.data_type())?,
+            answer_type,
+        )?;
+        Ok(Self::from_iter(
+            Arc::new(answer),
+            std::iter::once(percentile),
+        ))
     }
 
-    fn grouped_percentile(&self, groups: &GroupIndices, percentage: f64) -> Self::Output {
-        let answers = groups
+    /// The exact percentile of each group of these decimals, as the `answer` field's decimal type.
+    pub fn grouped_decimal_percentile(
+        &self,
+        groups: &GroupIndices,
+        percentage: Percentage,
+        answer: Field,
+    ) -> DaftResult<Self> {
+        let answer_type = DecimalAnswer::of(&answer.dtype)?;
+        let input_scale = decimal_scale(self.data_type())?;
+        let percentiles = groups
             .iter()
             .map(|group| {
-                stats::exact_decimal_percentile(
+                exact_decimal_percentile(
                     group.iter().map(|&index| self.get(index as usize)),
                     percentage,
+                    input_scale,
+                    answer_type,
                 )
             })
             .collect::<DaftResult<Vec<_>>>()?;
-        Ok(Self::from_iter(self.field.clone(), answers))
+        Ok(Self::from_iter(Arc::new(answer), percentiles))
     }
 }
 
 impl ListArray {
-    /// The percentile of all values in the list, whose items are decimals of the answer's type.
+    /// The exact percentile of all decimal values in these lists, as the `answer` field's type.
     pub fn decimal_percentile(
         &self,
+        percentage: Percentage,
         answer: Field,
-        percentage: f64,
     ) -> DaftResult<Decimal128Array> {
+        let answer_type = DecimalAnswer::of(&answer.dtype)?;
+        let input_scale = decimal_scale(self.child_data_type())?;
         let mut rows = (0..self.len()).map(|i| i as u64);
-        let percentile = decimal_percentile_for_rows(self, &mut rows, percentage)?;
+        let percentile =
+            decimal_percentile_for_rows(self, &mut rows, percentage, input_scale, answer_type)?;
         Ok(Decimal128Array::from_iter(
             Arc::new(answer),
             std::iter::once(percentile),
         ))
     }
 
-    /// The percentile of the values in each group's lists, whose items are decimals of the answer's type.
+    /// The exact percentile of each group's decimal list values, as the `answer` field's type.
     pub fn grouped_decimal_percentile(
         &self,
-        answer: Field,
         groups: &GroupIndices,
-        percentage: f64,
+        percentage: Percentage,
+        answer: Field,
     ) -> DaftResult<Decimal128Array> {
-        let answers = groups
+        let answer_type = DecimalAnswer::of(&answer.dtype)?;
+        let input_scale = decimal_scale(self.child_data_type())?;
+        let percentiles = groups
             .iter()
-            .map(|group| decimal_percentile_for_rows(self, &mut group.iter().copied(), percentage))
+            .map(|group| {
+                decimal_percentile_for_rows(
+                    self,
+                    &mut group.iter().copied(),
+                    percentage,
+                    input_scale,
+                    answer_type,
+                )
+            })
             .collect::<DaftResult<Vec<_>>>()?;
-        Ok(Decimal128Array::from_iter(Arc::new(answer), answers))
+        Ok(Decimal128Array::from_iter(Arc::new(answer), percentiles))
     }
 }

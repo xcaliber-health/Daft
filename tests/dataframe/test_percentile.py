@@ -172,8 +172,8 @@ def test_a_decimal_percentile_reads_the_percentage_as_written() -> None:
     assert answered == [Decimal("9.000000")]
 
 
-def test_a_decimal_percentile_cuts_toward_zero_at_the_widened_scale() -> None:
-    # 1/3 of the way from 0.0000 to 0.0001 is 0.0000333..., cut to 0.00003333 at scale 4 + 4.
+def test_a_decimal_percentile_rounds_at_the_widened_scale() -> None:
+    # Rank 3 x 1/9 lies 1/3 of the way from 0.0000 to 0.0001: 0.0000333..., rounded to 0.00003333 at scale 4 + 4.
     df = _decimals(["0.0000", "0.0001", "0.0001", "0.0001"], precision=10, scale=4)
 
     answered = df.agg(col("v").percentile(1 / 9).alias("p")).to_pydict()["p"]

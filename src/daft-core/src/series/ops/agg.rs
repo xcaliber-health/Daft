@@ -16,7 +16,7 @@ use crate::{
     count_mode::CountMode,
     datatypes::*,
     series::{Series, array_impl::IntoSeries},
-    utils::stats,
+    utils::{decimal::Percentage, stats},
     with_match_physical_daft_types,
 };
 
@@ -167,19 +167,20 @@ impl Series {
                     DaftProductAggable::product(&self.downcast::<Float64Array>()?)?.into_series(),
                 ),
             },
+            // A product of decimals has no exact type of fixed scale: each factor adds its
+            // scale. Like other engines, it answers a float.
             DataType::Decimal128(_, _) => {
-                let casted = self.cast(&try_product_supertype(self.data_type())?)?;
-
+                let casted = self.cast(&DataType::Float64)?;
                 match groups {
                     Some(groups) => Ok(DaftProductAggable::grouped_product(
-                        &casted.downcast::<Decimal128Array>()?,
+                        &casted.downcast::<Float64Array>()?,
                         groups,
                     )?
                     .into_series()),
-                    None => Ok(DaftProductAggable::product(
-                        &casted.downcast::<Decimal128Array>()?,
-                    )?
-                    .into_series()),
+                    None => Ok(
+                        DaftProductAggable::product(&casted.downcast::<Float64Array>()?)?
+                            .into_series(),
+                    ),
                 }
             }
             other => Err(DaftError::TypeError(format!(
@@ -250,13 +251,24 @@ impl Series {
                     .into_series();
                 Ok(series)
             }
+            // A decimal's sum is taken at its own scale, then divided into the wider answer,
+            // so no value is widened out of range before the division.
             DataType::Decimal128(..) => {
-                let casted = self.cast(&target_type)?;
-                let casted = casted.decimal128()?;
-                let series = groups
-                    .map_or_else(|| casted.mean(), |groups| casted.grouped_mean(groups))?
-                    .into_series();
-                Ok(series)
+                let values = self.cast(&try_sum_supertype(self.data_type())?)?;
+                let values = values.decimal128()?;
+                let (sums, counts) = match groups {
+                    Some(groups) => (
+                        DaftSumAggable::grouped_sum(&values, groups)?,
+                        values.grouped_count(groups, CountMode::Valid)?,
+                    ),
+                    None => (
+                        DaftSumAggable::sum(&values)?,
+                        values.count(CountMode::Valid)?,
+                    ),
+                };
+                Ok(sums
+                    .merge_mean(&counts, Field::new(self.name(), target_type))?
+                    .into_series())
             }
 
             _ => Err(DaftError::not_implemented(format!(
@@ -275,27 +287,27 @@ impl Series {
 
         let answer_type = try_percentile_aggregation_supertype(self.data_type())?;
         match self.data_type() {
-            // A decimal is interpolated exactly, in the type its mean would answer.
+            // A decimal is interpolated exactly at its own scale; only the answer is widened.
             DataType::Decimal128(..) => {
-                let casted = self.cast(&answer_type)?;
-                let casted = casted.decimal128()?;
+                let values = self.decimal128()?;
+                let answer = Field::new(self.name(), answer_type);
+                let percentage = Percentage::parse(percentage)?;
                 let result = match groups {
-                    Some(groups) => casted.grouped_percentile(groups, percentage),
-                    None => casted.percentile(percentage),
+                    Some(groups) => values.grouped_decimal_percentile(groups, percentage, answer),
+                    None => values.decimal_percentile(percentage, answer),
                 }?;
                 Ok(result.into_series())
             }
             DataType::List(inner_dtype) | DataType::FixedSizeList(inner_dtype, _)
                 if matches!(inner_dtype.as_ref(), DataType::Decimal128(..)) =>
             {
-                let casted = self.cast(&DataType::List(Box::new(answer_type.clone())))?;
-                let downcasted = casted.downcast::<ListArray>()?;
+                let lists = self.cast(&DataType::List(inner_dtype.clone()))?;
+                let lists = lists.downcast::<ListArray>()?;
                 let answer = Field::new(self.name(), answer_type);
+                let percentage = Percentage::parse(percentage)?;
                 let result = match groups {
-                    Some(groups) => {
-                        downcasted.grouped_decimal_percentile(answer, groups, percentage)
-                    }
-                    None => downcasted.decimal_percentile(answer, percentage),
+                    Some(groups) => lists.grouped_decimal_percentile(groups, percentage, answer),
+                    None => lists.decimal_percentile(percentage, answer),
                 }?;
                 Ok(result.into_series())
             }

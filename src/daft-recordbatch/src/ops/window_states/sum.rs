@@ -9,7 +9,7 @@ use daft_core::{
 };
 use num_traits::{FromPrimitive, Zero};
 
-use super::WindowAggStateOps;
+use super::{WindowAggStateOps, decimal::DecimalSumWindowState};
 use crate::RecordBatch;
 
 pub struct SumWindowState<T>
@@ -161,13 +161,13 @@ pub fn create_for_type(
             source,
             total_length,
         )))),
+        // A decimal sums exactly, in the sum's decimal type, and refuses a total that does not fit.
         DataType::Decimal128(_, _) => {
-            let target_type = try_sum_supertype(source.data_type())?;
-            let casted = source.cast(&target_type)?;
-            Ok(Some(Box::new(SumWindowState::<Decimal128Type>::new(
+            let casted = source.cast(&try_sum_supertype(source.data_type())?)?;
+            Ok(Some(Box::new(DecimalSumWindowState::new(
                 &casted,
                 total_length,
-            ))))
+            )?)))
         }
         dt => Err(DaftError::TypeError(format!(
             "Cannot run Sum over type {}",

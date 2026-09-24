@@ -65,4 +65,3 @@ impl_daft_numeric_agg!(UInt64Type, u64);
 impl_daft_numeric_agg!(Float16Type, half::f16);
 impl_daft_numeric_agg!(Float32Type, f32);
 impl_daft_numeric_agg!(Float64Type, f64);
-impl_daft_numeric_agg!(Decimal128Type, i128);

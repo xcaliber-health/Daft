@@ -7,7 +7,6 @@ from decimal import Decimal
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from daft import DataType, Window, col
 from tests.conftest import assert_df_equals
@@ -144,16 +143,6 @@ def test_float64_running_window(make_df):
     assert_df_equals(result.to_pandas(), pd.DataFrame(expected_data), sort_key=["category", "ts"], check_dtype=False)
 
 
-@pytest.mark.skip(
-    reason="""
-Mismatch between expected and actual Arrow types for DataArray.
-Field name: value
-Logical type: Decimal(precision=5, scale=2)
-Physical type: Decimal(precision=5, scale=2)
-Expected Arrow physical type: Decimal(5, 2)
-Actual Arrow Logical type: Decimal(32, 32)
-"""
-)
 def test_decimal_running_sum(make_df):
     """Test running sum over decimal values."""
     random.seed(62)

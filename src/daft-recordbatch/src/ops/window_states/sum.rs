@@ -119,8 +119,9 @@ where
     }
 
     fn build(&self) -> DaftResult<Series> {
+        // The source's own type, not `T`'s: a decimal carries its precision and scale.
         DataArray::<T>::from_field_and_values(
-            Field::new(self.source.name(), T::get_dtype()),
+            Field::new(self.source.name(), self.source.data_type().clone()),
             self.sum_vec.iter().copied(),
         )
         .into_series()

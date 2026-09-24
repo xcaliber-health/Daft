@@ -75,7 +75,15 @@ where
         let sum_series = self.sum.build()?;
         let count_series = self.count.build()?;
 
-        Ok((sum_series / count_series).unwrap())
+        match sum_series.data_type() {
+            // A decimal mean keeps its sum's type, as the grouped mean does; dividing by
+            // the count as a decimal would widen past what a decimal can hold.
+            DataType::Decimal128(..) => Ok(sum_series
+                .decimal128()?
+                .merge_mean(count_series.u64()?)?
+                .into_series()),
+            _ => sum_series / count_series,
+        }
     }
 }
 

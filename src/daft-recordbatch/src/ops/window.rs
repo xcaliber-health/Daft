@@ -336,7 +336,11 @@ impl RecordBatch {
             None => {
                 let agg_expr = match window_expr.as_ref() {
                     WindowExpr::Agg(agg) => BoundAggExpr::new_unchecked(agg.clone()),
-                    _ => unreachable!("non-incremental fallback only handles Agg variants"),
+                    other => {
+                        return Err(DaftError::ValueError(format!(
+                            "{other} cannot be computed over a window frame"
+                        )));
+                    }
                 };
                 if Self::is_range_frame(&frame.start, &frame.end) {
                     Self::validate_range_frame_order_by(order_by)?;

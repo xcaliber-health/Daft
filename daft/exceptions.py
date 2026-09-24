@@ -15,6 +15,34 @@ class DaftTypeError(DaftCoreException):
     pass
 
 
+class DaftFieldNotFoundError(DaftCoreException):
+    """A column or field named in a query does not exist."""
+
+
+class DaftAmbiguousReferenceError(DaftCoreException):
+    """A column name refers to more than one column."""
+
+
+class DaftSchemaMismatchError(DaftCoreException):
+    """Two schemas that must agree do not."""
+
+
+class DaftValueError(DaftCoreException):
+    """An argument or value was refused."""
+
+
+class DaftComputeError(DaftCoreException):
+    """A computation could not be carried out on its inputs."""
+
+
+class DaftNotImplementedError(DaftCoreException):
+    """The requested operation is not supported."""
+
+
+class DaftInvalidArgumentError(DaftCoreException):
+    """An argument to an operation was invalid."""
+
+
 class DaftTransientError(DaftCoreException):
     """Daft Transient Error.
 

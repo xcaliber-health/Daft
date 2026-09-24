@@ -22,6 +22,11 @@ impl<T> Receiver<T> {
         self.0.recv().await
     }
 
+    /// Stops taking values: senders fail from now on, so a producer blocked on a full channel is released.
+    pub(crate) fn close(&mut self) {
+        self.0.close();
+    }
+
     pub(crate) fn into_stream(self) -> impl Stream<Item = T> {
         tokio_stream::wrappers::ReceiverStream::new(self.0)
     }

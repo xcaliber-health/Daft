@@ -192,7 +192,7 @@ impl Series {
     pub fn approx_sketch(&self, groups: Option<&GroupIndices>) -> DaftResult<Self> {
         // Upcast all numeric types to float64 and compute approx_sketch.
         match self.data_type() {
-            dt if dt.is_numeric() => {
+            dt if is_percentile_input(dt) => {
                 let casted = self.cast(&DataType::Float64)?;
                 match groups {
                     Some(groups) => Ok(DaftApproxSketchAggable::grouped_approx_sketch(
@@ -274,7 +274,7 @@ impl Series {
         }
 
         match self.data_type() {
-            dt if dt.is_numeric() => {
+            dt if is_percentile_input(dt) => {
                 let casted = self.cast(&DataType::Float64)?;
                 let casted = casted.f64()?;
                 let result = match groups {
@@ -284,7 +284,7 @@ impl Series {
                 Ok(result.into_series())
             }
             DataType::List(inner_dtype) | DataType::FixedSizeList(inner_dtype, _)
-                if inner_dtype.is_numeric() =>
+                if is_percentile_input(inner_dtype) =>
             {
                 let casted = self.cast(&DataType::List(Box::new(DataType::Float64)))?;
                 let downcasted = casted.downcast::<ListArray>()?;

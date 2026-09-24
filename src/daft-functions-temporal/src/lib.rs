@@ -3,6 +3,7 @@ pub mod date_arithmetic;
 pub mod date_construction;
 pub mod date_navigation;
 pub mod epoch_conversions;
+mod rows;
 pub mod time;
 mod to_string;
 mod total;
@@ -76,20 +77,20 @@ macro_rules! impl_temporal {
     };
 }
 impl_temporal!(Date, dt_date, Date);
-impl_temporal!(Day, dt_day, UInt32);
-impl_temporal!(DayOfMonth, dt_day_of_month, UInt32);
-impl_temporal!(DayOfWeek, dt_day_of_week, UInt32);
-impl_temporal!(DayOfYear, dt_day_of_year, UInt32);
-impl_temporal!(Hour, dt_hour, UInt32);
-impl_temporal!(Microsecond, dt_microsecond, UInt32);
-impl_temporal!(Millisecond, dt_millisecond, UInt32);
-impl_temporal!(Minute, dt_minute, UInt32);
-impl_temporal!(Month, dt_month, UInt32);
-impl_temporal!(Nanosecond, dt_nanosecond, UInt32);
-impl_temporal!(Quarter, dt_quarter, UInt32);
-impl_temporal!(Second, dt_second, UInt32);
-impl_temporal!(UnixDate, dt_unix_date, UInt64);
-impl_temporal!(WeekOfYear, dt_week_of_year, UInt32);
+impl_temporal!(Day, dt_day, Int32);
+impl_temporal!(DayOfMonth, dt_day_of_month, Int32);
+impl_temporal!(DayOfWeek, dt_day_of_week, Int32);
+impl_temporal!(DayOfYear, dt_day_of_year, Int32);
+impl_temporal!(Hour, dt_hour, Int32);
+impl_temporal!(Microsecond, dt_microsecond, Int32);
+impl_temporal!(Millisecond, dt_millisecond, Int32);
+impl_temporal!(Minute, dt_minute, Int32);
+impl_temporal!(Month, dt_month, Int32);
+impl_temporal!(Nanosecond, dt_nanosecond, Int32);
+impl_temporal!(Quarter, dt_quarter, Int32);
+impl_temporal!(Second, dt_second, Int32);
+impl_temporal!(UnixDate, dt_unix_date, Int64);
+impl_temporal!(WeekOfYear, dt_week_of_year, Int32);
 impl_temporal!(Year, dt_year, Int32);
 
 impl FunctionModule for TemporalFunctions {

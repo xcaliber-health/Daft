@@ -20,9 +20,10 @@ use common_hashable_float_wrapper::FloatWrapper;
 use common_treenode::{Transformed, TreeNode};
 use daft_core::{
     datatypes::{
-        InferDataType, try_mean_aggregation_supertype, try_percentile_aggregation_supertype,
-        try_product_supertype, try_skew_aggregation_supertype, try_stddev_aggregation_supertype,
-        try_sum_supertype, try_variance_aggregation_supertype,
+        InferDataType, is_percentile_input, try_mean_aggregation_supertype,
+        try_percentile_aggregation_supertype, try_product_supertype,
+        try_skew_aggregation_supertype, try_stddev_aggregation_supertype, try_sum_supertype,
+        try_variance_aggregation_supertype,
     },
     join::JoinSide,
     lit::Literal,
@@ -635,7 +636,7 @@ impl AggExpr {
             | Self::Concat(expr, _)
             | Self::Median(expr)
             | Self::Skew(expr) => expr.name(),
-            Self::MapGroups { func: _, inputs } => inputs.first().unwrap().name(),
+            Self::MapGroups { func: _, inputs } => inputs.first().map_or("", |input| input.name()),
             Self::AggFn { handle, .. }
             | Self::AggFnMap { handle, .. }
             | Self::AggFnCombine { handle, .. }
@@ -912,7 +913,7 @@ impl AggExpr {
                 Ok(Field::new(
                     field.name.as_ref(),
                     match &field.dtype {
-                        dt if dt.is_numeric() => {
+                        dt if is_percentile_input(dt) => {
                             if percentiles.len() > 1 || *force_list_output {
                                 DataType::FixedSizeList(
                                     Box::new(DataType::Float64),
@@ -924,7 +925,7 @@ impl AggExpr {
                         }
                         other => {
                             return Err(DaftError::TypeError(format!(
-                                "Expected input to approx_percentiles() to be numeric but received dtype {} for column \"{}\"",
+                                "Expected input to approx_percentiles() to be numeric or decimal but received dtype {} for column \"{}\"",
                                 other, field.name,
                             )));
                         }
@@ -939,9 +940,9 @@ impl AggExpr {
                 let field = expr.to_field(schema)?;
                 let dtype = match sketch_type {
                     SketchType::DDSketch => {
-                        if !field.dtype.is_numeric() {
+                        if !is_percentile_input(&field.dtype) {
                             return Err(DaftError::TypeError(format!(
-                                r#"Expected input to approx_sketch() to be numeric but received dtype {} for column "{}""#,
+                                r#"Expected input to approx_sketch() to be numeric or decimal but received dtype {} for column "{}""#,
                                 field.dtype, field.name,
                             )));
                         }
@@ -2330,13 +2331,15 @@ impl Expr {
             Self::List(..) => "list",
             Self::Function { func, inputs } => match func {
                 FunctionExpr::Struct(StructExpr::Get(name)) => name,
-                _ => inputs.first().unwrap().name(),
+                _ => inputs.first().map_or("", |input| input.name()),
             },
             Self::ScalarFn(ScalarFn::Builtin(func)) => match func.name() {
                 "struct" => "struct", // FIXME: make struct its own expr variant
                 "monotonically_increasing_id" => "monotonically_increasing_id", // Special case for functions with no inputs
                 "uuid" | "uuidv7" => "",
-                _ => func.inputs.first().unwrap().name(),
+                // A function with no inputs, such as `current_date()` or `pi()`, has
+                // nothing to take a name from, and names its own field "".
+                _ => func.inputs.first().map_or("", |input| input.name()),
             },
             Self::BinaryOp {
                 op: _,

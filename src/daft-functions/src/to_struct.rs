@@ -52,12 +52,48 @@ impl ScalarUDF for ToStructFunction {
         let child_fields = inputs
             .iter()
             .map(|e| e.to_field(schema))
-            .collect::<DaftResult<_>>()?;
+            .collect::<DaftResult<Vec<_>>>()?;
+        ensure_distinct_names(&child_fields)?;
         Ok(Field::new("struct", DataType::Struct(child_fields)))
+    }
+}
+
+/// Refuses two fields of one name: a struct's fields are read back by name, so
+/// only one of them could ever be reached and the other would be lost silently.
+fn ensure_distinct_names(fields: &[Field]) -> DaftResult<()> {
+    let mut seen = std::collections::HashSet::with_capacity(fields.len());
+    match fields.iter().find(|field| !seen.insert(&*field.name)) {
+        Some(repeated) => Err(DaftError::ValueError(format!(
+            "struct() received two fields named {:?}; give each field its own name with .alias()",
+            repeated.name
+        ))),
+        None => Ok(()),
     }
 }
 
 #[must_use]
 pub fn to_struct(inputs: Vec<ExprRef>) -> ExprRef {
     ScalarFn::builtin(ToStructFunction, inputs).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    fn fields(names: &[&str]) -> Vec<Field> {
+        names
+            .iter()
+            .map(|name| Field::new(*name, DataType::Int64))
+            .collect()
+    }
+
+    #[rstest]
+    #[case::distinct(&["x", "y"], true)]
+    #[case::repeated(&["x", "x"], false)]
+    #[case::repeated_apart(&["x", "y", "x"], false)]
+    fn a_struct_takes_each_name_once(#[case] names: &[&str], #[case] accepted: bool) {
+        assert_eq!(ensure_distinct_names(&fields(names)).is_ok(), accepted);
+    }
 }

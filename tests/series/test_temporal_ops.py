@@ -21,7 +21,7 @@ def test_series_date_day_operation() -> None:
     s = Series.from_pylist(input_dates)
     days = s.dt.day()
 
-    assert days.datatype() == DataType.uint32()
+    assert days.datatype() == DataType.int32()
 
     assert input == days.to_pylist()
 
@@ -38,7 +38,7 @@ def test_series_date_month_operation() -> None:
     s = Series.from_pylist(input_dates)
     months = s.dt.month()
 
-    assert months.datatype() == DataType.uint32()
+    assert months.datatype() == DataType.int32()
 
     assert input == months.to_pylist()
 
@@ -55,7 +55,7 @@ def test_series_date_quarter_operation() -> None:
     s = Series.from_pylist(input_dates)
     months = s.dt.month()
 
-    assert months.datatype() == DataType.uint32()
+    assert months.datatype() == DataType.int32()
 
     assert input == months.to_pylist()
 
@@ -90,7 +90,7 @@ def test_series_date_day_of_week_operation() -> None:
     s = Series.from_pylist(input_dates)
     day_of_weeks = s.dt.day_of_week()
 
-    assert day_of_weeks.datatype() == DataType.uint32()
+    assert day_of_weeks.datatype() == DataType.int32()
 
     assert [0, 1, 2, None, 3, 4, None, 5, 6] == day_of_weeks.to_pylist()
 
@@ -108,7 +108,7 @@ def test_series_timestamp_day_operation(tz) -> None:
     s = Series.from_pylist(input_ts).cast(DataType.timestamp(TimeUnit.ms(), timezone=tz))
     days = s.dt.day()
 
-    assert days.datatype() == DataType.uint32()
+    assert days.datatype() == DataType.int32()
 
     # If tz is +08:00, then we expect the days to be +1 because our ts_maker makes timestamps with times at 23:00
     expected = [d and d + 1 for d in input] if tz in {"+08:00", "Asia/Singapore"} else input
@@ -129,7 +129,7 @@ def test_series_timestamp_hour_operation(tz) -> None:
     s = Series.from_pylist(input_ts).cast(DataType.timestamp(TimeUnit.ms(), timezone=tz))
     hours = s.dt.hour()
 
-    assert hours.datatype() == DataType.uint32()
+    assert hours.datatype() == DataType.int32()
 
     expected = [h and (h + 8) % 24 for h in input] if tz in {"+08:00", "Asia/Singapore"} else input
     assert expected == hours.to_pylist()
@@ -147,7 +147,7 @@ def test_series_time_hour() -> None:
     s = Series.from_pylist(input_ts).cast(DataType.time(TimeUnit.ns()))
     hours = s.dt.hour()
 
-    assert hours.datatype() == DataType.uint32()
+    assert hours.datatype() == DataType.int32()
 
     assert input == hours.to_pylist()
 
@@ -165,7 +165,7 @@ def test_series_timestamp_minute_operation(tz) -> None:
     s = Series.from_pylist(input_ts).cast(DataType.timestamp(TimeUnit.ms(), timezone=tz))
     minutes = s.dt.minute()
 
-    assert minutes.datatype() == DataType.uint32()
+    assert minutes.datatype() == DataType.int32()
 
     assert input == minutes.to_pylist()
 
@@ -182,7 +182,7 @@ def test_series_time_minute() -> None:
     s = Series.from_pylist(input_ts).cast(DataType.time(TimeUnit.ns()))
     minutes = s.dt.minute()
 
-    assert minutes.datatype() == DataType.uint32()
+    assert minutes.datatype() == DataType.int32()
 
     assert input == minutes.to_pylist()
 
@@ -200,7 +200,7 @@ def test_series_timestamp_second_operation(tz) -> None:
     s = Series.from_pylist(input_ts).cast(DataType.timestamp(TimeUnit.ms(), timezone=tz))
     seconds = s.dt.second()
 
-    assert seconds.datatype() == DataType.uint32()
+    assert seconds.datatype() == DataType.int32()
 
     assert input == seconds.to_pylist()
 
@@ -217,7 +217,7 @@ def test_series_time_second() -> None:
     s = Series.from_pylist(input_ts).cast(DataType.time(TimeUnit.ns()))
     seconds = s.dt.second()
 
-    assert seconds.datatype() == DataType.uint32()
+    assert seconds.datatype() == DataType.int32()
 
     assert input == seconds.to_pylist()
 
@@ -235,7 +235,7 @@ def test_series_timestamp_month_operation(tz) -> None:
     s = Series.from_pylist(input_ts).cast(DataType.timestamp(TimeUnit.ms(), timezone=tz))
     months = s.dt.month()
 
-    assert months.datatype() == DataType.uint32()
+    assert months.datatype() == DataType.int32()
 
     assert input == months.to_pylist()
 
@@ -254,7 +254,7 @@ def test_series_timestamp_quarter_operation(tz) -> None:
     s = Series.from_pylist(input_ts).cast(DataType.timestamp(TimeUnit.ms(), timezone=tz))
     quarters = s.dt.quarter()
 
-    assert quarters.datatype() == DataType.uint32()
+    assert quarters.datatype() == DataType.int32()
 
     assert expected == quarters.to_pylist()
 
@@ -288,7 +288,7 @@ def test_series_timestamp_unix_date_operation() -> None:
     s = Series.from_pylist(input_ts).cast(DataType.timestamp(TimeUnit.ms()))
     out = s.dt.unix_date()
 
-    assert out.datatype() == DataType.uint64()
+    assert out.datatype() == DataType.int64()
 
     assert [2922, 20009, 34699, None] == out.to_pylist()
 
@@ -590,3 +590,26 @@ def test_series_remove_tz() -> None:
     replaced = input_series.dt.replace_time_zone()
     expected = [datetime(2024, 1, 1, 0, 0, 0)]
     assert replaced.to_pylist() == expected
+
+
+@pytest.mark.parametrize(
+    ("part", "expected"),
+    [
+        pytest.param("year", -1, id="year"),
+        pytest.param("month", -6, id="month"),
+        pytest.param("day", -3, id="day"),
+        pytest.param("quarter", -2, id="quarter"),
+        pytest.param("day_of_year", -184, id="day_of_year"),
+    ],
+)
+def test_one_date_part_minus_another_can_be_negative(part: str, expected: int) -> None:
+    earlier = getattr(Series.from_pylist([date(2025, 1, 1)]).dt, part)()
+    later = getattr(Series.from_pylist([date(2026, 7, 4)]).dt, part)()
+
+    assert (earlier - later).to_pylist() == [expected]
+
+
+def test_series_timestamp_unix_date_before_1970_is_negative() -> None:
+    s = Series.from_pylist([datetime(1969, 12, 31, 23, 0), datetime(1900, 1, 1)])
+
+    assert s.dt.unix_date().to_pylist() == [-1, -25567]

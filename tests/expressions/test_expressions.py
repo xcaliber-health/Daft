@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Callable
 from datetime import date, datetime, time, timedelta, timezone
 
 import pytest
 import pytz
 
 import daft
+import daft.functions
 from daft.datatype import DataType, TimeUnit
-from daft.expressions import col, lit
+from daft.expressions import Expression, col, lit
 from daft.expressions.testing import expr_structurally_equal
 from daft.functions import hash as hash_fn
 from daft.recordbatch import MicroPartition
@@ -811,3 +813,31 @@ def test_drop_nan_no_nans():
     dd = {"n": [1, 1, 2]}
     df = daft.from_pydict(dd)
     assert df.drop_nan().to_pydict() == dd
+
+
+@pytest.mark.parametrize(
+    "function",
+    [
+        pytest.param("current_date", id="current_date"),
+        pytest.param("current_timestamp", id="current_timestamp"),
+        pytest.param("current_timezone", id="current_timezone"),
+        pytest.param("pi", id="pi"),
+        pytest.param("e", id="e"),
+    ],
+)
+@pytest.mark.parametrize(
+    "wrap",
+    [
+        pytest.param(lambda x: x.cast(DataType.string()), id="cast"),
+        pytest.param(lambda x: x.is_null(), id="is_null"),
+        pytest.param(lambda x: ~x.is_null(), id="not"),
+        pytest.param(lambda x: x.fill_null(x), id="fill_null"),
+    ],
+)
+def test_a_function_without_inputs_can_be_wrapped(function: str, wrap: Callable[[Expression], Expression]) -> None:
+    df = daft.from_pydict({"a": [1, 2]})
+
+    result = df.select(wrap(getattr(daft.functions, function)()).alias("out")).to_pydict()
+
+    assert len(result["out"]) == 2
+    assert all(value is not None for value in result["out"])

@@ -65,23 +65,24 @@ fn process_interval(interval: &str, timeunit: TimeUnit) -> DaftResult<i64> {
 }
 
 impl DateArray {
-    fn date_part_as_uint32(&self, part: DatePart) -> DaftResult<UInt32Array> {
+    /// Extracts `part` of each value as a signed 32-bit integer, so that parts
+    /// can be subtracted from one another without wrapping.
+    fn date_part_as_int32(&self, part: DatePart) -> DaftResult<Int32Array> {
         let date_array = self.to_arrow()?;
         let result = date_part(&*date_array, part)?;
-        let result = arrow::compute::cast(&*result, &arrow::datatypes::DataType::UInt32)?;
-        UInt32Array::from_arrow(Field::new(self.name(), DataType::UInt32), result)
+        Int32Array::from_arrow(Field::new(self.name(), DataType::Int32), result)
     }
 
-    pub fn day(&self) -> DaftResult<UInt32Array> {
-        self.date_part_as_uint32(DatePart::Day)
+    pub fn day(&self) -> DaftResult<Int32Array> {
+        self.date_part_as_int32(DatePart::Day)
     }
 
-    pub fn month(&self) -> DaftResult<UInt32Array> {
-        self.date_part_as_uint32(DatePart::Month)
+    pub fn month(&self) -> DaftResult<Int32Array> {
+        self.date_part_as_int32(DatePart::Month)
     }
 
-    pub fn quarter(&self) -> DaftResult<UInt32Array> {
-        self.date_part_as_uint32(DatePart::Quarter)
+    pub fn quarter(&self) -> DaftResult<Int32Array> {
+        self.date_part_as_int32(DatePart::Quarter)
     }
 
     pub fn year(&self) -> DaftResult<Int32Array> {
@@ -90,29 +91,30 @@ impl DateArray {
         Int32Array::from_arrow(Field::new(self.name(), DataType::Int32), result)
     }
 
-    pub fn day_of_week(&self) -> DaftResult<UInt32Array> {
-        self.date_part_as_uint32(DatePart::DayOfWeekMonday0)
+    pub fn day_of_week(&self) -> DaftResult<Int32Array> {
+        self.date_part_as_int32(DatePart::DayOfWeekMonday0)
     }
 
-    pub fn day_of_month(&self) -> DaftResult<UInt32Array> {
-        self.date_part_as_uint32(DatePart::Day)
+    pub fn day_of_month(&self) -> DaftResult<Int32Array> {
+        self.date_part_as_int32(DatePart::Day)
     }
 
-    pub fn day_of_year(&self) -> DaftResult<UInt32Array> {
-        self.date_part_as_uint32(DatePart::DayOfYear)
+    pub fn day_of_year(&self) -> DaftResult<Int32Array> {
+        self.date_part_as_int32(DatePart::DayOfYear)
     }
 
-    pub fn week_of_year(&self) -> DaftResult<UInt32Array> {
-        self.date_part_as_uint32(DatePart::Week)
+    pub fn week_of_year(&self) -> DaftResult<Int32Array> {
+        self.date_part_as_int32(DatePart::Week)
     }
 }
 
 impl TimestampArray {
-    fn date_part_as_uint32(&self, part: DatePart) -> DaftResult<UInt32Array> {
+    /// Extracts `part` of each value as a signed 32-bit integer, so that parts
+    /// can be subtracted from one another without wrapping.
+    fn date_part_as_int32(&self, part: DatePart) -> DaftResult<Int32Array> {
         let ts_array = self.to_arrow()?;
         let result = date_part(&*ts_array, part)?;
-        let result = arrow::compute::cast(&*result, &arrow::datatypes::DataType::UInt32)?;
-        UInt32Array::from_arrow(Field::new(self.name(), DataType::UInt32), result)
+        Int32Array::from_arrow(Field::new(self.name(), DataType::Int32), result)
     }
 
     pub fn date(&self) -> DaftResult<DateArray> {
@@ -410,19 +412,20 @@ impl TimestampArray {
         Self::from_arrow(self.field.clone(), result)
     }
 
-    pub fn day_of_month(&self) -> DaftResult<UInt32Array> {
-        self.date_part_as_uint32(DatePart::Day)
+    pub fn day_of_month(&self) -> DaftResult<Int32Array> {
+        self.date_part_as_int32(DatePart::Day)
     }
 
-    pub fn day_of_year(&self) -> DaftResult<UInt32Array> {
-        self.date_part_as_uint32(DatePart::DayOfYear)
+    pub fn day_of_year(&self) -> DaftResult<Int32Array> {
+        self.date_part_as_int32(DatePart::DayOfYear)
     }
 
-    pub fn week_of_year(&self) -> DaftResult<UInt32Array> {
-        self.date_part_as_uint32(DatePart::Week)
+    pub fn week_of_year(&self) -> DaftResult<Int32Array> {
+        self.date_part_as_int32(DatePart::Week)
     }
 
-    pub fn unix_date(&self) -> DaftResult<UInt64Array> {
+    /// Days since 1970-01-01, negative for earlier dates.
+    pub fn unix_date(&self) -> DaftResult<Int64Array> {
         const UNIX_EPOCH_DATE: NaiveDate = DateTime::UNIX_EPOCH.naive_utc().date();
         let DataType::Timestamp(tu, _tz) = self.data_type() else {
             unreachable!("TimestampArray must have Timestamp datatype")
@@ -434,12 +437,12 @@ impl TimestampArray {
                 datetime
                     .date_naive()
                     .signed_duration_since(UNIX_EPOCH_DATE)
-                    .num_days() as u64
+                    .num_days()
             })
         });
 
-        Ok(UInt64Array::from_iter(
-            Field::new(self.name(), DataType::UInt64),
+        Ok(Int64Array::from_iter(
+            Field::new(self.name(), DataType::Int64),
             date_arrow,
         ))
     }
@@ -481,34 +484,35 @@ impl IntervalArray {
 }
 
 impl TimeArray {
-    fn date_part_as_uint32(&self, part: DatePart) -> DaftResult<UInt32Array> {
+    /// Extracts `part` of each value as a signed 32-bit integer, so that parts
+    /// can be subtracted from one another without wrapping.
+    fn date_part_as_int32(&self, part: DatePart) -> DaftResult<Int32Array> {
         let time_array = self.to_arrow()?;
         let result = date_part(&*time_array, part)?;
-        let result = arrow::compute::cast(&*result, &arrow::datatypes::DataType::UInt32)?;
-        UInt32Array::from_arrow(Field::new(self.name(), DataType::UInt32), result)
+        Int32Array::from_arrow(Field::new(self.name(), DataType::Int32), result)
     }
 
-    pub fn hour(&self) -> DaftResult<UInt32Array> {
-        self.date_part_as_uint32(DatePart::Hour)
+    pub fn hour(&self) -> DaftResult<Int32Array> {
+        self.date_part_as_int32(DatePart::Hour)
     }
 
-    pub fn minute(&self) -> DaftResult<UInt32Array> {
-        self.date_part_as_uint32(DatePart::Minute)
+    pub fn minute(&self) -> DaftResult<Int32Array> {
+        self.date_part_as_int32(DatePart::Minute)
     }
 
-    pub fn second(&self) -> DaftResult<UInt32Array> {
-        self.date_part_as_uint32(DatePart::Second)
+    pub fn second(&self) -> DaftResult<Int32Array> {
+        self.date_part_as_int32(DatePart::Second)
     }
 
-    pub fn millisecond(&self) -> DaftResult<UInt32Array> {
-        self.date_part_as_uint32(DatePart::Millisecond)
+    pub fn millisecond(&self) -> DaftResult<Int32Array> {
+        self.date_part_as_int32(DatePart::Millisecond)
     }
 
-    pub fn microsecond(&self) -> DaftResult<UInt32Array> {
-        self.date_part_as_uint32(DatePart::Microsecond)
+    pub fn microsecond(&self) -> DaftResult<Int32Array> {
+        self.date_part_as_int32(DatePart::Microsecond)
     }
 
-    pub fn nanosecond(&self) -> DaftResult<UInt32Array> {
-        self.date_part_as_uint32(DatePart::Nanosecond)
+    pub fn nanosecond(&self) -> DaftResult<Int32Array> {
+        self.date_part_as_int32(DatePart::Nanosecond)
     }
 }

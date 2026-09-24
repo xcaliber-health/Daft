@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 
+import daft
 from daft import col
 
 
@@ -102,3 +105,41 @@ def test_select_with_dict_alias_behavior(make_df, valid_data: list[dict[str, flo
     )
     # The dictionary key should override any alias in the expression
     assert df.column_names == ["renamed_length", "renamed_width"]
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(lambda df: df.select(col("a").alias("x"), col("b").alias("x")), id="select"),
+        pytest.param(lambda df: df.select(col("a"), col("a")), id="select same column twice"),
+        pytest.param(lambda df: df.agg(col("a").sum().alias("x"), col("b").sum().alias("x")), id="agg"),
+        pytest.param(lambda df: df.select(col("a").sum().alias("x"), col("b").sum().alias("x")), id="global select"),
+        pytest.param(lambda df: df.groupby("a").agg(col("a").count()), id="agg named like its group"),
+    ],
+)
+def test_a_repeated_output_name_is_refused(build: Callable[[daft.DataFrame], daft.DataFrame]) -> None:
+    df = daft.from_pydict({"a": [1, 2], "b": [3, 4]})
+
+    with pytest.raises(ValueError, match="more than once"):
+        build(df).collect()
+
+
+def test_a_repeated_output_name_is_refused_in_sql() -> None:
+    df = daft.from_pydict({"a": [1, 2], "b": [3, 4]})
+
+    with pytest.raises(Exception, match="more than once"):
+        daft.sql("SELECT a AS x, b AS x FROM df", df=df).collect()
+
+
+def test_one_aggregation_may_be_read_under_two_names() -> None:
+    df = daft.from_pydict({"a": [1, 2, 3]})
+
+    result = df.select(col("a").sum().alias("x"), col("a").sum().alias("y")).to_pydict()
+
+    assert result == {"x": [6], "y": [6]}
+
+
+def test_with_column_still_replaces_an_existing_column() -> None:
+    df = daft.from_pydict({"a": [1, 2]})
+
+    assert df.with_column("a", col("a") * 10).to_pydict() == {"a": [10, 20]}

@@ -64,6 +64,24 @@ pub struct LogicalPlanBuilder {
     config: Option<Arc<DaftPlanningConfig>>,
 }
 
+/// Refuses two outputs of one name.
+///
+/// Columns are addressed by name, so of two outputs sharing a name only one can
+/// ever be read back; the other would be lost without a word.
+fn ensure_distinct_output_names(exprs: &[ExprRef], operation: &str) -> DaftResult<()> {
+    let mut seen = HashSet::with_capacity(exprs.len());
+    match exprs
+        .iter()
+        .map(|expr| expr.name())
+        .find(|name| !seen.insert(*name))
+    {
+        Some(repeated) => Err(DaftError::ValueError(format!(
+            "{operation}() produces the column {repeated:?} more than once; give each output its own name with .alias()"
+        ))),
+        None => Ok(()),
+    }
+}
+
 impl LogicalPlanBuilder {
     pub fn new(plan: Arc<LogicalPlan>, config: Option<Arc<DaftPlanningConfig>>) -> Self {
         Self { plan, config }
@@ -339,20 +357,25 @@ impl LogicalPlanBuilder {
             let mut final_exprs: Vec<ExprRef> =
                 Vec::with_capacity(agg_exprs.len() + foldable_exprs.len());
 
+            // One aggregation asked for under two names is computed once.
+            let mut computed: HashSet<Arc<str>> = HashSet::with_capacity(agg_exprs.len());
             for (id, user_name, agg) in agg_exprs {
-                agg_internal.push(agg.alias(id.clone()));
+                if computed.insert(id.clone()) {
+                    agg_internal.push(agg.alias(id.clone()));
+                }
                 final_exprs.push(resolved_col(id).alias(user_name));
             }
+            final_exprs.extend(foldable_exprs);
+            ensure_distinct_output_names(&final_exprs, "select")?;
 
             let agg_plan: LogicalPlan =
                 ops::Aggregate::try_new(self.plan.clone(), agg_internal, vec![])?.into();
             let agg_plan = Arc::new(agg_plan);
 
-            final_exprs.extend(foldable_exprs);
-
             let logical_plan: LogicalPlan = ops::Project::try_new(agg_plan, final_exprs)?.into();
             Ok(self.with_new_plan(logical_plan))
         } else {
+            ensure_distinct_output_names(&to_select, "select")?;
             let logical_plan: LogicalPlan =
                 ops::Project::try_new(self.plan.clone(), to_select)?.into();
             Ok(self.with_new_plan(logical_plan))
@@ -661,6 +684,14 @@ impl LogicalPlanBuilder {
 
         let agg_resolver = ExprResolver::builder().groupby(&groupby_exprs).build();
         let agg_exprs = agg_resolver.resolve(agg_exprs, self.plan.clone())?;
+        ensure_distinct_output_names(
+            &groupby_exprs
+                .iter()
+                .chain(&agg_exprs)
+                .cloned()
+                .collect::<Vec<_>>(),
+            "agg",
+        )?;
 
         let logical_plan: LogicalPlan =
             ops::Aggregate::try_new(self.plan.clone(), agg_exprs, groupby_exprs)?.into();

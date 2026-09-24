@@ -43,6 +43,7 @@ python = [
 ]
 
 [dev-dependencies]
+rstest = {workspace = true}
 typetag = {workspace = true}
 
 [lints]

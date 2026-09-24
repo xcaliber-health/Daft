@@ -23,7 +23,12 @@ impl RecordBatch {
         }
     }
 
+    /// Aggregates the whole batch into exactly one row.
     pub fn agg_global(&self, to_agg: &[BoundAggExpr]) -> DaftResult<Self> {
+        // With nothing to compute there is still one group, the whole batch.
+        if to_agg.is_empty() {
+            return Self::new_with_size(Schema::empty(), vec![], 1);
+        }
         self.eval_expression_list(
             &to_agg
                 .iter()
@@ -581,6 +586,17 @@ mod tests {
             .collect::<DaftResult<_>>()?;
         pairs.sort();
         assert_eq!(pairs, vec![("a".into(), 30i64), ("b".into(), 3i64)]);
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::rows(5)]
+    #[case::no_rows(0)]
+    fn a_global_aggregate_with_nothing_to_compute_is_one_row(#[case] rows: i64) -> DaftResult<()> {
+        let values = Int64Array::from_values("a", 0..rows).into_series();
+        let batch = RecordBatch::from_nonempty_columns(vec![values])?;
+
+        assert_eq!(batch.agg_global(&[])?.len(), 1);
         Ok(())
     }
 }

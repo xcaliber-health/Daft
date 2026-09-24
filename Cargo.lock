@@ -3439,6 +3439,7 @@ dependencies = [
  "pyo3",
  "rand 0.9.2",
  "rayon",
+ "rstest",
  "serde",
  "serde_json",
  "smallvec",

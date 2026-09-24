@@ -1,3 +1,5 @@
+mod single_row;
+
 use common_error::{DaftError, DaftResult};
 use daft_core::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -107,3 +109,5 @@ impl ScalarUDF for MergeMeanFunction {
 pub fn merge_mean(sum: ExprRef, counts: ExprRef) -> ExprRef {
     ScalarFn::builtin(MergeMeanFunction {}, vec![sum, counts]).into()
 }
+
+pub use single_row::single_row_value;

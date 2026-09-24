@@ -99,6 +99,24 @@ def test_groups_spread_over_files_answer_their_rows(tmp_path: pathlib.Path) -> N
     assert answer == {"k": [1, 2, 3, 4], "v": ["a", "b", "c", "d"]}
 
 
+def test_a_whole_frame_answers_its_row_when_the_other_files_hold_none(tmp_path: pathlib.Path) -> None:
+    # The filter leaves most files without rows, and their partial aggregations answer
+    # nothing; only the file holding the row may supply the value.
+    path = _write_files(tmp_path, [{"k": [i] * 100, "v": list(range(i * 100, i * 100 + 100))} for i in range(4)])
+    df = daft.read_parquet(path).where((col("k") == 3) & (col("v") == 350))
+
+    answers = [df.agg(single_value(col("v"))).to_pydict()["v"] for _ in range(5)]
+
+    assert answers == [[350]] * 5
+
+
+def test_a_whole_frame_whose_rows_are_in_different_files_fails_the_query(tmp_path: pathlib.Path) -> None:
+    path = _write_files(tmp_path, [{"v": [10]}, {"v": [20]}])
+
+    with pytest.raises(DaftCardinalityError):
+        daft.read_parquet(path).agg(single_value(col("v"))).collect()
+
+
 @pytest.mark.parametrize(
     "v",
     [pytest.param([10, 20, 30], id="numeric"), pytest.param(["a", "b", "c"], id="string")],

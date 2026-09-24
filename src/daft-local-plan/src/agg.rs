@@ -6,7 +6,7 @@ use daft_core::{
 use daft_dsl::{
     AggExpr, ApproxPercentileParams, ExprRef, SketchType, bound_col,
     expr::bound_expr::{BoundAggExpr, BoundExpr},
-    functions::agg::merge_mean,
+    functions::agg::{merge_mean, single_row_value},
     lit, null_lit,
 };
 use daft_functions::numeric::sqrt;
@@ -103,6 +103,13 @@ pub fn populate_aggregation_stages_bound_with_schema(
             )?
         };
     }
+
+    // Every global single-value term counts the rows of its input, and counting any one
+    // column counts them all, so the terms count the same column and share one count.
+    let single_value_rows_input = aggregations.iter().find_map(|agg| match agg.as_ref() {
+        AggExpr::SingleValue(expr) => Some(expr.clone()),
+        _ => None,
+    });
 
     for agg_expr in aggregations {
         let output_field = agg_expr.as_ref().to_field(schema)?;
@@ -286,8 +293,19 @@ pub fn populate_aggregation_stages_bound_with_schema(
                 let global_any_col = second_stage!(AggExpr::AnyValue(any_col, *ignore_nulls));
                 final_stage(global_any_col);
             }
-            // Each partition answers its group's single row, so a group whose rows
-            // arrive from two partitions is caught when the answers are combined.
+            // Each partial answers its group's single row, so a group whose rows arrive in
+            // two partials is caught when the partials are combined. A grouped partial holds
+            // only groups it saw rows of, so combining its answers suffices. A global partial
+            // over no rows still answers one (null) row, so there each partial also counts
+            // its rows: an empty partial counts zero and its null is never taken for the value.
+            AggExpr::SingleValue(expr) if group_by.is_empty() => {
+                let single_col = first_stage!(AggExpr::SingleValue(expr.clone()));
+                let rows_input = single_value_rows_input.as_ref().unwrap_or(expr).clone();
+                let rows_col = first_stage!(AggExpr::Count(rows_input, CountMode::All));
+                let value_col = second_stage!(AggExpr::AnyValue(single_col, true));
+                let total_rows_col = second_stage!(AggExpr::Sum(rows_col));
+                final_stage(single_row_value(value_col, total_rows_col));
+            }
             AggExpr::SingleValue(expr) => {
                 let single_col = first_stage!(AggExpr::SingleValue(expr.clone()));
                 let global_single_col = second_stage!(AggExpr::SingleValue(single_col));

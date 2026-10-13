@@ -151,6 +151,16 @@ def test_a_constant_filter_reads_no_data_file(
     assert counted == []
 
 
+def test_an_overwrite_that_changes_nothing_commits_nothing(local_catalog: Catalog) -> None:
+    table = _table(local_catalog, UNPARTITIONED_PARTITION_SPEC, SEED)
+    before = (snapshot_count(table), _rows(table))
+
+    result = _frame([]).write_iceberg(table, mode="overwrite", overwrite_filter=col("v") > 1_000)
+
+    assert result.count_rows() == 0
+    assert (snapshot_count(table), _rows(table)) == before
+
+
 def test_a_row_the_filter_is_null_on_is_kept(local_catalog: Catalog) -> None:
     table = _table(local_catalog, UNPARTITIONED_PARTITION_SPEC, [[(None, "b", 2), (10, "a", 1), (3, "a", 1)]])
     scope = (col("id") > 5) | (col("id").is_null() & (col("v") == 1))

@@ -3,9 +3,10 @@
 //! A request is turned into a logical plan (deserialized directly, or planned
 //! from text against the server session), optimized *on the server* so scan
 //! planning and pruning run next to the data, translated to a local physical
-//! plan, and driven through the streaming execution engine. Results are
-//! encoded into wire messages as they are produced; a metadata-only terminal
-//! message carries execution statistics.
+//! plan, and driven through the streaming execution engine. The result's
+//! schema, fixed by its plan, is sent as soon as planning returns; results are
+//! encoded into wire messages as they are produced, each matching that schema;
+//! a metadata-only terminal message carries execution statistics.
 //!
 //! Cancellation is cooperative: the per-query token (tripped by an explicit
 //! cancel action, the time limit, or the server's drain) and the receiver side
@@ -555,13 +556,20 @@ async fn run_query_inner(
         cancel.clone(),
     )
     .await?;
+    // The plan fixes the result's columns, so its schema is handed over as soon
+    // as planning returns, before any work runs: whatever ends the query after
+    // this point is read after the schema, as a local result raises it on read.
+    let schema = optimized.schema();
+    let mut encoder = BatchEncoder::try_new(&schema)?;
+    if !sink.deliver(encoder.schema_message(&schema)?, cancel).await {
+        return Err(ServeError::Cancelled(query_id));
+    }
     // Translation reads in-memory data and may call into the interpreter;
     // keep it off the async runtime threads too.
     let setup = {
         let slot = slot.clone();
         tokio::task::spawn_blocking(move || -> ServeResult<_> {
             let _slot = slot;
-            let schema = optimized.schema();
             let optimized_plan = optimized.build();
             // Shipped sets are decoded first (pure engine work, no
             // interpreter); only referenced keys they do not cover are then
@@ -588,7 +596,7 @@ async fn run_query_inner(
                 }
             }
             let (local_plan, inputs) = translate(&optimized_plan, &all_psets)?;
-            Ok((schema, local_plan, inputs))
+            Ok((local_plan, inputs))
         })
         .await
         .map_err(|e| {
@@ -597,7 +605,7 @@ async fn run_query_inner(
             )))
         })??
     };
-    let (schema, local_plan, inputs) = setup;
+    let (local_plan, inputs) = setup;
     log::debug!("serve query {query_id}: setup complete");
 
     if cancel.is_cancelled() {
@@ -637,46 +645,30 @@ async fn run_query_inner(
     let mut results = enqueue_future.await?;
     log::debug!("serve query {query_id}: inputs enqueued");
 
-    // The stream's schema comes from the first produced partition rather
-    // than the logical plan: operators with runtime-derived output columns
-    // can order or type columns differently than planning predicted, and the
-    // wire schema must describe the batches actually sent. The plan schema
-    // is the fallback for empty results.
-    let first = tokio::select! {
-        () = cancel.cancelled() => {
-            executor.cancel_plan(fingerprint);
-            return Err(ServeError::Cancelled(query_id));
-        }
-        partition = results.next_partition() => partition,
-    };
-    let stream_schema = first
-        .as_ref()
-        .map_or(schema, |partition| partition.schema());
-    let mut encoder = BatchEncoder::try_new(&stream_schema)?;
-    let schema_message = encoder.schema_message(&stream_schema)?;
-    if !sink.deliver(schema_message, cancel).await {
-        // Cancelled, or the client disconnected, before the stream started.
-        executor.cancel_plan(fingerprint);
-        return Err(ServeError::Cancelled(query_id));
-    }
-
     let mut rows: u64 = 0;
     let mut bytes: u64 = 0;
-    let mut pending = first;
     loop {
-        let partition = match pending.take() {
-            Some(partition) => Some(partition),
-            None => tokio::select! {
-                () = cancel.cancelled() => {
-                    executor.cancel_plan(fingerprint);
-                    return Err(ServeError::Cancelled(query_id));
-                }
-                partition = results.next_partition() => partition,
-            },
+        let partition = tokio::select! {
+            () = cancel.cancelled() => {
+                executor.cancel_plan(fingerprint);
+                return Err(ServeError::Cancelled(query_id));
+            }
+            partition = results.next_partition() => partition,
         };
         let Some(partition) = partition else {
             break;
         };
+        // The schema already handed over describes every part; a part that
+        // differs is never sent, since a reader would fail on it partway.
+        if *partition.schema() != *schema {
+            executor.cancel_plan(fingerprint);
+            return Err(ServeError::Execution(
+                common_error::DaftError::InternalError(format!(
+                    "a result part's schema {} differs from its plan's {schema}",
+                    partition.schema()
+                )),
+            ));
+        }
         rows += partition.len() as u64;
         for batch in partition.record_batches() {
             for message in encoder.encode(batch)? {

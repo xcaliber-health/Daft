@@ -85,14 +85,42 @@ This call will then return a DataFrame containing the operations that were perfo
 
 ``` {title="Output"}
 
-╭───────────┬───────┬───────────┬────────────────────────────────╮
-│ operation ┆ rows  ┆ file_size ┆ file_name                      │
-│ ---       ┆ ---   ┆ ---       ┆ ---                            │
-│ Utf8      ┆ Int64 ┆ Int64     ┆ Utf8                           │
-╞═══════════╪═══════╪═══════════╪════════════════════════════════╡
-│ ADD       ┆ 5     ┆ 707       ┆ 2f1a2bb1-3e64-49da-accd-1074e… │
-╰───────────┴───────┴───────────┴────────────────────────────────╯
+╭───────────┬───────┬───────────┬────────────────────────────────┬──────────────┬───────────╮
+│ operation ┆ rows  ┆ file_size ┆ file_name                      ┆ rows_removed ┆ rewritten │
+│ ---       ┆ ---   ┆ ---       ┆ ---                            ┆ ---          ┆ ---       │
+│ Utf8      ┆ Int64 ┆ Int64     ┆ Utf8                           ┆ Int64        ┆ Bool      │
+╞═══════════╪═══════╪═══════════╪════════════════════════════════╪══════════════╪═══════════╡
+│ ADD       ┆ 5     ┆ 707       ┆ 2f1a2bb1-3e64-49da-accd-1074e… ┆ None         ┆ false     │
+╰───────────┴───────┴───────────┴────────────────────────────────┴──────────────┴───────────╯
 ```
+
+Each row states one file's own facts. A `DELETE` row's `rows_removed` counts how many of that file's live rows the
+write removed; an `ADD` row's `rewritten` says whether the file holds rows kept from a file the write replaced,
+rather than the write's new rows. A partitioned table's rows also carry the file's `partitioning` values.
+
+### Replacing the rows a filter selects
+
+`mode="overwrite"` with `overwrite_filter` replaces only the existing rows on which the filter is true, and writes the
+new rows, in one snapshot:
+
+=== "🐍 Python"
+
+    ```python
+    from daft import col
+
+    df.write_iceberg(table, mode="overwrite", overwrite_filter=col("day") == "2026-10-13")
+    ```
+
+- A row on which the filter is false or null is kept, as SQL's `DELETE … WHERE` keeps it.
+- A file every live row of which matches is removed whole; a file only some of whose rows match is rewritten without
+  them, so the result's rows written are the `rows` of the `ADD` rows whose `rewritten` is false.
+- Every new row must satisfy the filter, or the write fails before anything is committed.
+- The commit is checked against commits made since the write was planned, under the table property
+  `write.delete.isolation-level`. Under `serializable` (the default), a concurrent commit that added rows the filter
+  may select refuses the write; under `snapshot`, only one that removed or added deletes to a file the write replaces
+  does. A refusal raises `daft.io.iceberg.WriteConflict` and commits nothing, so the write may be run again.
+
+It is copy-on-write, on the main branch, and requires pyiceberg 0.11 or later.
 
 ## Checkpointing
 

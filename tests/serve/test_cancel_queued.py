@@ -2,11 +2,15 @@
 
 A queued query is cancellable by its id from the moment it is accepted: the
 cancel is accepted, the query's client is answered at once, and the query
-never runs. Ownership is unchanged, so another caller cannot cancel it.
+never runs. Ownership is unchanged, so another caller cannot cancel it. A
+client that goes away while its query is queued takes the query with it.
 """
 
 from __future__ import annotations
 
+import subprocess
+import sys
+import textwrap
 import threading
 import time
 from collections.abc import Iterator
@@ -131,3 +135,57 @@ def test_cancelling_a_finished_query_answers_false(one_slot_server: DaftServeSer
     list(result)
 
     assert alpha.cancel_query("done") is False
+
+
+def test_a_client_gone_while_its_query_is_queued_takes_the_query_with_it(
+    one_slot_server: DaftServeServer, tmp_path: pathlib.Path
+) -> None:
+    alpha = RemoteRunner(one_slot_server.address(), token="tok-alpha").client
+    holder = alpha.run_plan(_holding_df(tmp_path)._builder._builder, {}, "holder", results_buffer_size=1)
+    path = str(tmp_path / "gone.parquet")
+    daft.from_pydict({"v": [1]}).write_parquet(path, write_mode="overwrite")
+    marker = tmp_path / "ran"
+    # The client runs in its own process, so it can be killed while its query waits.
+    script = textwrap.dedent(
+        """
+        import sys
+        import daft
+        from daft import col
+        from daft.runners.remote_runner import RemoteRunner
+
+        address, path, marker = sys.argv[1:4]
+
+        @daft.func(return_dtype=daft.DataType.int64())
+        def mark(v: int) -> int:
+            with open(marker, "w") as written:
+                written.write("ran")
+            return v
+
+        df = daft.read_parquet(path).select(mark(col("v")).alias("v"))
+        print("SUBMITTING", flush=True)
+        RemoteRunner(address, token="tok-alpha").client.run_plan(df._builder._builder, {}, "gone", results_buffer_size=1)
+        """
+    )
+    client = subprocess.Popen(
+        [sys.executable, "-c", script, one_slot_server.address(), path, str(marker)],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert client.stdout is not None
+    assert client.stdout.readline().strip() == "SUBMITTING"
+    deadline = time.monotonic() + 10
+    while one_slot_server.active_queries() < 2:
+        assert time.monotonic() < deadline, "the queued query never reached the server"
+        time.sleep(0.05)
+
+    client.kill()
+    client.wait(timeout=10)
+
+    # It leaves the queue while the slot is still held.
+    deadline = time.monotonic() + 10
+    while one_slot_server.active_queries() > 1:
+        assert time.monotonic() < deadline, "the abandoned query stayed queued"
+        time.sleep(0.05)
+    del holder
+    time.sleep(1.0)
+    assert not marker.exists()

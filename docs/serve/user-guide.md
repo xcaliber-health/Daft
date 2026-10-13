@@ -464,6 +464,28 @@ If `query_timeout_secs` is set (server-wide or per tenant), any query that runs
 too long is stopped and the client gets a clear timeout error. It's off by
 default.
 
+### Watching queries with subscribers
+
+Subscribers attached in the server process (`daft.attach_subscriber(...)`) see
+every served query, under the query id its client chose. They get the same
+events as for a query run in-process, plus one more at the start:
+
+1. `QueryQueued`: the server accepted the request and it is waiting for a
+   slot. It names the `lane` (`plan`, `sql` or `request`), the request's
+   `kind` (for requests to your host), and the `caller` (the tenant name, or
+   `None` without tenants).
+2. `QueryStarted`: the query got its slot and its plan exists.
+   `metadata.queued_seconds` is how long it waited (it is `None` in-process).
+3. The optimization and execution events, as in-process.
+4. `QueryFinished`, on every way a query ends: completed, failed, cancelled,
+   timed out, or abandoned by its client. `result.rows_returned` and
+   `result.bytes_returned` count the rows handed to the client and their
+   in-memory size, the same way as in-process.
+
+A query cancelled while it waits reports `QueryQueued` then `QueryFinished`
+(`Canceled`), and never starts. With no subscriber attached, the server does
+no reporting work.
+
 ### Shutting down cleanly
 
 When the server receives a stop signal (`Ctrl-C`, or `SIGTERM` from an

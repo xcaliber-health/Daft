@@ -17,7 +17,7 @@ pub struct PyQueryMetadata(pub(crate) Arc<QueryMetadata>);
 #[pymethods]
 impl PyQueryMetadata {
     #[new]
-    #[pyo3(signature = (output_schema, unoptimized_plan, runner, ray_dashboard_url=None, entrypoint=None, python_version=None, daft_version=None, ray_version=None))]
+    #[pyo3(signature = (output_schema, unoptimized_plan, runner, ray_dashboard_url=None, entrypoint=None, python_version=None, daft_version=None, ray_version=None, queued_seconds=None))]
     #[allow(clippy::too_many_arguments)]
     fn __new__(
         output_schema: PySchema,
@@ -28,6 +28,7 @@ impl PyQueryMetadata {
         python_version: Option<String>,
         daft_version: Option<String>,
         ray_version: Option<String>,
+        queued_seconds: Option<f64>,
     ) -> Self {
         Self(Arc::new(QueryMetadata {
             output_schema: output_schema.into(),
@@ -38,6 +39,7 @@ impl PyQueryMetadata {
             python_version,
             daft_version,
             ray_version,
+            queued_seconds,
         }))
     }
     #[getter]
@@ -72,6 +74,11 @@ impl PyQueryMetadata {
     pub fn ray_version(&self) -> Option<String> {
         self.0.ray_version.clone()
     }
+    /// Seconds a served query waited for an execution slot; `None` in-process.
+    #[getter]
+    pub fn queued_seconds(&self) -> Option<f64> {
+        self.0.queued_seconds
+    }
 }
 
 #[pyclass(frozen, from_py_object)]
@@ -82,11 +89,18 @@ pub struct PyQueryResult(pub(crate) Arc<QueryResult>);
 impl PyQueryResult {
     // Query Result contains the final state of a query, and if there is any error, contains an error message
     #[new]
-    #[pyo3(signature = (end_state, error_message))]
-    fn __new__(end_state: QueryEndState, error_message: Option<String>) -> Self {
+    #[pyo3(signature = (end_state, error_message, rows_returned=None, bytes_returned=None))]
+    fn __new__(
+        end_state: QueryEndState,
+        error_message: Option<String>,
+        rows_returned: Option<u64>,
+        bytes_returned: Option<u64>,
+    ) -> Self {
         Self(Arc::new(QueryResult {
             end_state,
             error_message,
+            rows_returned,
+            bytes_returned,
         }))
     }
     #[getter]
@@ -96,6 +110,16 @@ impl PyQueryResult {
     #[getter]
     pub fn error_message(&self) -> Option<String> {
         self.0.error_message.clone()
+    }
+    /// Rows handed to the query's reader.
+    #[getter]
+    pub fn rows_returned(&self) -> Option<u64> {
+        self.0.rows_returned
+    }
+    /// In-memory size, in bytes, of the batches handed to the query's reader.
+    #[getter]
+    pub fn bytes_returned(&self) -> Option<u64> {
+        self.0.bytes_returned
     }
 }
 

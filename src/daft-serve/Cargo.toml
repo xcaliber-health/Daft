@@ -7,6 +7,7 @@ async-channel = "2.5.0"
 async-stream = {workspace = true}
 common-daft-config = {path = "../common/daft-config", default-features = false}
 common-error = {path = "../common/error", default-features = false}
+common-metrics = {path = "../common/metrics", default-features = false}
 common-py-serde = {path = "../common/py-serde", default-features = false}
 common-runtime = {path = "../common/runtime", default-features = false}
 common-treenode = {path = "../common/treenode", default-features = false}
@@ -27,15 +28,19 @@ serde = {workspace = true, features = ["rc"]}
 thiserror = {workspace = true}
 tokio = {workspace = true}
 tokio-util = {workspace = true}
-uuid = {workspace = true}
 tonic = {workspace = true}
 tonic-health = {workspace = true}
+uuid = {workspace = true}
+
+[dev-dependencies]
+rstest = {workspace = true}
 
 [features]
 python = [
   "dep:pyo3",
   "common-daft-config/python",
   "common-error/python",
+  "common-metrics/python",
   "common-py-serde/python",
   "common-runtime/python",
   "daft-context/python",

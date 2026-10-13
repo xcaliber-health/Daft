@@ -14,6 +14,7 @@
 //! - [`admission`] — concurrent-query admission control
 //! - [`registry`] — running-query registry for cross-connection cancel
 //! - [`error`] — typed errors and their transport mapping
+//! - [`lifecycle`] — a served query's lifecycle events
 //! - `server` / `execute` — the serving endpoint and query driver
 //! - `client` — the connecting side, decoding result streams
 
@@ -21,6 +22,7 @@ pub mod admission;
 pub mod auth;
 pub mod codec;
 pub mod error;
+pub mod lifecycle;
 pub mod registry;
 pub mod wire;
 

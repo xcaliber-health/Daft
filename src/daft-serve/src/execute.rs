@@ -29,6 +29,7 @@ use crate::{
     admission::AdmissionPermit,
     codec::{self, BatchEncoder},
     error::{ServeError, ServeResult},
+    lifecycle::{PlanningEvents, QueryLifecycle},
     registry::QueryGuard,
     wire::{ExplainResult, NamedPartitionSet, QueryPayload, QueryRequest, QueryStatsWire},
 };
@@ -130,15 +131,26 @@ pub fn payload_to_builder(
 ///
 /// Planning may call into the interpreter and, for textual or host requests,
 /// read catalogs over the network, so it runs on a blocking thread.
+///
+/// `planning` reports the query's start and optimization as they happen; an
+/// explanation passes `None`, since it starts no query.
 async fn plan_off_runtime(
     payload: QueryPayload,
     planners: Planners,
     origin: RequestOrigin,
     exec_config: Arc<DaftExecutionConfig>,
+    planning: Option<PlanningEvents>,
 ) -> ServeResult<LogicalPlanBuilder> {
     tokio::task::spawn_blocking(move || -> ServeResult<_> {
         let builder = payload_to_builder(&payload, &planners, &origin)?;
-        Ok(builder.optimize(exec_config)?)
+        if let Some(events) = &planning {
+            events.started(&builder);
+        }
+        let optimized = builder.optimize(exec_config)?;
+        if let Some(events) = &planning {
+            events.optimized(&optimized);
+        }
+        Ok(optimized)
     })
     .await
     .map_err(|e| {
@@ -166,7 +178,7 @@ pub async fn explain(
 ) -> ServeResult<ExplainResult> {
     let exec_config = resolve_exec_config(&request)?;
     let query_id = origin.query_id.clone();
-    let planning = plan_off_runtime(request.payload, planners, origin, exec_config);
+    let planning = plan_off_runtime(request.payload, planners, origin, exec_config, None);
     let bounded = async {
         if timeout_secs > 0 {
             tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), planning)
@@ -287,14 +299,16 @@ pub struct QueryBounds {
     pub result_buffer_size: usize,
 }
 
-/// What an admitted query holds until it finishes: its execution slot and its
-/// registry entry.
+/// What an admitted query holds until it finishes: its execution slot, its
+/// registry entry, and its lifecycle reporting.
 #[derive(Debug)]
 pub struct QueryHold {
     /// The execution slot; dropping it frees the slot.
     pub permit: AdmissionPermit,
     /// The registry entry; dropping it deregisters the query.
     pub guard: QueryGuard,
+    /// The query's lifecycle events; its end is reported when the query ends.
+    pub lifecycle: QueryLifecycle,
 }
 
 /// Runs one admitted query, sending encoded messages into `tx`.
@@ -313,8 +327,21 @@ pub async fn run_query(
     tx: async_channel::Sender<Result<FlightData, Status>>,
     bounds: QueryBounds,
 ) {
+    let QueryHold {
+        permit,
+        guard,
+        mut lifecycle,
+    } = hold;
     let query_id = request.query_id.clone();
-    let inner = run_query_inner(request, planners, caller, &cancel, &tx, bounds);
+    let inner = run_query_inner(
+        request,
+        planners,
+        caller,
+        &cancel,
+        &tx,
+        bounds,
+        &mut lifecycle,
+    );
     let result = if bounds.timeout_secs > 0 {
         match tokio::time::timeout(std::time::Duration::from_secs(bounds.timeout_secs), inner).await
         {
@@ -327,13 +354,17 @@ pub async fn run_query(
     } else {
         inner.await
     };
-    drop(hold);
-    if let Err(err) = result {
-        let err = if cancel.is_cancelled() && !matches!(err, ServeError::Timeout { .. }) {
+    drop(guard);
+    drop(permit);
+    let result = result.map_err(|err| {
+        if cancel.is_cancelled() && !matches!(err, ServeError::Timeout { .. }) {
             ServeError::Cancelled(query_id)
         } else {
             err
-        };
+        }
+    });
+    lifecycle.finish(&result);
+    if let Err(err) = result {
         // A send failure means the client is gone; nothing left to notify.
         let _ = tx.send(Err(err.into())).await;
     }
@@ -346,6 +377,7 @@ async fn run_query_inner(
     cancel: &CancellationToken,
     tx: &async_channel::Sender<Result<FlightData, Status>>,
     bounds: QueryBounds,
+    lifecycle: &mut QueryLifecycle,
 ) -> ServeResult<()> {
     let exec_config = resolve_exec_config(&request)?;
     let maintain_order = exec_config.maintain_order;
@@ -361,7 +393,14 @@ async fn run_query_inner(
         query_id: query_id.clone(),
         caller,
     };
-    let optimized = plan_off_runtime(payload, planners, origin, exec_config.clone()).await?;
+    let optimized = plan_off_runtime(
+        payload,
+        planners,
+        origin,
+        exec_config.clone(),
+        lifecycle.planning(),
+    )
+    .await?;
     // Translation reads in-memory data and may call into the interpreter;
     // keep it off the async runtime threads too.
     let setup = {
@@ -460,9 +499,9 @@ async fn run_query_inner(
     let mut encoder = BatchEncoder::try_new(&stream_schema)?;
     let schema_message = encoder.schema_message(&stream_schema)?;
     if tx.send(Ok(schema_message)).await.is_err() {
-        // Client disconnected before the stream started.
+        // Client disconnected before the stream started: the query is cancelled.
         executor.cancel_plan(fingerprint);
-        return Ok(());
+        return Err(ServeError::Cancelled(query_id));
     }
 
     let mut rows: u64 = 0;
@@ -487,12 +526,13 @@ async fn run_query_inner(
             for message in encoder.encode(batch)? {
                 bytes += message.data_body.len() as u64;
                 if tx.send(Ok(message)).await.is_err() {
-                    // Client disconnected mid-stream; abort execution.
+                    // Client disconnected mid-stream: the query is cancelled.
                     executor.cancel_plan(fingerprint);
-                    return Ok(());
+                    return Err(ServeError::Cancelled(query_id));
                 }
             }
         }
+        lifecycle.returned(partition.len() as u64, partition.size_bytes() as u64);
     }
 
     let stats = executor.try_finish(fingerprint, input_id)?.await?;

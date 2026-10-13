@@ -25,6 +25,7 @@ if TYPE_CHECKING:
         ProcessStats,
         QueryFinished,
         QueryHeartbeat,
+        QueryQueued,
         QueryStarted,
         Stats,
     )
@@ -186,9 +187,16 @@ class EventLogSubscriber(Subscriber):
 
     # Query lifecycle
 
+    def on_query_queued(self, event: QueryQueued) -> None:
+        self._write_event(
+            event.query_id,
+            "query_queued",
+            {"lane": event.lane, "kind": event.kind, "caller": event.caller},
+        )
+
     def on_query_started(self, event: QueryStarted) -> None:
         self._query_starts[event.query_id] = _mono_ms()
-        payload = {
+        payload: dict[str, str | float | None] = {
             "plan": event.metadata.unoptimized_plan,
             "runner": event.metadata.runner,
             "entrypoint": event.metadata.entrypoint,
@@ -197,6 +205,8 @@ class EventLogSubscriber(Subscriber):
         }
         if event.metadata.ray_version is not None:
             payload["runner_version"] = event.metadata.ray_version
+        if event.metadata.queued_seconds is not None:
+            payload["queued_seconds"] = event.metadata.queued_seconds
 
         self._write_event(
             event.query_id,
@@ -218,6 +228,10 @@ class EventLogSubscriber(Subscriber):
         if duration_ms is not None:
             payload["duration_ms"] = round(duration_ms)
         payload["state"] = query_state_str(event.result.end_state)
+        if event.result.rows_returned is not None:
+            payload["rows_returned"] = event.result.rows_returned
+        if event.result.bytes_returned is not None:
+            payload["bytes_returned"] = event.result.bytes_returned
 
         self._write_event(event.query_id, "query_ended", payload)
         self._clear_query_state(event.query_id)

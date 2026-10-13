@@ -17,6 +17,8 @@ from daft.subscribers.events import (
     OptimizationCompleted,
     OptimizationStarted,
     QueryFinished,
+    QueryQueued,
+    QueryStarted,
 )
 from tests.conftest import get_tests_daft_runner_name
 
@@ -85,6 +87,36 @@ def test_event_log_subscriber_writes_query_lifecycle_events(tmp_path):
     assert query_ended["query_id"] == query_id
     assert query_ended["state"] == "Finished"
     assert query_ended["duration_ms"] >= 0
+
+
+def test_event_log_subscriber_writes_a_served_query_lifecycle(tmp_path):
+    subscriber = EventLogSubscriber(tmp_path)
+    query_id = "q_served"
+    df = daft.from_pydict({"x": [1, 2, 3]})
+    metadata = PyQueryMetadata(df.schema()._schema, df._builder.repr_json(), "Serve (Swordfish)", queued_seconds=0.25)
+
+    try:
+        subscriber.on_event(QueryQueued(query_id, timestamp=0.0, lane="request", kind="echo", caller="svc"))
+        subscriber.on_event(QueryStarted(query_id, metadata))
+        subscriber.on_event(
+            QueryFinished(
+                query_id,
+                PyQueryResult(QueryEndState.Finished, "Query finished", rows_returned=3, bytes_returned=24),
+                duration_ms=None,
+            )
+        )
+    finally:
+        subscriber.close()
+
+    events = _load_events(tmp_path / query_id / "events.jsonl")
+    assert [event["event"] for event in events] == ["event_log_started", "query_queued", "query_started", "query_ended"]
+    assert {key: events[1][key] for key in ("lane", "kind", "caller")} == {
+        "lane": "request",
+        "kind": "echo",
+        "caller": "svc",
+    }
+    assert events[2]["queued_seconds"] == 0.25
+    assert (events[3]["rows_returned"], events[3]["bytes_returned"]) == (3, 24)
 
 
 def test_event_log_subscriber_computes_execution_duration_locally(tmp_path):

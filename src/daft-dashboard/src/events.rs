@@ -14,6 +14,17 @@ pub struct EventLogStarted {
     pub daft_version: String,
 }
 
+/// A served query accepted before it waits for an execution slot.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct QueryQueued {
+    pub query_id: String,
+    pub timestamp: f64,
+    pub lane: String,
+    pub kind: Option<String>,
+    pub caller: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct QueryStarted {
     pub query_id: String,
@@ -153,6 +164,7 @@ pub struct ProcessStats {
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
     EventLogStarted(EventLogStarted),
+    QueryQueued(QueryQueued),
     QueryStarted(QueryStarted),
     QueryEnded(QueryEnded),
     OptimizationStarted(OptimizationStarted),

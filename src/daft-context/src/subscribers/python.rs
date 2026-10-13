@@ -14,7 +14,7 @@ use crate::{
         events::{
             ExecEndEvent, ExecStartEvent, OperatorEndEvent, OperatorStartEvent,
             OptimizationCompleteEvent, OptimizationStartEvent, ProcessStatsEvent, QueryEndEvent,
-            QueryHeartbeatEvent, QueryStartEvent, StatsEvent,
+            QueryHeartbeatEvent, QueryQueuedEvent, QueryStartEvent, StatsEvent,
         },
     },
 };
@@ -63,6 +63,18 @@ fn build_operator_finished(py: Python<'_>, event: &OperatorEndEvent) -> PyResult
             event.operator.node_id,
             event.operator.name.as_ref(),
             event.operator.origin_node_id,
+        ))
+        .map(Into::into)
+}
+
+fn build_query_queued(py: Python<'_>, event: &QueryQueuedEvent) -> PyResult<Py<PyAny>> {
+    event_class(py, "QueryQueued")?
+        .call1((
+            event.header.query_id.to_string(),
+            event.header.timestamp_epoch_secs,
+            event.lane.as_str(),
+            event.kind.as_deref(),
+            event.caller.as_deref(),
         ))
         .map(Into::into)
 }
@@ -164,6 +176,7 @@ fn build_process_stats(py: Python<'_>, event: &ProcessStatsEvent) -> PyResult<Py
 
 fn build_py_event(py: Python<'_>, event: Event) -> PyResult<Option<Py<PyAny>>> {
     match event {
+        Event::QueryQueued(event) => build_query_queued(py, &event).map(Some),
         Event::QueryStart(event) => build_query_started(py, &event).map(Some),
         Event::QueryHeartbeat(event) => build_query_heartbeat(py, &event).map(Some),
         Event::QueryEnd(event) => build_query_finished(py, &event).map(Some),

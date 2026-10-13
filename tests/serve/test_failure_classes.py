@@ -76,17 +76,17 @@ class FailingSource(DataSource):
 
 
 @daft.udf(return_dtype=daft.DataType.int64())
-def explode(v: daft.Series) -> daft.Series:
+def fail_in_legacy_udf(v: daft.Series) -> daft.Series:
     raise KeyError("no such row")
 
 
 @daft.func.batch(return_dtype=daft.DataType.int64())
-def explode_batch(v: daft.Series) -> daft.Series:
+def fail_each_batch(v: daft.Series) -> daft.Series:
     raise KeyError("no such batch")
 
 
 @daft.func(return_dtype=daft.DataType.int64())
-def explode_rows(v: int) -> int:
+def fail_each_row(v: int) -> int:
     raise KeyError("no such row")
 
 
@@ -99,15 +99,15 @@ def _missing_column() -> daft.DataFrame:
 
 
 def _a_udf_failure() -> daft.DataFrame:
-    return daft.from_pydict({"v": [1]}).select(explode(col("v")))
+    return daft.from_pydict({"v": [1]}).select(fail_in_legacy_udf(col("v")))
 
 
 def _a_batch_failure() -> daft.DataFrame:
-    return daft.from_pydict({"v": [1]}).select(explode_batch(col("v")))
+    return daft.from_pydict({"v": [1]}).select(fail_each_batch(col("v")))
 
 
 def _row_failures() -> daft.DataFrame:
-    return daft.from_pydict({"v": [1]}).select(explode_rows(col("v")))
+    return daft.from_pydict({"v": [1]}).select(fail_each_row(col("v")))
 
 
 def _a_source_failure() -> daft.DataFrame:

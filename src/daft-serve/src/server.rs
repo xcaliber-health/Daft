@@ -355,7 +355,7 @@ type BoxedStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'sta
 /// Response stream that owns its execution task, so dropping the stream
 /// aborts the query.
 struct QueryResponseStream {
-    rx: Pin<Box<async_channel::Receiver<Result<FlightData, Status>>>>,
+    results: execute::ResultStream,
     _task: RuntimeTask<()>,
 }
 
@@ -366,7 +366,7 @@ impl Stream for QueryResponseStream {
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        self.get_mut().rx.as_mut().poll_next(cx)
+        Pin::new(&mut self.get_mut().results).poll_next(cx)
     }
 }
 
@@ -462,8 +462,7 @@ impl FlightService for DaftServeService {
         // Buffer a handful of encoded messages so encoding overlaps with
         // network sends without unbounded memory growth.
         let buffer = query.results_buffer_size.unwrap_or(8).clamp(1, 64);
-        let (tx, rx) = async_channel::bounded(buffer);
-        let sink = execute::ResultSink::new(tx, &rx);
+        let (sink, results) = execute::ResultSink::open(buffer);
         let planners = self.planners.clone();
         let bounds = execute::QueryBounds {
             timeout_secs: limits.query_timeout_secs,
@@ -483,7 +482,7 @@ impl FlightService for DaftServeService {
         // (client disconnect or completion) aborts the task, which drops the
         // engine instance and cancels its running pipeline.
         Ok(Response::new(Box::pin(QueryResponseStream {
-            rx: Box::pin(rx),
+            results,
             _task: task,
         })))
     }

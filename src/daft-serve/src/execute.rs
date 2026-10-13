@@ -12,10 +12,16 @@
 //! of the output channel (dropped when the client disconnects) both abort
 //! execution promptly, dropping the engine instance which cancels its running
 //! pipeline. A query waiting for its client to read is still cancelled at
-//! once, and a query that ends unfinished discards what its client has not
-//! read, so the client's next read raises why it ended.
+//! once, and a query that ends unfinished discards the rows its client has
+//! not read, so the client's next read raises why it ended. A schema not yet
+//! read is kept: a planned query hands over its schema before any failure.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll, ready},
+};
 
 use arrow_flight::FlightData;
 use common_daft_config::DaftExecutionConfig;
@@ -24,6 +30,7 @@ use daft_local_plan::translate;
 use daft_logical_plan::{LogicalPlan, LogicalPlanBuilder, PyLogicalPlanBuilder};
 use daft_micropartition::MicroPartitionRef;
 use daft_schema::schema::Schema;
+use futures::{FutureExt, Stream, channel::oneshot};
 use pyo3::{intern, prelude::*};
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
@@ -52,24 +59,39 @@ pub struct Planners {
 /// Where an admitted query's encoded results go, for its client to read at
 /// its own pace.
 ///
-/// Holds the sending half of the bounded results channel and a weak handle on
-/// its receiving half, which never keeps the channel open by itself.
+/// Holds the sending half of the bounded results channel, a weak handle on
+/// its receiving half, which never keeps the channel open by itself, and the
+/// slot for why the query ended, which its client reads after the results.
 pub struct ResultSink {
     tx: async_channel::Sender<Result<FlightData, Status>>,
     unread: async_channel::WeakReceiver<Result<FlightData, Status>>,
+    ending: oneshot::Sender<Status>,
+}
+
+/// What a query's client reads: its results, then why it ended, if it ended
+/// unfinished.
+pub struct ResultStream {
+    results: Pin<Box<async_channel::Receiver<Result<FlightData, Status>>>>,
+    ending: Option<oneshot::Receiver<Status>>,
 }
 
 impl ResultSink {
-    /// Sends into `tx`, whose receiving half `rx` the client's stream reads.
+    /// Opens a sink holding up to `buffer` results its client has not read,
+    /// and the stream its client reads them from.
     #[must_use]
-    pub fn new(
-        tx: async_channel::Sender<Result<FlightData, Status>>,
-        rx: &async_channel::Receiver<Result<FlightData, Status>>,
-    ) -> Self {
-        Self {
+    pub fn open(buffer: usize) -> (Self, ResultStream) {
+        let (tx, results) = async_channel::bounded(buffer);
+        let (ending, ended) = oneshot::channel();
+        let sink = Self {
             tx,
-            unread: rx.downgrade(),
-        }
+            unread: results.downgrade(),
+            ending,
+        };
+        let stream = ResultStream {
+            results: Box::pin(results),
+            ending: Some(ended),
+        };
+        (sink, stream)
     }
 
     /// Hands `message` to the client, waiting for room while it is not reading.
@@ -86,13 +108,49 @@ impl ResultSink {
 
     /// Ends the client's stream with `status`, discarding the results it has
     /// not read, so its next read raises why the query ended.
-    fn end(&self, status: Status) {
+    ///
+    /// The schema, when the client has not read it yet, is kept: a query that
+    /// was planned hands over its schema before any failure.
+    fn end(self, status: Status) {
         if let Some(unread) = self.unread.upgrade() {
+            let schema = unread.try_recv().ok().filter(is_schema);
             while unread.try_recv().is_ok() {}
+            if let Some(schema) = schema {
+                // Only the query sends, and the channel was just emptied, so
+                // there is room unless the client is gone.
+                let _ = self.tx.try_send(schema);
+            }
         }
-        // Only the query sends, and the channel was just emptied, so there is
-        // room unless the client is gone, when there is no one to tell.
-        let _ = self.tx.try_send(Err(status));
+        // Read once the results are, whatever room the channel has; a client
+        // that is gone has no one to tell.
+        let _ = self.ending.send(status);
+    }
+}
+
+/// Whether `message` is a result's schema rather than a part of its rows.
+fn is_schema(message: &Result<FlightData, Status>) -> bool {
+    message.as_ref().is_ok_and(|data| {
+        arrow_ipc::root_as_message(&data.data_header)
+            .is_ok_and(|header| header.header_type() == arrow_ipc::MessageHeader::Schema)
+    })
+}
+
+impl Stream for ResultStream {
+    type Item = Result<FlightData, Status>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if let Some(result) = ready!(this.results.as_mut().poll_next(cx)) {
+            return Poll::Ready(Some(result));
+        }
+        // Every result is read and the query is over: say why it ended, if
+        // it ended unfinished.
+        let Some(ending) = this.ending.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let ended = ready!(ending.poll_unpin(cx));
+        this.ending = None;
+        Poll::Ready(ended.ok().map(Err))
     }
 }
 

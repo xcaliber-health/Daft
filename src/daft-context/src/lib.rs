@@ -280,49 +280,37 @@ impl DaftContext {
 
 static DAFT_CONTEXT: OnceLock<DaftContext> = OnceLock::new();
 
-#[cfg(feature = "python")]
+/// Returns the process's engine context, set up on its first use.
+///
+/// Every caller gets the same context. When several threads use the engine
+/// for the first time at once, as the I/O threads of a fresh server answering
+/// a burst of requests do, one sets the context up and the others wait for
+/// it; none fails. Setting it up takes no interpreter lock, so a caller
+/// holding that lock may wait without deadlock.
 pub fn get_context() -> DaftContext {
-    match DAFT_CONTEXT.get() {
-        Some(ctx) => ctx.clone(),
-        None => {
-            use crate::subscribers::default_subscribers;
+    DAFT_CONTEXT.get_or_init(new_context).clone()
+}
 
-            let state = ContextState {
-                config: Config::from_env(),
-                subscribers: default_subscribers(),
-            };
-            let state = RwLock::new(state);
-            let state = Arc::new(state);
-            let ctx = DaftContext { state };
-
-            DAFT_CONTEXT
-                .set(ctx.clone())
-                .expect("Failed to set DaftContext");
-            ctx
-        }
+fn new_context() -> DaftContext {
+    let state = ContextState {
+        config: Config::from_env(),
+        subscribers: initial_subscribers(),
+    };
+    DaftContext {
+        state: Arc::new(RwLock::new(state)),
     }
+}
+
+#[cfg(feature = "python")]
+fn initial_subscribers() -> HashMap<String, Arc<dyn Subscriber>> {
+    crate::subscribers::default_subscribers()
 }
 
 // Non-Python builds are only used in Rust-only test runs (`cargo test`).
 // Production always enables the python feature.
 #[cfg(not(feature = "python"))]
-pub fn get_context() -> DaftContext {
-    match DAFT_CONTEXT.get() {
-        Some(ctx) => ctx.clone(),
-        None => {
-            let state = ContextState {
-                config: Config::from_env(),
-                subscribers: HashMap::new(),
-            };
-            let state = RwLock::new(state);
-            let state = Arc::new(state);
-            let ctx = DaftContext { state };
-
-            // If another thread already set the context, use theirs.
-            let _ = DAFT_CONTEXT.set(ctx);
-            DAFT_CONTEXT.get().unwrap().clone()
-        }
-    }
+fn initial_subscribers() -> HashMap<String, Arc<dyn Subscriber>> {
+    HashMap::new()
 }
 
 #[cfg(feature = "python")]
@@ -336,4 +324,41 @@ pub fn register_modules(parent: &Bound<PyModule>) -> PyResult<()> {
     parent.add_class::<python::PyQueryMetadata>()?;
     parent.add_class::<python::PyQueryResult>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Barrier};
+
+    use super::get_context;
+
+    #[test]
+    fn threads_using_the_engine_for_the_first_time_at_once_share_one_context() {
+        let threads = 16;
+        let start = Arc::new(Barrier::new(threads));
+        // Every thread is started before any is joined, so all reach the context at once.
+        let mut handles = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let start = start.clone();
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                get_context()
+            }));
+        }
+
+        let contexts: Vec<_> = handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .expect("a first use of the context never fails")
+            })
+            .collect();
+
+        assert!(
+            contexts
+                .iter()
+                .all(|ctx| Arc::ptr_eq(&ctx.state, &contexts[0].state))
+        );
+    }
 }

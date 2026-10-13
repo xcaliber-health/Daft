@@ -1,8 +1,7 @@
 import builtins
 import datetime
 from collections.abc import AsyncIterator, Callable
-from enum import Enum
-from typing import TYPE_CHECKING, Any, Concatenate, Literal, TypeAlias, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Concatenate, Literal, TypeAlias, TypeVar, final
 
 from typing_extensions import CapsuleType
 
@@ -31,7 +30,8 @@ if TYPE_CHECKING:
 
 R = TypeVar("R")
 
-class ImageMode(Enum):
+@final
+class ImageMode:
     """Supported image modes for Daft's image type.
 
     Warning:
@@ -41,34 +41,37 @@ class ImageMode(Enum):
     """
 
     #: 8-bit grayscale
-    L = 1
+    L: ClassVar[ImageMode]
 
     #: 8-bit grayscale + alpha
-    LA = 2
+    LA: ClassVar[ImageMode]
 
     #: 8-bit RGB
-    RGB = 3
+    RGB: ClassVar[ImageMode]
 
     #: 8-bit RGB + alpha
-    RGBA = 4
+    RGBA: ClassVar[ImageMode]
 
     #: 16-bit grayscale
-    L16 = 5
+    L16: ClassVar[ImageMode]
 
     #: 16-bit grayscale + alpha
-    LA16 = 6
+    LA16: ClassVar[ImageMode]
 
     #: 16-bit RGB
-    RGB16 = 7
+    RGB16: ClassVar[ImageMode]
 
     #: 16-bit RGB + alpha
-    RGBA16 = 8
+    RGBA16: ClassVar[ImageMode]
 
     #: 32-bit floating RGB
-    RGB32F = 9
+    RGB32F: ClassVar[ImageMode]
 
     #: 32-bit floating RGB + alpha
-    RGBA32F = 10
+    RGBA32F: ClassVar[ImageMode]
+
+    def __int__(self) -> int: ...
+    __hash__: ClassVar[None]  # type: ignore[assignment]
 
     @staticmethod
     def from_mode_string(mode: str) -> ImageMode:
@@ -80,13 +83,17 @@ class ImageMode(Enum):
                 return ``ImageMode.RGB``.
         """
 
-class ImageProperty(Enum):
+@final
+class ImageProperty:
     """Supported image properties for Daft's image type."""
 
-    Height = 1
-    Width = 2
-    Channel = 3
-    Mode = 4
+    Height: ClassVar[ImageProperty]
+    Width: ClassVar[ImageProperty]
+    Channel: ClassVar[ImageProperty]
+    Mode: ClassVar[ImageProperty]
+
+    def __int__(self) -> int: ...
+    __hash__: ClassVar[None]  # type: ignore[assignment]
 
     @staticmethod
     def from_property_string(attr: str) -> ImageProperty: ...
@@ -102,12 +109,6 @@ class PyWindowBoundary:
     def offset(n: int) -> PyWindowBoundary: ...
     @staticmethod
     def range_offset(n: PyExpr) -> PyWindowBoundary: ...
-
-class WindowFrameType(Enum):
-    """Represents the type of window frame (ROWS or RANGE)."""
-
-    Rows = 1
-    Range = 2
 
 class WindowFrame:
     """Represents a window frame specification."""
@@ -128,28 +129,36 @@ class WindowSpec:
     def with_frame(self, frame: WindowFrame) -> WindowSpec: ...
     def with_min_periods(self, min_periods: int) -> WindowSpec: ...
 
-class ImageFormat(Enum):
+@final
+class ImageFormat:
     """Supported image formats for Daft's image I/O."""
 
-    PNG = 1
-    JPEG = 2
-    TIFF = 3
-    GIF = 4
-    BMP = 5
+    PNG: ClassVar[ImageFormat]
+    JPEG: ClassVar[ImageFormat]
+    TIFF: ClassVar[ImageFormat]
+    GIF: ClassVar[ImageFormat]
+    BMP: ClassVar[ImageFormat]
+
+    def __int__(self) -> int: ...
+    __hash__: ClassVar[None]  # type: ignore[assignment]
 
     @staticmethod
     def from_format_string(mode: str) -> ImageFormat:
         """Create an ImageFormat from its string representation."""
 
-class JoinType(Enum):
+@final
+class JoinType:
     """Type of a join operation."""
 
-    Inner = 1
-    Left = 2
-    Right = 3
-    Outer = 4
-    Semi = 5
-    Anti = 6
+    Inner: ClassVar[JoinType]
+    Left: ClassVar[JoinType]
+    Right: ClassVar[JoinType]
+    Outer: ClassVar[JoinType]
+    Semi: ClassVar[JoinType]
+    Anti: ClassVar[JoinType]
+
+    def __int__(self) -> int: ...
+    __hash__: ClassVar[None]  # type: ignore[assignment]
 
     @staticmethod
     def from_join_type_str(join_type: str) -> JoinType:
@@ -161,14 +170,18 @@ class JoinType(Enum):
                 return ``JoinType.Inner``.
         """
 
-class JoinStrategy(Enum):
+@final
+class JoinStrategy:
     """Join strategy (algorithm) to use."""
 
-    Hash = 1
-    SortMerge = 2
-    Broadcast = 3
-    Cross = 4
-    KeyFiltering = 5
+    Hash: ClassVar[JoinStrategy]
+    SortMerge: ClassVar[JoinStrategy]
+    Broadcast: ClassVar[JoinStrategy]
+    Cross: ClassVar[JoinStrategy]
+    KeyFiltering: ClassVar[JoinStrategy]
+
+    def __int__(self) -> int: ...
+    __hash__: ClassVar[None]  # type: ignore[assignment]
 
     @staticmethod
     def from_join_strategy_str(join_strategy: str) -> JoinStrategy:
@@ -180,11 +193,16 @@ class JoinStrategy(Enum):
                 return ``JoinStrategy.SortMerge``.
         """
 
-class AsofJoinStrategy(Enum):
+@final
+class AsofJoinStrategy:
     """Asof join strategy."""
 
-    Backward = 1
-    Forward = 2
+    Backward: ClassVar[AsofJoinStrategy]
+    Forward: ClassVar[AsofJoinStrategy]
+    Nearest: ClassVar[AsofJoinStrategy]
+
+    def __int__(self) -> int: ...
+    __hash__: ClassVar[None]  # type: ignore[assignment]
 
     @staticmethod
     def from_asof_join_strategy_str(strategy: str) -> AsofJoinStrategy:
@@ -195,11 +213,16 @@ class AsofJoinStrategy(Enum):
             e.g. ``AsofJoinStrategy.from_asof_join_strategy_str("backward")`` would return ``AsofJoinStrategy.Backward``.
         """
 
-class JoinSide(Enum):
-    Left = 1
-    Right = 2
+@final
+class JoinSide:
+    Left: ClassVar[JoinSide]
+    Right: ClassVar[JoinSide]
 
-class CountMode(Enum):
+    def __int__(self) -> int: ...
+    __hash__: ClassVar[None]  # type: ignore[assignment]
+
+@final
+class CountMode:
     """Supported count modes for Daft's count aggregation.
 
     | All   - Count both non-null and null values.
@@ -207,9 +230,12 @@ class CountMode(Enum):
     | Null  - Count only null values.
     """
 
-    All = 1
-    Valid = 2
-    Null = 3
+    All: ClassVar[CountMode]
+    Valid: ClassVar[CountMode]
+    Null: ClassVar[CountMode]
+
+    def __int__(self) -> int: ...
+    __hash__: ClassVar[None]  # type: ignore[assignment]
 
     @staticmethod
     def from_count_mode_str(count_mode: str) -> CountMode:
@@ -244,21 +270,31 @@ class ResourceRequest:
     def __eq__(self, other: ResourceRequest) -> bool: ...  # type: ignore[override]
     def __ne__(self, other: ResourceRequest) -> bool: ...  # type: ignore[override]
 
-class FileFormat(Enum):
+@final
+class FileFormat:
     """Format of a file, e.g. Parquet, CSV, and JSON."""
 
-    Parquet = 1
-    Csv = 2
-    Json = 3
+    Parquet: ClassVar[FileFormat]
+    Csv: ClassVar[FileFormat]
+    Json: ClassVar[FileFormat]
+    Warc: ClassVar[FileFormat]
+    Text: ClassVar[FileFormat]
+
+    def __int__(self) -> int: ...
+    __hash__: ClassVar[None]  # type: ignore[assignment]
 
     def ext(self) -> str: ...
 
-class WriteMode(Enum):
+@final
+class WriteMode:
     """Mode for writing data to a file."""
 
-    Overwrite = 1
-    OverwritePartitions = 2
-    Append = 3
+    Overwrite: ClassVar[WriteMode]
+    OverwritePartitions: ClassVar[WriteMode]
+    Append: ClassVar[WriteMode]
+
+    def __int__(self) -> int: ...
+    __hash__: ClassVar[None]  # type: ignore[assignment]
 
     @staticmethod
     def from_str(mode: str) -> WriteMode: ...
@@ -1428,11 +1464,15 @@ class PyTimeUnit:
 
 ReduceReturnType: TypeAlias = tuple[Callable[..., Any], tuple[Any, ...]]
 
-class UnionMode(Enum):
+@final
+class UnionMode:
     """Union mode for Arrow union types."""
 
-    Sparse = 1
-    Dense = 2
+    Sparse: ClassVar[UnionMode]
+    Dense: ClassVar[UnionMode]
+
+    def __int__(self) -> int: ...
+    __hash__: ClassVar[None]  # type: ignore[assignment]
 
     @staticmethod
     def from_mode_string(mode: str) -> UnionMode: ...
@@ -1803,7 +1843,6 @@ def udaf_expr(
     state_field_dtypes: list[PyDataType],
     expr_args: list[PyExpr],
 ) -> PyExpr: ...
-def resolve_expr(expr: PyExpr, schema: PySchema) -> tuple[PyExpr, PyField]: ...
 def row_number() -> PyExpr: ...
 def rank() -> PyExpr: ...
 def dense_rank() -> PyExpr: ...
@@ -1825,30 +1864,6 @@ def sql_exec(
 def sql_expr(sql: str) -> PyExpr: ...
 def sql_datatype(sql: str) -> PyDataType: ...
 def list_sql_functions() -> list[SQLFunctionStub]: ...
-def connect_start(addr: str = "sc://0.0.0.0:0") -> ConnectionHandle: ...
-
-class ConnectionHandle:
-    def shutdown(self) -> None: ...
-    def port(self) -> int: ...
-
-# ---
-# expr.list namespace
-# ---
-def list_sort(expr: PyExpr, desc: PyExpr, nulls_first: PyExpr) -> PyExpr: ...
-def list_distinct(expr: PyExpr) -> PyExpr: ...
-def list_value_counts(expr: PyExpr) -> PyExpr: ...
-def list_join(expr: PyExpr, delimiter: PyExpr) -> PyExpr: ...
-def list_flatten(expr: PyExpr) -> PyExpr: ...
-def list_count(expr: PyExpr, mode: CountMode) -> PyExpr: ...
-def list_get(expr: PyExpr, idx: PyExpr, default: PyExpr) -> PyExpr: ...
-def list_sum(expr: PyExpr) -> PyExpr: ...
-def list_mean(expr: PyExpr) -> PyExpr: ...
-def list_min(expr: PyExpr) -> PyExpr: ...
-def list_max(expr: PyExpr) -> PyExpr: ...
-def list_bool_and(expr: PyExpr) -> PyExpr: ...
-def list_bool_or(expr: PyExpr) -> PyExpr: ...
-def list_slice(expr: PyExpr, start: PyExpr, end: PyExpr | None = None) -> PyExpr: ...
-def list_chunk(expr: PyExpr, size: int) -> PyExpr: ...
 
 class PySeries:
     @staticmethod
@@ -1944,8 +1959,6 @@ class PySeries:
 class PySeriesIterator:
     def __next__(self) -> Any: ...
     def __iter__(self) -> PySeriesIterator: ...
-
-class PyShowOptions: ...
 
 class OperatorMetrics:
     def inc_counter(
@@ -2228,15 +2241,23 @@ class PyCheckpointStore:
     def get_checkpointed_files(self) -> list[PyFileMetadata]: ...
     def mark_committed(self, ids: list[str]) -> None: ...
 
-class CheckpointStatus(Enum):
-    Staged = ...
-    Checkpointed = ...
-    Committed = ...
+@final
+class CheckpointStatus:
+    Staged: ClassVar[CheckpointStatus]
+    Checkpointed: ClassVar[CheckpointStatus]
+    Committed: ClassVar[CheckpointStatus]
 
-class CheckpointFileFormat(Enum):
-    Iceberg = ...
-    Parquet = ...
-    DeltaLake = ...
+    def __int__(self) -> int: ...
+    __hash__: ClassVar[None]  # type: ignore[assignment]
+
+@final
+class CheckpointFileFormat:
+    Iceberg: ClassVar[CheckpointFileFormat]
+    Parquet: ClassVar[CheckpointFileFormat]
+    DeltaLake: ClassVar[CheckpointFileFormat]
+
+    def __int__(self) -> int: ...
+    __hash__: ClassVar[None]  # type: ignore[assignment]
 
 class PyCheckpoint:
     id: str
@@ -2759,17 +2780,25 @@ class PyDaftEventLogConfig:
     @property
     def path(self) -> str: ...
 
-class StatType(Enum):
-    COUNT = 0
-    BYTES = 1
-    PERCENT = 2
-    FLOAT = 3
-    DURATION = 5
+@final
+class StatType:
+    COUNT: ClassVar[StatType]
+    BYTES: ClassVar[StatType]
+    PERCENT: ClassVar[StatType]
+    FLOAT: ClassVar[StatType]
+    DURATION: ClassVar[StatType]
 
-class QueryEndState(Enum):
-    Finished = 0
-    Canceled = 1
-    Failed = 2
+    def __int__(self) -> int: ...
+    __hash__: ClassVar[None]  # type: ignore[assignment]
+
+@final
+class QueryEndState:
+    Finished: ClassVar[QueryEndState]
+    Canceled: ClassVar[QueryEndState]
+    Failed: ClassVar[QueryEndState]
+
+    def __int__(self) -> int: ...
+    __hash__: ClassVar[None]  # type: ignore[assignment]
 
 class PyQueryMetadata:
     output_schema: PySchema
@@ -2976,7 +3005,6 @@ class PyScalarFunction:
     def __call__(self, *args: PyExpr, **kwargs: PyExpr) -> PyExpr: ...
 
 def get_function_from_registry(name: str) -> PyScalarFunction: ...
-def to_from_proto(builder: LogicalPlanBuilder) -> LogicalPlanBuilder: ...
 
 class PyFileReference:
     @staticmethod
@@ -3008,7 +3036,17 @@ class PyDaftFile:
     def __enter__(self) -> PyDaftFile: ...
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None: ...
 
+@final
 class PyMediaType:
+    Unknown: ClassVar[PyMediaType]
+    Video: ClassVar[PyMediaType]
+    Audio: ClassVar[PyMediaType]
+    Image: ClassVar[PyMediaType]
+    Hdf5: ClassVar[PyMediaType]
+
+    def __int__(self) -> int: ...
+    __hash__: ClassVar[None]  # type: ignore[assignment]
+
     @staticmethod
     def unknown() -> PyMediaType: ...
     @staticmethod

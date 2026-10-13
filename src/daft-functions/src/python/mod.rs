@@ -15,7 +15,7 @@ use pyo3::{
     wrap_pyfunction,
 };
 
-#[pyo3::pyclass]
+#[pyo3::pyclass(module = "daft.daft")]
 pub struct PyScalarFunction {
     pub inner: Arc<dyn ScalarFunctionFactory>,
 }
@@ -75,6 +75,7 @@ pub fn get_function_from_registry(name: &str) -> PyResult<PyScalarFunction> {
 
 pub fn register(parent: &Bound<PyModule>) -> PyResult<()> {
     parent.add_function(wrap_pyfunction!(get_function_from_registry, parent)?)?;
+    parent.add_class::<PyScalarFunction>()?;
 
     Ok(())
 }

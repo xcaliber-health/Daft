@@ -13,6 +13,7 @@
 //! - [`auth`] — bearer-token authentication
 //! - [`admission`] — concurrent-query admission control
 //! - [`registry`] — running-query registry for cross-connection cancel
+//! - [`connection`] — connections the server closes once its drain is over
 //! - [`error`] — typed errors and their transport mapping
 //! - [`lifecycle`] — a served query's lifecycle events
 //! - `server` / `execute` — the serving endpoint and query driver
@@ -22,6 +23,7 @@
 pub mod admission;
 pub mod auth;
 pub mod codec;
+pub mod connection;
 pub mod error;
 pub mod lifecycle;
 pub mod registry;

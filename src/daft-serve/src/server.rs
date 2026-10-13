@@ -23,12 +23,14 @@ use arrow_flight::{
 };
 use common_error::{DaftError, DaftResult};
 use common_runtime::RuntimeTask;
-use futures::Stream;
+use futures::{Stream, StreamExt};
+use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, transport::Server};
 
 use crate::{
     admission::{Admission, TenantAdmission},
     auth::{AUTHORIZATION_KEY, AuthPolicy},
+    connection::ClosableConnection,
     error::{ServeError, ServeResult},
     execute,
     lifecycle::QueryLifecycle,
@@ -461,6 +463,7 @@ impl FlightService for DaftServeService {
         // network sends without unbounded memory growth.
         let buffer = query.results_buffer_size.unwrap_or(8).clamp(1, 64);
         let (tx, rx) = async_channel::bounded(buffer);
+        let sink = execute::ResultSink::new(tx, &rx);
         let planners = self.planners.clone();
         let bounds = execute::QueryBounds {
             timeout_secs: limits.query_timeout_secs,
@@ -473,7 +476,7 @@ impl FlightService for DaftServeService {
                 guard,
                 lifecycle,
             };
-            execute::run_query(query, planners, tenant, cancel, hold, tx, bounds).await;
+            execute::run_query(query, planners, tenant, cancel, hold, sink, bounds).await;
         });
 
         // The response stream owns the execution task: dropping the stream
@@ -553,6 +556,13 @@ impl FlightService for DaftServeService {
     }
 }
 
+/// How long, after the drain cancels the queries still running, their clients
+/// have to hear so before the connections still open are closed.
+///
+/// A client reading its result hears its query's end at once; one holding a
+/// result without reading would keep its connection open for ever.
+const CLOSE_GRACE: Duration = Duration::from_secs(2);
+
 /// Cloneable signal half of a running server: initiates a graceful
 /// shutdown from any thread while another thread waits on the join half.
 #[derive(Clone)]
@@ -560,12 +570,15 @@ pub struct ServeShutdownHandle {
     registry: QueryRegistry,
     draining: Arc<AtomicBool>,
     shutdown_signal: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    closed: CancellationToken,
 }
 
 impl ServeShutdownHandle {
     /// Begins a graceful shutdown: refuse new queries, stop accepting
     /// connections, and after `drain_timeout` cancel any still-running
-    /// queries so the transport can finish. Idempotent; returns immediately.
+    /// queries. Connections still open [`CLOSE_GRACE`] later are closed, so
+    /// the transport finishes even when a client holds a result it does not
+    /// read. Idempotent; returns immediately.
     pub fn begin_shutdown(&self, drain_timeout: Duration) {
         self.draining.store(true, Ordering::Release);
         let signal = self
@@ -576,10 +589,19 @@ impl ServeShutdownHandle {
         if let Some(signal) = signal {
             let _ = signal.send(());
             let registry = self.registry.clone();
-            drop(common_runtime::get_io_runtime(true).spawn(async move {
-                tokio::time::sleep(drain_timeout).await;
-                registry.cancel_all();
-            }));
+            let closed = self.closed.clone();
+            // Detached: the drain must outlive this call, and a runtime task
+            // handle cancels its task when dropped.
+            drop(
+                common_runtime::get_io_runtime(true)
+                    .runtime
+                    .spawn(async move {
+                        tokio::time::sleep(drain_timeout).await;
+                        registry.cancel_all();
+                        tokio::time::sleep(CLOSE_GRACE).await;
+                        closed.cancel();
+                    }),
+            );
         }
     }
 
@@ -653,6 +675,8 @@ pub fn start_server(service: DaftServeService) -> ServeResult<ServeHandle> {
     let io_runtime = common_runtime::get_io_runtime(true);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let (addr_tx, addr_rx) = tokio::sync::oneshot::channel::<Result<SocketAddr, String>>();
+    let closed = CancellationToken::new();
+    let connections_closed = closed.clone();
 
     let server_task = io_runtime.spawn(async move {
         let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
@@ -673,7 +697,10 @@ pub fn start_server(service: DaftServeService) -> ServeResult<ServeHandle> {
 
         let incoming = tonic::transport::server::TcpIncoming::from(listener)
             .with_nodelay(Some(true))
-            .with_keepalive(None);
+            .with_keepalive(None)
+            .map(move |accepted| {
+                accepted.map(|io| ClosableConnection::new(io, connections_closed.clone()))
+            });
 
         let (health_reporter, health_service) = tonic_health::server::health_reporter();
         health_reporter
@@ -725,6 +752,7 @@ pub fn start_server(service: DaftServeService) -> ServeResult<ServeHandle> {
             registry,
             draining,
             shutdown_signal: Arc::new(std::sync::Mutex::new(Some(shutdown_tx))),
+            closed,
         },
         server_task: Some(server_task),
     })

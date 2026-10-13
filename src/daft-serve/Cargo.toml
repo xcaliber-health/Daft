@@ -35,6 +35,7 @@ uuid = {workspace = true}
 
 [dev-dependencies]
 rstest = {workspace = true}
+tokio = {workspace = true, features = ["io-util"]}
 
 [features]
 python = [

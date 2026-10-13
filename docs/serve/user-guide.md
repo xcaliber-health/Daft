@@ -485,11 +485,17 @@ slot (a query cancelled while waiting never runs):
 
 You can only cancel queries you started.
 
+A cancelled query ends at once, even if your client has stopped reading its
+result: it frees its slot straight away, and anything the server was still
+holding for you is discarded. The next read of that result raises `Cancelled`
+(after any parts already on their way to your client).
+
 ### Time limits
 
 If `query_timeout_secs` is set (server-wide or per tenant), any query that runs
 too long is stopped and the client gets a clear timeout error. It's off by
-default.
+default. As with a cancel, the query ends on time whether or not its client is
+reading.
 
 ### Watching queries with subscribers
 
@@ -521,7 +527,9 @@ orchestrator), it:
 1. Stops accepting new queries (new attempts get a "server is shutting down"
    error).
 2. Lets in-flight queries finish, for up to `drain_timeout_secs`.
-3. Cancels anything still running past that window and exits.
+3. Cancels anything still running past that window, gives clients two seconds
+   to hear so, then closes any connection still open and exits. A client that
+   holds a result without reading it cannot keep the server from stopping.
 
 This makes rolling restarts and Kubernetes deployments safe.
 
@@ -669,6 +677,7 @@ A failed query's `QueryFinished` event names the same kind in
 | `Timeout` | Query ran past its time limit. | Raise the limit or simplify the query. |
 | `Draining` | Server is shutting down. | Reconnect to a running server. |
 | `Cancelled` | Query was cancelled (by you or a disconnect). | Expected after a cancel. |
+| `Transport` | The connection failed, or the result ended before its query finished. | Retry against a running server. |
 
 ---
 

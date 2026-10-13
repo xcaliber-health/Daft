@@ -130,7 +130,11 @@ pub fn payload_to_builder(
 /// Plans and optimizes a request off the async runtime threads.
 ///
 /// Planning may call into the interpreter and, for textual or host requests,
-/// read catalogs over the network, so it runs on a blocking thread.
+/// read catalogs over the network, so it runs on a blocking thread. It holds
+/// `slot` until it returns: planning cannot be interrupted, so a query that
+/// ends while it plans, by its time limit, keeps its slot taken until the
+/// planning it started is done. Planning that returns after `cancel` trips
+/// stops there, without optimizing or reporting.
 ///
 /// `planning` reports the query's start and optimization as they happen; an
 /// explanation passes `None`, since it starts no query.
@@ -140,9 +144,15 @@ async fn plan_off_runtime(
     origin: RequestOrigin,
     exec_config: Arc<DaftExecutionConfig>,
     planning: Option<PlanningEvents>,
+    slot: AdmissionPermit,
+    cancel: CancellationToken,
 ) -> ServeResult<LogicalPlanBuilder> {
     tokio::task::spawn_blocking(move || -> ServeResult<_> {
+        let _slot = slot;
         let builder = payload_to_builder(&payload, &planners, &origin)?;
+        if cancel.is_cancelled() {
+            return Err(ServeError::Cancelled(origin.query_id));
+        }
         if let Some(events) = &planning {
             events.started(&builder);
         }
@@ -175,17 +185,30 @@ pub async fn explain(
     origin: RequestOrigin,
     cancel: &CancellationToken,
     timeout_secs: u64,
+    slot: AdmissionPermit,
 ) -> ServeResult<ExplainResult> {
     let exec_config = resolve_exec_config(&request)?;
     let query_id = origin.query_id.clone();
-    let planning = plan_off_runtime(request.payload, planners, origin, exec_config, None);
+    let planning = plan_off_runtime(
+        request.payload,
+        planners,
+        origin,
+        exec_config,
+        None,
+        slot,
+        cancel.clone(),
+    );
     let bounded = async {
         if timeout_secs > 0 {
             tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), planning)
                 .await
-                .map_err(|_| ServeError::Timeout {
-                    query_id: query_id.clone(),
-                    limit_secs: timeout_secs,
+                .map_err(|_| {
+                    // Planning still running stops when it returns; it keeps the slot until then.
+                    cancel.cancel();
+                    ServeError::Timeout {
+                        query_id: query_id.clone(),
+                        limit_secs: timeout_secs,
+                    }
                 })?
         } else {
             planning.await
@@ -337,19 +360,27 @@ pub async fn run_query(
         request,
         planners,
         caller,
-        &cancel,
-        &tx,
         bounds,
-        &mut lifecycle,
+        RunningQuery {
+            cancel: &cancel,
+            tx: &tx,
+            lifecycle: &mut lifecycle,
+            slot: &permit,
+        },
     );
     let result = if bounds.timeout_secs > 0 {
         match tokio::time::timeout(std::time::Duration::from_secs(bounds.timeout_secs), inner).await
         {
             Ok(result) => result,
-            Err(_) => Err(ServeError::Timeout {
-                query_id: query_id.clone(),
-                limit_secs: bounds.timeout_secs,
-            }),
+            Err(_) => {
+                // Work still running for the query stops at its next chance; work that cannot
+                // be interrupted keeps its share of the slot until it returns.
+                cancel.cancel();
+                Err(ServeError::Timeout {
+                    query_id: query_id.clone(),
+                    limit_secs: bounds.timeout_secs,
+                })
+            }
         }
     } else {
         inner.await
@@ -370,15 +401,29 @@ pub async fn run_query(
     }
 }
 
+/// What an admitted query's work shares while it runs: its cancellation, the
+/// sink of its results, its lifecycle reporting, and its slot, a share of which
+/// each piece of its work holds until that work returns.
+struct RunningQuery<'a> {
+    cancel: &'a CancellationToken,
+    tx: &'a async_channel::Sender<Result<FlightData, Status>>,
+    lifecycle: &'a mut QueryLifecycle,
+    slot: &'a AdmissionPermit,
+}
+
 async fn run_query_inner(
     request: QueryRequest,
     planners: Planners,
     caller: Option<String>,
-    cancel: &CancellationToken,
-    tx: &async_channel::Sender<Result<FlightData, Status>>,
     bounds: QueryBounds,
-    lifecycle: &mut QueryLifecycle,
+    running: RunningQuery<'_>,
 ) -> ServeResult<()> {
+    let RunningQuery {
+        cancel,
+        tx,
+        lifecycle,
+        slot,
+    } = running;
     let exec_config = resolve_exec_config(&request)?;
     let maintain_order = exec_config.maintain_order;
     let QueryRequest {
@@ -399,12 +444,16 @@ async fn run_query_inner(
         origin,
         exec_config.clone(),
         lifecycle.planning(),
+        slot.clone(),
+        cancel.clone(),
     )
     .await?;
     // Translation reads in-memory data and may call into the interpreter;
     // keep it off the async runtime threads too.
     let setup = {
+        let slot = slot.clone();
         tokio::task::spawn_blocking(move || -> ServeResult<_> {
+            let _slot = slot;
             let schema = optimized.schema();
             let optimized_plan = optimized.build();
             // Shipped sets are decoded first (pure engine work, no

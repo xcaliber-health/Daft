@@ -19,10 +19,14 @@ pub struct Admission {
     queue_timeout: Duration,
 }
 
-/// A held execution slot; dropping it frees the slot.
-#[derive(Debug)]
+/// A held execution slot, freed when its last holder drops it.
+///
+/// Work done for a query holds a clone for as long as it runs: work that
+/// cannot be interrupted, such as a request host's planning, keeps the slot
+/// taken until it returns, even after the query has ended for its client.
+#[derive(Debug, Clone)]
 pub struct AdmissionPermit {
-    _permit: OwnedSemaphorePermit,
+    _permit: Arc<OwnedSemaphorePermit>,
 }
 
 impl Admission {
@@ -69,7 +73,9 @@ impl Admission {
             () = cancel.cancelled() => Err(ServeError::Cancelled(query_id.to_string())),
             acquired = wait => {
                 let permit = acquired.map_err(|_| at_capacity())?.map_err(|_| at_capacity())?;
-                Ok(AdmissionPermit { _permit: permit })
+                Ok(AdmissionPermit {
+                    _permit: Arc::new(permit),
+                })
             }
         }
     }
@@ -246,6 +252,27 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn a_slot_is_freed_only_when_its_last_holder_drops_it() {
+        let admission = Admission::new(1, Duration::from_millis(20));
+        let held = admission
+            .acquire("q", &CancellationToken::new())
+            .await
+            .unwrap();
+        let still_working = held.clone();
+
+        drop(held);
+        let while_work_runs = admission.acquire("q", &CancellationToken::new()).await;
+        drop(still_working);
+        let after_work_ends = admission.acquire("q", &CancellationToken::new()).await;
+
+        assert!(matches!(
+            while_work_runs,
+            Err(ServeError::AtCapacity { .. })
+        ));
+        assert!(after_work_ends.is_ok());
     }
 
     #[tokio::test]

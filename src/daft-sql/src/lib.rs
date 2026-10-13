@@ -21,6 +21,7 @@ pub fn register_modules(parent: &Bound<PyModule>) -> PyResult<()> {
     parent.add_function(wrap_pyfunction!(python::sql_expr, parent)?)?;
     parent.add_function(wrap_pyfunction!(python::sql_datatype, parent)?)?;
     parent.add_function(wrap_pyfunction!(python::list_sql_functions, parent)?)?;
+    parent.add_class::<python::SQLFunctionStub>()?;
     Ok(())
 }
 

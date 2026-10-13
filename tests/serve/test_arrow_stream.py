@@ -4,7 +4,8 @@ A served result offers Arrow's stream interface, as a local frame does: any
 reader of it (pyarrow, DuckDB, polars) reads it part by part as it arrives,
 schema first, so an empty result still names its columns. Its columns convert
 as a local result's do. A failure partway ends the stream with its class as
-text, and the result keeps the failure to raise as its class.
+text, and the result keeps the failure to raise as its class. A query that was
+planned hands over its schema before its failure, however soon it fails.
 """
 
 from __future__ import annotations
@@ -84,12 +85,17 @@ def _slow(rows: int) -> daft.DataFrame:
     return daft.from_pydict({"n": list(range(rows))}).into_batches(1).select(crawl(col("n")).alias("n"))
 
 
+def _collapse() -> daft.DataFrame:
+    """One value per group, from a group holding two: fails as soon as it runs."""
+    return daft.from_pydict({"g": [1, 1], "n": [1, 2]}).groupby("g").agg(col("n").single_value())
+
+
 class Host:
     """Answers each kind of request with its own frame."""
 
     @property
     def kinds(self) -> Collection[str]:
-        return ("rows", "empty", "typed", "slow", "fails", "refuse")
+        return ("rows", "empty", "typed", "slow", "fails", "collapse", "refuse")
 
     def plan(self, request: ServedRequest) -> daft.DataFrame:
         if request.kind == "refuse":
@@ -100,6 +106,7 @@ class Host:
             "typed": _typed,
             "slow": lambda: _slow(10),
             "fails": lambda: FailingSource().read(),
+            "collapse": _collapse,
         }
         return frames[request.kind]()
 
@@ -180,6 +187,39 @@ def test_a_failure_partway_reaches_the_reader_and_is_kept_as_its_class(server: D
     failure = answer.failure
     assert isinstance(failure, DaftServeError)
     assert (failure.error_class, failure.remote_type, failure.query_id) == ("Python", "Boom", "q-fails")
+
+
+def _why(failure: Exception | None) -> str | None:
+    """The class a failure was raised as on the server."""
+    if isinstance(failure, DaftServeError):
+        return failure.remote_type or failure.error_class
+    return None if failure is None else type(failure).__name__
+
+
+@pytest.mark.parametrize("buffer", [1, 8], ids=["holding one part", "holding eight"])
+@pytest.mark.parametrize(
+    ("kind", "schema", "why"),
+    [
+        pytest.param(
+            "collapse",
+            pa.schema([("g", pa.int64()), ("n", pa.int64())]),
+            "DaftCardinalityError",
+            id="failing at once",
+        ),
+        pytest.param("fails", pa.schema([("n", pa.int64())]), "Boom", id="failing after its first part"),
+    ],
+)
+def test_a_failure_while_running_follows_its_schema(
+    server: DaftServeServer, kind: str, schema: pa.Schema, why: str, buffer: int
+) -> None:
+    answer = RemoteRunner(server.address()).client.run_request(
+        kind, b"", f"q-{kind}-{buffer}", results_buffer_size=buffer
+    )
+
+    assert pa.schema(answer) == schema
+    with pytest.raises(pa.ArrowException):
+        pa.table(answer)
+    assert _why(answer.failure) == why
 
 
 def test_a_failure_before_the_schema_is_raised_as_its_class(server: DaftServeServer) -> None:

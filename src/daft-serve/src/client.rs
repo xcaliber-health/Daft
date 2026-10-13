@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use arrow_flight::{
     Action, Ticket,
-    decode::{DecodedPayload, FlightDataDecoder},
+    decode::{DecodedFlightData, DecodedPayload, FlightDataDecoder},
     flight_service_client::FlightServiceClient,
 };
 use common_error::DaftError;
@@ -264,30 +264,14 @@ impl QueryResultStream {
     /// decoded into engine types.
     pub async fn next_partition(&mut self) -> Option<ServeResult<MicroPartition>> {
         loop {
-            let message = match self.decoder.next().await? {
+            let message = match self.next_message().await? {
                 Ok(message) => message,
-                Err(arrow_flight::error::FlightError::Tonic(status)) => {
-                    return Some(Err(failure_of_status(status.as_ref())));
-                }
-                Err(e) => {
-                    return Some(Err(ServeError::Execution(DaftError::External(
-                        format!("result stream failed: {e}").into(),
-                    ))));
-                }
+                Err(e) => return Some(Err(e)),
             };
             match &message.payload {
                 DecodedPayload::Schema(_) => {
-                    let app_metadata = &message.inner.app_metadata;
-                    match wire::decode::<SchemaRef>(app_metadata) {
-                        Ok(schema) => {
-                            let fields = schema
-                                .fields()
-                                .iter()
-                                .map(|f| Arc::new(f.clone()))
-                                .collect();
-                            self.schema = Some((schema, fields));
-                        }
-                        Err(e) => return Some(Err(e)),
+                    if let Err(e) = self.remember_schema(&message.inner.app_metadata) {
+                        return Some(Err(e));
                     }
                 }
                 DecodedPayload::RecordBatch(batch) => {
@@ -321,6 +305,59 @@ impl QueryResultStream {
                 DecodedPayload::None => {}
             }
         }
+    }
+
+    /// Reads the stream up to its schema, which the server sends before any
+    /// batch, and returns it; an empty result still has one.
+    ///
+    /// # Errors
+    /// Returns the failure the stream reports first, or a malformed-payload
+    /// error if it ends or sends a batch before its schema.
+    pub async fn read_schema(&mut self) -> ServeResult<SchemaRef> {
+        loop {
+            if let Some((schema, _)) = &self.schema {
+                return Ok(schema.clone());
+            }
+            let message = self.next_message().await.ok_or_else(|| {
+                ServeError::MalformedPayload(
+                    "the result stream ended before its schema".to_string(),
+                )
+            })??;
+            match &message.payload {
+                DecodedPayload::Schema(_) => self.remember_schema(&message.inner.app_metadata)?,
+                DecodedPayload::RecordBatch(_) => {
+                    return Err(ServeError::MalformedPayload(
+                        "result batch arrived before the stream schema".to_string(),
+                    ));
+                }
+                DecodedPayload::None => {}
+            }
+        }
+    }
+
+    /// Receives the next message, mapping a failed status to the failure it reports.
+    async fn next_message(&mut self) -> Option<ServeResult<DecodedFlightData>> {
+        Some(match self.decoder.next().await? {
+            Ok(message) => Ok(message),
+            Err(arrow_flight::error::FlightError::Tonic(status)) => {
+                Err(failure_of_status(status.as_ref()))
+            }
+            Err(e) => Err(ServeError::Execution(DaftError::External(
+                format!("result stream failed: {e}").into(),
+            ))),
+        })
+    }
+
+    /// Decodes and keeps the engine schema a schema message carries.
+    fn remember_schema(&mut self, app_metadata: &[u8]) -> ServeResult<()> {
+        let schema = wire::decode::<SchemaRef>(app_metadata)?;
+        let fields = schema
+            .fields()
+            .iter()
+            .map(|f| Arc::new(f.clone()))
+            .collect();
+        self.schema = Some((schema, fields));
+        Ok(())
     }
 
     /// Schema of the result stream, available after the first message.

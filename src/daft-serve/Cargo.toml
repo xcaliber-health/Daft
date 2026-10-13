@@ -5,6 +5,7 @@ arrow-ipc = {workspace = true}
 arrow-schema = {workspace = true}
 async-channel = "2.5.0"
 async-stream = {workspace = true}
+common-arrow-ffi = {path = "../common/arrow-ffi", optional = true}
 common-daft-config = {path = "../common/daft-config", default-features = false}
 common-error = {path = "../common/error", default-features = false}
 common-metrics = {path = "../common/metrics", default-features = false}
@@ -37,6 +38,7 @@ rstest = {workspace = true}
 
 [features]
 python = [
+  "dep:common-arrow-ffi",
   "dep:pyo3",
   "common-daft-config/python",
   "common-error/python",

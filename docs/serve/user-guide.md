@@ -211,6 +211,33 @@ for table in runner.run_iter_tables(df._builder):
 > writes happen on the server, connect with `daft.connect` rather than a
 > standalone `RemoteRunner`.
 
+### Reading a result as an Arrow stream
+
+A result from the client (`run_plan`, `run_sql` or `run_request`) offers Arrow's
+stream interface, so pyarrow, DuckDB, polars or any other Arrow reader reads it
+directly, one part at a time as it arrives:
+
+```python
+import pyarrow as pa
+
+client = RemoteRunner("grpc://localhost:9494", token="secret").client
+result = client.run_request("report", b"...", query_id="q-1")
+reader = pa.RecordBatchReader.from_stream(result)  # or pa.table(result), duckdb.from_arrow(result)
+for batch in reader:
+    ...
+```
+
+- The schema is read first, so an empty result still names its columns and types.
+- Columns convert exactly as a local result's do. A reader may ask for a schema of its
+  own, and the columns are cast to it.
+- A result is read once: once taken as an Arrow stream, it can't be taken again or
+  iterated part by part.
+- A failure partway through ends the stream with its class and message as text, since
+  Arrow's interface carries only text. `result.failure` then holds the failure as the
+  class it's raised as when iterated (for example `DaftServeError` with its
+  `error_class` and `remote_type`). A failure before any row, such as a request host's
+  refusal, is raised as its class directly.
+
 ---
 
 ## Three ways to send a query

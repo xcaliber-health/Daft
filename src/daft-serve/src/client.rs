@@ -120,6 +120,11 @@ fn status_to_error(status: &tonic::Status) -> ServeError {
 }
 
 /// Connection to one serving endpoint.
+///
+/// Cloning is cheap and every clone shares the one underlying connection, which
+/// multiplexes calls: concurrent calls each take their own clone and proceed
+/// independently, so a call waiting on the server never holds up another.
+#[derive(Clone)]
 pub struct ServeClient {
     inner: FlightServiceClient<Channel>,
     token: Option<String>,

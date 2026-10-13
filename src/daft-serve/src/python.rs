@@ -301,9 +301,13 @@ impl PyServeQueryResult {
 }
 
 /// Connection to a remote serving endpoint.
+///
+/// Safe to share across threads: each call works on its own clone of the
+/// connection handle, so a query waiting for an execution slot never blocks a
+/// concurrent query, cancel or probe on the same client.
 #[pyclass(module = "daft.daft", name = "DaftServeClient", frozen)]
 pub struct PyDaftServeClient {
-    inner: Arc<tokio::sync::Mutex<ServeClient>>,
+    inner: ServeClient,
 }
 
 impl PyDaftServeClient {
@@ -373,28 +377,27 @@ impl PyDaftServeClient {
     #[new]
     #[pyo3(signature = (address, token=None))]
     pub fn new(py: Python<'_>, address: String, token: Option<String>) -> PyResult<Self> {
-        let client = block_on(py, ServeClient::connect(&address, token))?;
-        Ok(Self {
-            inner: Arc::new(tokio::sync::Mutex::new(client)),
-        })
+        let inner = block_on(py, ServeClient::connect(&address, token))?;
+        Ok(Self { inner })
     }
 
     /// Fetches the server description.
     pub fn server_info(&self, py: Python<'_>) -> PyResult<PyServeServerInfo> {
-        let info = block_on(py, async { self.inner.lock().await.server_info().await })?;
+        let mut client = self.inner.clone();
+        let info = block_on(py, async move { client.server_info().await })?;
         Ok(PyServeServerInfo { inner: info })
     }
 
     /// Probes server liveness.
     pub fn health(&self, py: Python<'_>) -> PyResult<()> {
-        block_on(py, async { self.inner.lock().await.health().await })
+        let mut client = self.inner.clone();
+        block_on(py, async move { client.health().await })
     }
 
     /// Cancels a running query by id; returns whether it was found.
     pub fn cancel_query(&self, py: Python<'_>, query_id: String) -> PyResult<bool> {
-        block_on(py, async {
-            self.inner.lock().await.cancel_query(&query_id).await
-        })
+        let mut client = self.inner.clone();
+        block_on(py, async move { client.cancel_query(&query_id).await })
     }
 
     /// Submits a serialized plan with its referenced in-memory partitions.
@@ -416,7 +419,8 @@ impl PyDaftServeClient {
             query_id,
             results_buffer_size,
         )?;
-        let stream = block_on(py, async { self.inner.lock().await.run(&request).await })?;
+        let mut client = self.inner.clone();
+        let stream = block_on(py, async move { client.run(&request).await })?;
         Ok(PyServeQueryResult {
             stream: tokio::sync::Mutex::new(stream),
             optimized_locally,
@@ -439,7 +443,8 @@ impl PyDaftServeClient {
             psets: vec![],
             results_buffer_size,
         };
-        let stream = block_on(py, async { self.inner.lock().await.run(&request).await })?;
+        let mut client = self.inner.clone();
+        let stream = block_on(py, async move { client.run(&request).await })?;
         Ok(PyServeQueryResult {
             stream: tokio::sync::Mutex::new(stream),
             optimized_locally: false,
@@ -456,9 +461,8 @@ impl PyDaftServeClient {
             "explain".to_string(),
             None,
         )?;
-        let explained = block_on(py, async {
-            self.inner.lock().await.explain(&request).await
-        })?;
+        let mut client = self.inner.clone();
+        let explained = block_on(py, async move { client.explain(&request).await })?;
         if optimized_locally {
             Ok(format!(
                 "Note: a source in this plan cannot travel, so scan planning \

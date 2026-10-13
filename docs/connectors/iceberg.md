@@ -138,7 +138,8 @@ in one snapshot. The key set is a DataFrame whose columns are the key columns, n
   kept, and a key with no new row still loses its existing rows.
 - Every new row must have its key in the key set, or the write fails before anything is committed.
 - Key types compare within a family (numbers with numbers, text with text, and so on); a key of another family is
-  refused, never cast.
+  refused, never cast. A timestamp with a time zone and one without are different families: a zoneless timestamp
+  names no instant until a zone is assumed. Timestamps in different zones compare by instant.
 - The key set's distinct rows are read once and held in memory, in the calling process, without spilling.
 - Only files whose partition (identity, bucket, truncate or time transforms of a key column) and column bounds may
   hold a key are read, and only their key columns, to count matches. Partitioning or sorting the table by the key

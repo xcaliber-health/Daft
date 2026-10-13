@@ -10,6 +10,7 @@ concurrent commit conflicts only when a file it added may hold one.
 
 from __future__ import annotations
 
+import datetime
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -347,6 +348,72 @@ def test_a_concurrent_commit_conflicts_only_when_a_file_it_added_may_hold_a_key(
     else:
         overwrite()
         assert (1, "eu", 11) in _rows(table)
+
+
+def _moments_table(catalog: Catalog) -> Table:
+    from pyiceberg.types import TimestampType, TimestamptzType
+
+    schema = Schema(
+        NestedField(1, "wall", TimestampType(), required=False),
+        NestedField(2, "instant", TimestamptzType(), required=False),
+        NestedField(3, "v", LongType(), required=False),
+    )
+    table = catalog.create_table("default.moments", schema=schema)
+    noon = datetime.datetime(2026, 10, 13, 12, 0)
+    daft.from_arrow(
+        pa.table(
+            {
+                "wall": pa.array([noon, noon.replace(hour=13)], type=pa.timestamp("us")),
+                "instant": pa.array(
+                    [noon.replace(tzinfo=datetime.timezone.utc), noon.replace(hour=13, tzinfo=datetime.timezone.utc)],
+                    type=pa.timestamp("us", tz="UTC"),
+                ),
+                "v": [1, 2],
+            }
+        )
+    ).write_iceberg(table)
+    return table
+
+
+@pytest.mark.parametrize(
+    ("column", "key_type"),
+    [
+        pytest.param("wall", pa.timestamp("us", tz="UTC"), id="a zoned key against a zoneless column"),
+        pytest.param("instant", pa.timestamp("us"), id="a zoneless key against a zoned column"),
+    ],
+)
+def test_a_timestamp_key_is_refused_against_a_column_of_other_zone_awareness(
+    local_catalog: Catalog, column: str, key_type: pa.DataType
+) -> None:
+    table = _moments_table(local_catalog)
+    before = snapshot_count(table)
+    noon = datetime.datetime(2026, 10, 13, 12, 0, tzinfo=datetime.timezone.utc if key_type.tz else None)
+    keys = daft.from_arrow(pa.table({column: pa.array([noon], type=key_type)}))
+
+    with pytest.raises(ValueError, match="does not compare"):
+        daft.read_iceberg(table).limit(0).write_iceberg(table, mode="overwrite", overwrite_keys=keys)
+
+    assert snapshot_count(table) == before
+
+
+def test_a_zoned_key_matches_the_same_instant_in_another_zone(local_catalog: Catalog) -> None:
+    table = _moments_table(local_catalog)
+    # 08:00 in New York, in October, is 12:00 UTC.
+    new_york = datetime.timezone(datetime.timedelta(hours=-4))
+    keys = daft.from_arrow(
+        pa.table(
+            {
+                "instant": pa.array(
+                    [datetime.datetime(2026, 10, 13, 8, 0, tzinfo=new_york)],
+                    type=pa.timestamp("us", tz="America/New_York"),
+                )
+            }
+        )
+    )
+
+    daft.read_iceberg(table).limit(0).write_iceberg(table, mode="overwrite", overwrite_keys=keys)
+
+    assert daft.read_iceberg(table).to_pydict()["v"] == [2]
 
 
 @pytest.mark.parametrize(

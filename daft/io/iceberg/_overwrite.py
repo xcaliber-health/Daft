@@ -577,8 +577,11 @@ def _comparable(key: DataType, column: DataType) -> bool:
     """Whether a key of type ``key`` is compared with a column of type ``column``.
 
     Types compare within one family: numbers, text, bytes, dates, times,
-    timestamps, or truth values. A key is never matched across families, as a
-    cast from text to a number would.
+    timestamps with a time zone, timestamps without one, or truth values. A key
+    is never matched across families, as a cast from text to a number would, nor
+    a timestamp with a zone against one without, which names no instant until a
+    zone is assumed. Timestamps in different zones name the same instants, and
+    compare.
     """
     family = _family(key)
     return key == column or (family is not None and family == _family(column))
@@ -597,7 +600,7 @@ def _family(dtype: DataType) -> str | None:
     if dtype.is_time():
         return "time"
     if dtype.is_timestamp():
-        return "timestamp"
+        return "zoned timestamp" if dtype.timezone is not None else "zoneless timestamp"
     if dtype.is_boolean():
         return "truth"
     return None

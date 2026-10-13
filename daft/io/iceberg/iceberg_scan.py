@@ -85,6 +85,9 @@ def iceberg_partition_spec_to_fields(
 
 
 class IcebergScanOperator(ScanOperator):
+    #: Column naming the data file each row was read from, when the scan provides one.
+    _file_path_column: str | None = None
+
     def __init__(
         self,
         iceberg_table: Table,
@@ -250,6 +253,14 @@ class IcebergScanOperator(ScanOperator):
 
         # TODO: Thread in Statistics to each ScanTask: P2
         pspec = self._iceberg_record_to_partition_spec(self._iceberg_table.specs()[file.spec_id], file.partition)
+        if self._file_path_column is not None:
+            # The path is constant across the file, so it is filled like a partition value.
+            path = daft.Series.from_pylist([file.file_path], name=self._file_path_column, dtype=daft.DataType.string())
+            pspec = (
+                RecordBatch.from_pydict({self._file_path_column: path})
+                if pspec is None
+                else RecordBatch.from_pydict({**pspec.to_pydict(), self._file_path_column: path})
+            )
         return ScanTask.catalog_scan_task(
             file=file.file_path,
             file_format=self._file_format_config,
@@ -353,7 +364,9 @@ class IcebergFileGroupScanOperator(IcebergScanOperator):
     """Scan operator over an explicit set of planned data files.
 
     Reads exactly the supplied files under the table's current schema, so one
-    file group can be read, transformed and written as a lazy frame.
+    file group can be read, transformed and written as a lazy frame. With
+    ``file_path_column``, each row also carries the path of the file it was
+    read from in that column.
     """
 
     def __init__(
@@ -364,6 +377,7 @@ class IcebergFileGroupScanOperator(IcebergScanOperator):
         tasks: list[FileScanTask],
         schema_source: SchemaSource = "current",
         ignore_corrupt_files: bool = False,
+        file_path_column: str | None = None,
     ) -> None:
         super().__init__(
             iceberg_table,
@@ -373,6 +387,11 @@ class IcebergFileGroupScanOperator(IcebergScanOperator):
             ignore_corrupt_files=ignore_corrupt_files,
         )
         self._tasks = tasks
+        if file_path_column is not None:
+            if file_path_column in self._schema.column_names():
+                raise ValueError(f"the file path column {file_path_column!r} names a column of the table")
+            self._file_path_column = file_path_column
+            self._schema = Schema._from_fields([*self._schema, Field.create(file_path_column, daft.DataType.string())])
 
     def name(self) -> str:
         return "IcebergFileGroupScanOperator"

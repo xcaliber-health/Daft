@@ -3,7 +3,7 @@
 Re-exports the result types, exception types, and helper utilities that
 callers of ``rewrite_data_files``, ``rewrite_position_delete_files``,
 ``rewrite_manifests``, ``expire_snapshots``, and ``remove_orphan_files`` need to handle return
-values and recover from errors.
+values and recover from errors, and the conflict an overwrite by filter raises.
 """
 
 from typing import TypeAlias
@@ -15,6 +15,7 @@ from daft.io.iceberg._compact import (
     RewriteFailedException,
     RewriteResult,
 )
+from daft.io.iceberg._overwrite import WriteConflict
 from daft.io.iceberg._expire import (
     ExpireResult,
     ExpireSnapshotsFailedException,
@@ -51,4 +52,5 @@ __all__ = [
     "RewritePositionDeletesFailedException",
     "RewritePositionDeletesResult",
     "RewriteResult",
+    "WriteConflict",
 ]

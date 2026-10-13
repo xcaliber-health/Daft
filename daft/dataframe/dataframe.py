@@ -1343,10 +1343,18 @@ class DataFrame:
         io_config: IOConfig | None = None,
         snapshot_properties: dict[str, str] | None = None,
         checkpoint: "IdempotentCommit | None" = None,
+        overwrite_filter: Expression | None = None,
     ) -> "DataFrame":
         """Writes the DataFrame to an [Iceberg](https://iceberg.apache.org/docs/nightly/) table, returning a new DataFrame with the operations that occurred.
 
         Can be run in either `append` or `overwrite` mode which will either appends the rows in the DataFrame or will delete the existing rows and then append the DataFrame rows respectively.
+
+        With ``overwrite_filter``, an overwrite replaces only the existing rows on which the filter is true, in one
+        snapshot: a row on which it is false or null is kept. Files only some of whose rows match are rewritten
+        without them. Every written row must satisfy the filter, or the write fails before anything is committed.
+        The commit is checked against commits made since the write was planned, under the table's
+        ``write.delete.isolation-level`` (``serializable`` by default, which also refuses a concurrent commit that
+        added rows the filter may select); an overlap raises ``daft.io.iceberg.WriteConflict`` and commits nothing.
 
         ``write_iceberg`` supports checkpointing via the ``checkpoint=`` parameter. For the conceptual overview, see the [Checkpointing guide](../use-case/checkpointing.md).
 
@@ -1356,9 +1364,13 @@ class DataFrame:
             io_config (IOConfig, optional): A custom IOConfig to use when accessing Iceberg object storage data. If provided, configurations set in `table` are ignored.
             snapshot_properties (dict[str, str], optional): Optional snapshot properties to set while writing to the table. Keys with prefix ``daft.idempotence-`` are reserved.
             checkpoint (IdempotentCommit, optional): Bundled checkpoint store + idempotence key for an idempotent commit. When provided, the snapshot summary is tagged with ``daft.idempotence-key`` and retries with the same key recognize the prior attempt without producing a duplicate snapshot. Only ``mode='append'`` is supported. Requires the Ray runner.
+            overwrite_filter (Expression, optional): With ``mode='overwrite'``, a boolean expression over the table's columns selecting the existing rows to replace. Requires pyiceberg>=0.11.0.
 
         Returns:
-            DataFrame: The operations that occurred with this write.
+            DataFrame: The operations that occurred with this write, one row per file: ``operation`` (``ADD`` or
+            ``DELETE``), ``rows``, ``file_size``, ``file_name``, the ``partitioning`` values of a partitioned table,
+            ``rows_removed`` (on ``DELETE`` rows: how many of the file's live rows the write removed) and
+            ``rewritten`` (on ``ADD`` rows: whether the file holds rows kept from a replaced file, rather than new rows).
 
         Note:
             This call is **blocking** and will execute the DataFrame when called.
@@ -1399,6 +1411,9 @@ class DataFrame:
             >>> table = pyiceberg.Table(...)  # doctest: +SKIP
             >>> df = daft.from_pydict({"user_id": [1, 2, 3], "name": ["Alice", "Bob", "Charlie"]})
             >>> df = df.write_iceberg(table, mode="overwrite")  # doctest: +SKIP
+            >>> df = df.write_iceberg(
+            ...     table, mode="overwrite", overwrite_filter=daft.col("user_id") <= 3
+            ... )  # doctest: +SKIP
             >>>
             >>> store = daft.CheckpointStore("s3://my-bucket/ckpt/")  # doctest: +SKIP
             >>> df = daft.read_parquet(
@@ -1411,7 +1426,6 @@ class DataFrame:
             ... )  # doctest: +SKIP
 
         """
-        import pyarrow as pa
         import pyiceberg
         from packaging.version import parse
 
@@ -1429,6 +1443,14 @@ class DataFrame:
 
         if mode not in ["append", "overwrite"]:
             raise ValueError(f"Only support `append` or `overwrite` mode. {mode} is unsupported")
+
+        if overwrite_filter is not None:
+            if mode != "overwrite":
+                raise ValueError("overwrite_filter requires mode='overwrite'")
+            if checkpoint is not None:
+                raise ValueError("overwrite_filter cannot be combined with checkpoint")
+            if parse(pyiceberg.__version__) < parse("0.11.0"):
+                raise ValueError("write_iceberg with overwrite_filter requires pyiceberg>=0.11.0")
 
         if checkpoint is not None and mode == "overwrite":
             raise NotImplementedError(
@@ -1456,47 +1478,36 @@ class DataFrame:
         if checkpoint is not None:
             return self._write_iceberg_with_checkpoint(table, io_config, snapshot_properties, checkpoint)
 
-        operations = []
-        path = []
-        rows = []
-        size = []
+        from daft.io.iceberg._overwrite import (
+            RemovedFile,
+            WrittenFile,
+            overwrite_by_filter,
+            removed_whole,
+            write_result,
+        )
+
+        if overwrite_filter is not None:
+            return overwrite_by_filter(self, table, overwrite_filter, io_config, snapshot_properties or {})
 
         builder = self._builder.write_iceberg(table, io_config)
         write_df = DataFrame(builder)
         write_df.collect()
 
-        write_result = write_df.to_pydict()
-        assert "data_file" in write_result
-        data_files = write_result["data_file"]
+        written = write_df.to_pydict()
+        assert "data_file" in written
+        data_files = written["data_file"]
 
-        if mode == "overwrite":
-            deleted_files = table.scan().plan_files()
-        else:
-            deleted_files = []
+        removed: list[RemovedFile] = []
+        if mode == "overwrite" and parse(pyiceberg.__version__) >= parse("0.11.0"):
+            from daft.io.iceberg._deletes import plan_files
 
-        schema = table.schema()
-        partitioning: dict[str, list[Any]] = {
-            schema.find_field(field.source_id).name: [] for field in table.spec().fields
-        }
-
-        for data_file in data_files:
-            operations.append("ADD")
-            path.append(data_file.file_path)
-            rows.append(data_file.record_count)
-            size.append(data_file.file_size_in_bytes)
-
-            for field in partitioning:
-                partitioning[field].append(getattr(data_file.partition, field, None))
-
-        for pf in deleted_files:
-            data_file = pf.file
-            operations.append("DELETE")
-            path.append(data_file.file_path)
-            rows.append(data_file.record_count)
-            size.append(data_file.file_size_in_bytes)
-
-            for field in partitioning:
-                partitioning[field].append(getattr(data_file.partition, field, None))
+            start = table.current_snapshot()
+            start_id = int(start.snapshot_id) if start is not None else None
+            plan = plan_files(table, table.scan(snapshot_id=start_id))
+            removed = removed_whole(table, plan, start_id, io_config)
+        elif mode == "overwrite":
+            # Without row-level delete planning, a file's recorded rows stand for its live rows.
+            removed = [RemovedFile(task.file, int(task.file.record_count)) for task in table.scan().plan_files()]
 
         if parse(pyiceberg.__version__) >= parse("0.7.0"):
             from pyiceberg.table import ALWAYS_TRUE, TableProperties
@@ -1549,25 +1560,9 @@ class DataFrame:
 
             merge.commit()
 
-        with_operations = {
-            "operation": pa.array(operations, type=pa.string()),
-            "rows": pa.array(rows, type=pa.int64()),
-            "file_size": pa.array(size, type=pa.int64()),
-            "file_name": pa.array([fp for fp in path], type=pa.string()),
-        }
-
-        if partitioning:
-            with_operations["partitioning"] = pa.StructArray.from_arrays(
-                partitioning.values(), names=partitioning.keys()
-            )
-
-        from daft import from_pydict
-
         # NOTE: We are losing the history of the plan here.
         # This is due to the fact that the logical plan of the write_iceberg returns datafiles but we want to return the above data
-        df = from_pydict(with_operations)
-        df._metadata = write_df._metadata
-        return df
+        return write_result(table, [WrittenFile(f, rewritten=False) for f in data_files], removed, like=write_df)
 
     def _write_iceberg_with_checkpoint(
         self,

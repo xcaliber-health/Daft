@@ -371,13 +371,15 @@ def _write_equality_delete_file(
     *,
     partition: Record | None = None,
     spec_id: int | None = None,
+    bounds: bool = False,
 ) -> DataFile:
     """Write an equality delete file holding ``rows`` and matching on ``equality_columns``.
 
     Column names are resolved against the table schema to their field ids, which
     is how a reader identifies the delete columns. ``spec_id`` and ``partition``
-    place the delete; the unpartitioned spec makes it a global delete. Returns
-    the delete file's metadata; nothing is committed here.
+    place the delete; the unpartitioned spec makes it a global delete. With
+    ``bounds``, each column's lower and upper bounds are recorded, as engines'
+    writers record them. Returns the delete file's metadata; nothing is committed here.
     """
     import io
     import uuid
@@ -405,9 +407,23 @@ def _write_equality_delete_file(
     with table.io.new_output(delete_path).create(overwrite=True) as handle:
         handle.write(payload)
 
+    lower_bounds: dict[int, bytes] = {}
+    upper_bounds: dict[int, bytes] = {}
+    if bounds:
+        import pyarrow.compute as pc
+        from pyiceberg.conversions import to_bytes
+
+        for name in rows.column_names:
+            field = schema.find_field(name)
+            extremes = pc.min_max(rows.column(name)).as_py()
+            lower_bounds[field.field_id] = to_bytes(field.field_type, extremes["min"])
+            upper_bounds[field.field_id] = to_bytes(field.field_type, extremes["max"])
+
     delete_file = DataFile.from_args(
         _table_format_version=table.metadata.format_version,
         content=DataFileContent.EQUALITY_DELETES,
+        lower_bounds=lower_bounds or None,
+        upper_bounds=upper_bounds or None,
         file_path=delete_path,
         file_format=FileFormat.PARQUET,
         partition=partition if partition is not None else Record(),
@@ -429,13 +445,16 @@ def commit_equality_delete_rows(
     *,
     partition: Record | None = None,
     spec_id: int | None = None,
+    bounds: bool = False,
 ) -> str:
     """Commit an equality delete removing every row equal to a row of ``rows`` on ``equality_columns``.
 
     Neither the catalog library nor the reference engine's batch writers emit
     one, so it is written here. Returns the path of the delete file.
     """
-    delete_file = _write_equality_delete_file(table, rows, equality_columns, partition=partition, spec_id=spec_id)
+    delete_file = _write_equality_delete_file(
+        table, rows, equality_columns, partition=partition, spec_id=spec_id, bounds=bounds
+    )
     _commit_files(table, [], [delete_file])
     return delete_file.file_path
 

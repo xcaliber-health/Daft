@@ -197,10 +197,12 @@ def read_with_deletes(
     io_config: IOConfig,
     schema_source: SchemaSource = "current",
     ignore_corrupt_files: bool = False,
+    file_path_column: str | None = None,
 ) -> DataFrame:
     """Build a lazy frame over exactly these data files, with their deletes applied.
 
-    Files sharing a sequence number and partition are read together.
+    Files sharing a sequence number and partition are read together. With
+    ``file_path_column``, each row carries the path of its data file there.
     """
     from daft import runners
     from daft.daft import ScanOperatorHandle, StorageConfig
@@ -221,6 +223,7 @@ def read_with_deletes(
             tasks=tasks,
             schema_source=schema_source,
             ignore_corrupt_files=ignore_corrupt_files,
+            file_path_column=file_path_column,
         )
         handle = ScanOperatorHandle.from_python_scan_operator(operator)
         return DataFrame(LogicalPlanBuilder.from_tabular_scan(scan_operator=handle))

@@ -1159,7 +1159,7 @@ def _compaction_producer_class() -> type:
                 summary=Summary(operation=Operation.OVERWRITE, **collector.build(), **properties),
                 previous_summary=previous_snapshot.summary if previous_snapshot is not None else None,
             )
-            return Summary(operation=Operation.REPLACE, **totals.additional_properties)
+            return Summary(operation=self._operation, **totals.additional_properties)
 
     _COMPACTION_PRODUCER_CLASS = _CompactionProducer
     return _COMPACTION_PRODUCER_CLASS
@@ -1515,15 +1515,23 @@ def _added_files(snapshot: Snapshot, table: PyIcebergTable) -> list[DataFile]:
     return _entries_of(snapshot, table, ManifestEntryStatus.ADDED)
 
 
-def _entries_of(snapshot: Snapshot, table: PyIcebergTable, status: ManifestEntryStatus) -> list[DataFile]:
-    """Return the files whose manifest entries ``snapshot`` wrote with ``status``."""
+def _entries_of(
+    snapshot: Snapshot,
+    table: PyIcebergTable,
+    status: ManifestEntryStatus,
+    conflict: type[RuntimeError] = RewriteConflict,
+) -> list[DataFile]:
+    """Return the files whose manifest entries ``snapshot`` wrote with ``status``.
+
+    A manifest that cannot be read raises ``conflict``: the commit cannot be shown to be safe.
+    """
     snapshot_id = int(snapshot.snapshot_id)
     try:
         manifests = snapshot.manifests(table.io)
     except OSError as exc:
-        raise RewriteConflict(
+        raise conflict(
             f"could not read the manifests of snapshot {snapshot_id} to check for "
-            f"conflicting writes, so the rewrite cannot be shown to be safe: {exc}"
+            f"conflicting writes, so the commit cannot be shown to be safe: {exc}"
         ) from exc
 
     out: list[DataFile] = []
@@ -1533,9 +1541,9 @@ def _entries_of(snapshot: Snapshot, table: PyIcebergTable, status: ManifestEntry
         try:
             entries = manifest.fetch_manifest_entry(table.io, discard_deleted=False)
         except OSError as exc:
-            raise RewriteConflict(
+            raise conflict(
                 f"could not read manifest {manifest.manifest_path!r} of snapshot "
-                f"{snapshot_id} to check for conflicting writes, so the rewrite "
+                f"{snapshot_id} to check for conflicting writes, so the commit "
                 f"cannot be shown to be safe: {exc}"
             ) from exc
         out.extend(entry.data_file for entry in entries if int(entry.status) == int(status))

@@ -24,7 +24,7 @@ use tonic::transport::{Channel, Endpoint};
 
 use crate::{
     codec,
-    error::{ServeError, ServeResult, failure_of_status},
+    error::{Failure, ServeError, ServeResult, failure_of_status},
     wire::{self, ExplainResult, QueryRequest, QueryStatsWire, ServerInfo, actions},
 };
 
@@ -183,6 +183,7 @@ impl ServeClient {
             decoder: FlightDataDecoder::new(stream),
             schema: None,
             stats: None,
+            ended: false,
         })
     }
 
@@ -254,19 +255,22 @@ pub struct QueryResultStream {
     decoder: FlightDataDecoder,
     schema: Option<(SchemaRef, Vec<FieldRef>)>,
     stats: Option<QueryStatsWire>,
+    ended: bool,
 }
 
 impl QueryResultStream {
     /// Receives the next result partition, or `None` at end of stream.
     ///
     /// # Errors
-    /// Yields an error item if the stream fails or a message cannot be
-    /// decoded into engine types.
+    /// Yields an error item if the stream fails, a message cannot be decoded
+    /// into engine types, or the stream ends before the server's closing
+    /// statistics, which a finished query always sends last.
     pub async fn next_partition(&mut self) -> Option<ServeResult<MicroPartition>> {
         loop {
-            let message = match self.next_message().await? {
-                Ok(message) => message,
-                Err(e) => return Some(Err(e)),
+            let message = match self.next_message().await {
+                Some(Ok(message)) => message,
+                Some(Err(e)) => return Some(Err(e)),
+                None => return self.end_of_stream(),
             };
             match &message.payload {
                 DecodedPayload::Schema(_) => {
@@ -305,6 +309,24 @@ impl QueryResultStream {
                 DecodedPayload::None => {}
             }
         }
+    }
+
+    /// Settles the end of the stream: complete once the closing statistics
+    /// arrived, and otherwise cut short, which is reported once, so a result
+    /// missing its end is never read as whole.
+    fn end_of_stream(&mut self) -> Option<ServeResult<MicroPartition>> {
+        if self.stats.is_some() || std::mem::replace(&mut self.ended, true) {
+            return None;
+        }
+        Some(Err(ServeError::Failed {
+            failure: Box::new(Failure {
+                error_class: "Transport".to_string(),
+                engine: false,
+                retryable: false,
+                python: None,
+            }),
+            message: "the result stream ended before its query finished".to_string(),
+        }))
     }
 
     /// Reads the stream up to its schema, which the server sends before any

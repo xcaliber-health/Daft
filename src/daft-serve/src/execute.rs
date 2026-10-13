@@ -8,9 +8,12 @@
 //! message carries execution statistics.
 //!
 //! Cancellation is cooperative: the per-query token (tripped by an explicit
-//! cancel action) and the receiver side of the output channel (dropped when
-//! the client disconnects) both abort execution promptly, dropping the
-//! engine instance which cancels its running pipeline.
+//! cancel action, the time limit, or the server's drain) and the receiver side
+//! of the output channel (dropped when the client disconnects) both abort
+//! execution promptly, dropping the engine instance which cancels its running
+//! pipeline. A query waiting for its client to read is still cancelled at
+//! once, and a query that ends unfinished discards what its client has not
+//! read, so the client's next read raises why it ended.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -44,6 +47,53 @@ pub struct Planners {
     pub session: Option<Arc<Py<PyAny>>>,
     /// Registered host planning requests of the kinds it declares.
     pub host: Option<Arc<Py<PyAny>>>,
+}
+
+/// Where an admitted query's encoded results go, for its client to read at
+/// its own pace.
+///
+/// Holds the sending half of the bounded results channel and a weak handle on
+/// its receiving half, which never keeps the channel open by itself.
+pub struct ResultSink {
+    tx: async_channel::Sender<Result<FlightData, Status>>,
+    unread: async_channel::WeakReceiver<Result<FlightData, Status>>,
+}
+
+impl ResultSink {
+    /// Sends into `tx`, whose receiving half `rx` the client's stream reads.
+    #[must_use]
+    pub fn new(
+        tx: async_channel::Sender<Result<FlightData, Status>>,
+        rx: &async_channel::Receiver<Result<FlightData, Status>>,
+    ) -> Self {
+        Self {
+            tx,
+            unread: rx.downgrade(),
+        }
+    }
+
+    /// Hands `message` to the client, waiting for room while it is not reading.
+    ///
+    /// Returns `false` without sending once `cancel` trips or the client is
+    /// gone, so a cancelled query never waits on its client.
+    async fn deliver(&self, message: FlightData, cancel: &CancellationToken) -> bool {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => false,
+            sent = self.tx.send(Ok(message)) => sent.is_ok(),
+        }
+    }
+
+    /// Ends the client's stream with `status`, discarding the results it has
+    /// not read, so its next read raises why the query ended.
+    fn end(&self, status: Status) {
+        if let Some(unread) = self.unread.upgrade() {
+            while unread.try_recv().is_ok() {}
+        }
+        // Only the query sends, and the channel was just emptied, so there is
+        // room unless the client is gone, when there is no one to tell.
+        let _ = self.tx.try_send(Err(status));
+    }
 }
 
 /// Who sent a request, and under which id: handed to the host with it.
@@ -334,7 +384,7 @@ pub struct QueryHold {
     pub lifecycle: QueryLifecycle,
 }
 
-/// Runs one admitted query, sending encoded messages into `tx`.
+/// Runs one admitted query, sending encoded messages into `sink`.
 ///
 /// The query's hold (its execution slot and registry entry) is kept for the
 /// duration of the send loop and released on return, whether the query completes, fails,
@@ -347,7 +397,7 @@ pub async fn run_query(
     caller: Option<String>,
     cancel: CancellationToken,
     hold: QueryHold,
-    tx: async_channel::Sender<Result<FlightData, Status>>,
+    sink: ResultSink,
     bounds: QueryBounds,
 ) {
     let QueryHold {
@@ -363,7 +413,7 @@ pub async fn run_query(
         bounds,
         RunningQuery {
             cancel: &cancel,
-            tx: &tx,
+            sink: &sink,
             lifecycle: &mut lifecycle,
             slot: &permit,
         },
@@ -396,8 +446,7 @@ pub async fn run_query(
     });
     lifecycle.finish(&result);
     if let Err(err) = result {
-        // A send failure means the client is gone; nothing left to notify.
-        let _ = tx.send(Err(err.into())).await;
+        sink.end(err.into());
     }
 }
 
@@ -406,7 +455,7 @@ pub async fn run_query(
 /// each piece of its work holds until that work returns.
 struct RunningQuery<'a> {
     cancel: &'a CancellationToken,
-    tx: &'a async_channel::Sender<Result<FlightData, Status>>,
+    sink: &'a ResultSink,
     lifecycle: &'a mut QueryLifecycle,
     slot: &'a AdmissionPermit,
 }
@@ -420,7 +469,7 @@ async fn run_query_inner(
 ) -> ServeResult<()> {
     let RunningQuery {
         cancel,
-        tx,
+        sink,
         lifecycle,
         slot,
     } = running;
@@ -547,8 +596,8 @@ async fn run_query_inner(
         .map_or(schema, |partition| partition.schema());
     let mut encoder = BatchEncoder::try_new(&stream_schema)?;
     let schema_message = encoder.schema_message(&stream_schema)?;
-    if tx.send(Ok(schema_message)).await.is_err() {
-        // Client disconnected before the stream started: the query is cancelled.
+    if !sink.deliver(schema_message, cancel).await {
+        // Cancelled, or the client disconnected, before the stream started.
         executor.cancel_plan(fingerprint);
         return Err(ServeError::Cancelled(query_id));
     }
@@ -574,8 +623,8 @@ async fn run_query_inner(
         for batch in partition.record_batches() {
             for message in encoder.encode(batch)? {
                 bytes += message.data_body.len() as u64;
-                if tx.send(Ok(message)).await.is_err() {
-                    // Client disconnected mid-stream: the query is cancelled.
+                if !sink.deliver(message, cancel).await {
+                    // Cancelled, or the client disconnected, mid-stream.
                     executor.cancel_plan(fingerprint);
                     return Err(ServeError::Cancelled(query_id));
                 }
@@ -596,6 +645,11 @@ async fn run_query_inner(
         physical_plan_json,
         stats: stats.encode(),
     };
-    let _ = tx.send(Ok(encoder.stats_message(&stats_wire)?)).await;
+    if !sink
+        .deliver(encoder.stats_message(&stats_wire)?, cancel)
+        .await
+    {
+        return Err(ServeError::Cancelled(stats_wire.query_id));
+    }
     Ok(())
 }

@@ -2790,6 +2790,10 @@ class PyQueryResult:
     error_message: str | None
     rows_returned: int | None
     bytes_returned: int | None
+    error_class: str | None
+    remote_type: str | None
+    remote_module: str | None
+    remote_types: list[str]
 
     def __init__(
         self,
@@ -2797,6 +2801,10 @@ class PyQueryResult:
         error_message: str | None,
         rows_returned: int | None = None,
         bytes_returned: int | None = None,
+        error_class: str | None = None,
+        remote_type: str | None = None,
+        remote_module: str | None = None,
+        remote_types: list[str] | None = None,
     ) -> None: ...
 
 class PyDaftContext:

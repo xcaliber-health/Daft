@@ -15,6 +15,7 @@ import pyarrow as pa  # noqa: TID253
 import ray.experimental  # noqa: TID253
 
 import daft
+from daft._failures import query_result
 from daft.context import get_context
 from daft.daft import DistributedPhysicalPlan, PyExecutionStats, RayPartitionRef
 from daft.daft import PyRecordBatch as _PyRecordBatch
@@ -616,8 +617,14 @@ class RayRunner(Runner[ray.ObjectRef]):
         # What reached the reader, counted as each result is handed over.
         returned = ReturnedCounts()
 
-        def finished(end_state: QueryEndState, message: str) -> PyQueryResult:
-            return PyQueryResult(end_state, message, returned.rows, returned.bytes)
+        def finished(end_state: QueryEndState, message: str, failed_with: BaseException | None = None) -> PyQueryResult:
+            return query_result(
+                end_state,
+                message,
+                rows_returned=returned.rows,
+                bytes_returned=returned.bytes,
+                failed_with=failed_with,
+            )
 
         try:
             # Optimize the logical plan.
@@ -702,11 +709,11 @@ class RayRunner(Runner[ray.ObjectRef]):
             raise e
         except UDFException as e:
             err_msg = f"UDF failed with exception: {e.original_exception}"
-            ctx._notify_query_end(query_id, finished(QueryEndState.Failed, err_msg))
+            ctx._notify_query_end(query_id, finished(QueryEndState.Failed, err_msg, e))
             raise e
         except Exception as e:
             err_msg = f"General Exception raised: {e}"
-            ctx._notify_query_end(query_id, finished(QueryEndState.Failed, err_msg))
+            ctx._notify_query_end(query_id, finished(QueryEndState.Failed, err_msg, e))
             raise e
         finally:
             heartbeat.stop()

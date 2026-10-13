@@ -24,7 +24,7 @@ use tonic::transport::{Channel, Endpoint};
 
 use crate::{
     codec,
-    error::{ERROR_CLASS_METADATA_KEY, ServeError, ServeResult},
+    error::{ServeError, ServeResult, failure_of_status},
     wire::{self, ExplainResult, QueryRequest, QueryStatsWire, ServerInfo, actions},
 };
 
@@ -106,19 +106,6 @@ pub fn referenced_pset_keys(plan: &LogicalPlan) -> Vec<String> {
     keys
 }
 
-/// Maps a transport status into a client-side error, preserving the server's
-/// error class for faithful re-raising.
-fn status_to_error(status: &tonic::Status) -> ServeError {
-    let class = status
-        .metadata()
-        .get(ERROR_CLASS_METADATA_KEY)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("Transport");
-    ServeError::Execution(DaftError::External(
-        format!("[{class}] {}", status.message()).into(),
-    ))
-}
-
 /// Connection to one serving endpoint.
 ///
 /// Cloning is cheap and every clone shares the one underlying connection, which
@@ -188,7 +175,7 @@ impl ServeClient {
             .inner
             .do_get(call)
             .await
-            .map_err(|s| status_to_error(&s))?;
+            .map_err(|s| failure_of_status(&s))?;
         let stream = response
             .into_inner()
             .map(|r| r.map_err(|s| arrow_flight::error::FlightError::Tonic(Box::new(s))));
@@ -213,13 +200,13 @@ impl ServeClient {
             .inner
             .do_action(call)
             .await
-            .map_err(|s| status_to_error(&s))?
+            .map_err(|s| failure_of_status(&s))?
             .into_inner();
         let first = stream
             .next()
             .await
             .transpose()
-            .map_err(|s| status_to_error(&s))?;
+            .map_err(|s| failure_of_status(&s))?;
         Ok(first.map(|r| r.body.to_vec()).unwrap_or_default())
     }
 
@@ -280,7 +267,7 @@ impl QueryResultStream {
             let message = match self.decoder.next().await? {
                 Ok(message) => message,
                 Err(arrow_flight::error::FlightError::Tonic(status)) => {
-                    return Some(Err(status_to_error(status.as_ref())));
+                    return Some(Err(failure_of_status(status.as_ref())));
                 }
                 Err(e) => {
                     return Some(Err(ServeError::Execution(DaftError::External(

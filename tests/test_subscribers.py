@@ -217,6 +217,41 @@ def test_an_in_process_query_reports_what_it_returned_and_no_queue():
     assert result.bytes_returned > 0
 
 
+@daft.udf(return_dtype=daft.DataType.int64())
+def _udf_raising_key_error(v: daft.Series) -> daft.Series:
+    raise KeyError("no such row")
+
+
+@pytest.mark.parametrize(
+    ("frame", "error_class", "remote_types"),
+    [
+        pytest.param(
+            lambda: daft.from_pydict({"k": [1, 1], "v": [1, 2]}).groupby("k").agg(daft.col("v").single_value()),
+            "DaftCardinalityError",
+            [],
+            id="an engine failure by its class",
+        ),
+        pytest.param(
+            lambda: daft.from_pydict({"v": [1]}).select(_udf_raising_key_error(daft.col("v"))),
+            "Python",
+            ["KeyError", "LookupError"],
+            id="a function's failure by the type it raised",
+        ),
+    ],
+)
+def test_a_failed_query_ends_naming_its_kind(frame, error_class, remote_types):
+    subscriber = MockSubscriber()
+
+    with daft.with_subscriber("mock", subscriber):
+        with pytest.raises(Exception):
+            frame().collect()
+
+    result = subscriber.results[subscriber.query_ids[-1]]
+    assert result.end_state == QueryEndState.Failed
+    assert result.error_class == error_class
+    assert result.remote_types[:2] == remote_types
+
+
 def test_execution_events_inherit_from_event_base():
     assert isinstance(OperatorStarted(query_id="q", node_id=1, name="scan"), Event)
     assert isinstance(Stats(query_id="q", stats={}), Event)

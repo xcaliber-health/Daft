@@ -127,7 +127,12 @@ pub enum Error {
 
 impl From<Error> for DaftError {
     fn from(value: Error) -> Self {
-        Self::External(value.into())
+        match value {
+            // A Python exception keeps its type: it is raised as itself.
+            #[cfg(feature = "python")]
+            Error::PyIO { source } => Self::PyO3Error(source),
+            other => Self::External(other.into()),
+        }
     }
 }
 

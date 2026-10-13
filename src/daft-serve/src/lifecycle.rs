@@ -12,7 +12,7 @@
 use std::{sync::Arc, time::Instant};
 
 use common_metrics::{QueryEndState, QueryID};
-use daft_context::subscribers::{QueryMetadata, QueryResult};
+use daft_context::subscribers::{QueryFailure, QueryMetadata, QueryResult};
 use daft_logical_plan::LogicalPlanBuilder;
 
 use crate::{
@@ -32,12 +32,25 @@ fn lane(payload: &QueryPayload) -> (&'static str, Option<String>) {
     }
 }
 
-/// The end state and message a query's outcome is reported with.
-fn ending(outcome: &Result<(), ServeError>) -> (QueryEndState, String) {
+/// The end state and message a query's outcome is reported with, and a
+/// failure's kind. The kind never carries an exception's named fields.
+fn ending(outcome: &Result<(), ServeError>) -> (QueryEndState, String, Option<QueryFailure>) {
     match outcome {
-        Ok(()) => (QueryEndState::Finished, "Query finished".to_string()),
-        Err(ServeError::Cancelled(_)) => (QueryEndState::Canceled, "Query canceled".to_string()),
-        Err(err) => (QueryEndState::Failed, err.to_string()),
+        Ok(()) => (QueryEndState::Finished, "Query finished".to_string(), None),
+        Err(ServeError::Cancelled(_)) => {
+            (QueryEndState::Canceled, "Query canceled".to_string(), None)
+        }
+        Err(err) => {
+            let failure = err.failure();
+            let python = failure.python;
+            let kind = QueryFailure {
+                error_class: failure.error_class,
+                remote_type: python.as_ref().map(|p| p.remote_type.clone()),
+                remote_module: python.as_ref().map(|p| p.remote_module.clone()),
+                remote_types: python.map(|p| p.remote_types).unwrap_or_default(),
+            };
+            (QueryEndState::Failed, err.to_string(), Some(kind))
+        }
     }
 }
 
@@ -169,11 +182,16 @@ impl QueryLifecycle {
 
     /// Reports the query's end with its outcome.
     pub fn finish(mut self, outcome: &Result<(), ServeError>) {
-        let (end_state, message) = ending(outcome);
-        self.report_end(end_state, message);
+        let (end_state, message, failure) = ending(outcome);
+        self.report_end(end_state, message, failure);
     }
 
-    fn report_end(&mut self, end_state: QueryEndState, message: String) {
+    fn report_end(
+        &mut self,
+        end_state: QueryEndState,
+        message: String,
+        failure: Option<QueryFailure>,
+    ) {
         self.ended = true;
         if !self.listening {
             return;
@@ -185,6 +203,7 @@ impl QueryLifecycle {
                 error_message: Some(message),
                 rows_returned: Some(self.rows_returned),
                 bytes_returned: Some(self.bytes_returned),
+                failure,
             },
         );
     }
@@ -196,6 +215,7 @@ impl Drop for QueryLifecycle {
             self.report_end(
                 QueryEndState::Canceled,
                 "Query canceled: its task was abandoned".to_string(),
+                None,
             );
         }
     }
@@ -206,25 +226,59 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::error::{Failure, PythonFailure};
+
+    fn host_failure() -> ServeError {
+        ServeError::Failed {
+            failure: Box::new(Failure {
+                error_class: "Host".into(),
+                engine: false,
+                retryable: false,
+                python: Some(PythonFailure {
+                    remote_type: "Refused".into(),
+                    remote_module: "host".into(),
+                    remote_types: vec!["Refused".into(), "Exception".into()],
+                    udf: false,
+                    fields: vec![("detail".into(), "a secret".into())],
+                }),
+            }),
+            message: "Refused: no".into(),
+        }
+    }
 
     #[rstest]
-    #[case::finished(Ok(()), QueryEndState::Finished)]
-    #[case::cancelled(Err(ServeError::Cancelled("q".into())), QueryEndState::Canceled)]
+    #[case::finished(Ok(()), QueryEndState::Finished, None)]
+    #[case::cancelled(Err(ServeError::Cancelled("q".into())), QueryEndState::Canceled, None)]
     #[case::timed_out(
         Err(ServeError::Timeout { query_id: "q".into(), limit_secs: 1 }),
-        QueryEndState::Failed
+        QueryEndState::Failed,
+        Some("Timeout")
     )]
     #[case::at_capacity(
         Err(ServeError::AtCapacity { max_concurrent: 1, waited_secs: 1 }),
-        QueryEndState::Failed
+        QueryEndState::Failed,
+        Some("AtCapacity")
     )]
-    fn an_outcome_ends_in_its_state(
+    #[case::host(Err(host_failure()), QueryEndState::Failed, Some("Host"))]
+    fn an_outcome_ends_in_its_state_and_kind(
         #[case] outcome: Result<(), ServeError>,
         #[case] expected: QueryEndState,
+        #[case] expected_class: Option<&str>,
     ) {
-        let (state, _) = ending(&outcome);
+        let (state, _, failure) = ending(&outcome);
 
         assert_eq!(format!("{state:?}"), format!("{expected:?}"));
+        assert_eq!(failure.map(|f| f.error_class).as_deref(), expected_class);
+    }
+
+    #[test]
+    fn a_python_failure_names_its_type_and_never_its_fields() {
+        let (_, message, failure) = ending(&Err(host_failure()));
+        let failure = failure.expect("a failed query has a kind");
+
+        assert_eq!(failure.remote_type.as_deref(), Some("Refused"));
+        assert_eq!(failure.remote_types, vec!["Refused", "Exception"]);
+        assert!(!format!("{failure:?}{message}").contains("a secret"));
     }
 
     #[rstest]

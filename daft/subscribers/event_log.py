@@ -232,6 +232,12 @@ class EventLogSubscriber(Subscriber):
             payload["rows_returned"] = event.result.rows_returned
         if event.result.bytes_returned is not None:
             payload["bytes_returned"] = event.result.bytes_returned
+        if event.result.error_class is not None:
+            payload["error_class"] = event.result.error_class
+        if event.result.remote_type is not None:
+            payload["remote_type"] = event.result.remote_type
+            payload["remote_module"] = event.result.remote_module
+            payload["remote_types"] = event.result.remote_types
 
         self._write_event(event.query_id, "query_ended", payload)
         self._clear_query_state(event.query_id)

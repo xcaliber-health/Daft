@@ -7,7 +7,7 @@ use pyo3::prelude::*;
 
 use crate::{
     DaftContext, subscribers,
-    subscribers::{QueryMetadata, QueryResult},
+    subscribers::{QueryFailure, QueryMetadata, QueryResult},
 };
 
 #[pyclass(frozen, from_py_object)]
@@ -89,18 +89,39 @@ pub struct PyQueryResult(pub(crate) Arc<QueryResult>);
 impl PyQueryResult {
     // Query Result contains the final state of a query, and if there is any error, contains an error message
     #[new]
-    #[pyo3(signature = (end_state, error_message, rows_returned=None, bytes_returned=None))]
+    #[pyo3(signature = (
+        end_state,
+        error_message,
+        rows_returned=None,
+        bytes_returned=None,
+        error_class=None,
+        remote_type=None,
+        remote_module=None,
+        remote_types=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn __new__(
         end_state: QueryEndState,
         error_message: Option<String>,
         rows_returned: Option<u64>,
         bytes_returned: Option<u64>,
+        error_class: Option<String>,
+        remote_type: Option<String>,
+        remote_module: Option<String>,
+        remote_types: Option<Vec<String>>,
     ) -> Self {
+        let failure = error_class.map(|error_class| QueryFailure {
+            error_class,
+            remote_type,
+            remote_module,
+            remote_types: remote_types.unwrap_or_default(),
+        });
         Self(Arc::new(QueryResult {
             end_state,
             error_message,
             rows_returned,
             bytes_returned,
+            failure,
         }))
     }
     #[getter]
@@ -120,6 +141,34 @@ impl PyQueryResult {
     #[getter]
     pub fn bytes_returned(&self) -> Option<u64> {
         self.0.bytes_returned
+    }
+    /// The kind of failure a failed query ended with: the engine class's
+    /// name, `Host`, `Python`, or a server's own class.
+    #[getter]
+    pub fn error_class(&self) -> Option<String> {
+        self.0.failure.as_ref().map(|f| f.error_class.clone())
+    }
+    /// For a Python failure, the name of the raised type.
+    #[getter]
+    pub fn remote_type(&self) -> Option<String> {
+        self.0.failure.as_ref().and_then(|f| f.remote_type.clone())
+    }
+    /// For a Python failure, the module of the raised type.
+    #[getter]
+    pub fn remote_module(&self) -> Option<String> {
+        self.0
+            .failure
+            .as_ref()
+            .and_then(|f| f.remote_module.clone())
+    }
+    /// For a Python failure, the names of the raised type's hierarchy, nearest first.
+    #[getter]
+    pub fn remote_types(&self) -> Vec<String> {
+        self.0
+            .failure
+            .as_ref()
+            .map(|f| f.remote_types.clone())
+            .unwrap_or_default()
     }
 }
 

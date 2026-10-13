@@ -30,6 +30,15 @@ class UDFException(Exception):
         # We except every creation of UDFException to be `raise UDFException(...) from ...`
         return self.__cause__
 
+    def __reduce__(self) -> tuple[type[UDFException], tuple[str, TracebackException | None]]:
+        """Pickle with a replica of the original exception, which `__cause__` does not carry to another process."""
+        from traceback import TracebackException
+
+        tb_info = self.tb_info
+        if tb_info is None and self.__cause__ is not None:
+            tb_info = TracebackException.from_exception(self.__cause__)
+        return (type(self), (self.message, tb_info))
+
     def __str__(self) -> str:
         if self.tb_info:
             return (

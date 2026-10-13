@@ -121,7 +121,7 @@ pub fn payload_to_builder(
             let dataframe = host
                 .bind(py)
                 .call_method1(intern!(py, "plan"), (served,))
-                .map_err(|e| ServeError::Execution(e.into()))?;
+                .map_err(|e| crate::failure::of_py_err(py, &e, crate::failure::Raised::ByHost))?;
             frame_builder(&dataframe)
         }),
     }
@@ -194,7 +194,7 @@ pub async fn explain(
     let optimized = tokio::select! {
         biased;
         () = cancel.cancelled() => return Err(ServeError::Cancelled(query_id)),
-        optimized = bounded => optimized?,
+        optimized = bounded => optimized.map_err(crate::failure::classify)?,
     };
     Ok(ExplainResult {
         optimized_plan: optimized.build().repr_ascii(false),
@@ -360,7 +360,7 @@ pub async fn run_query(
         if cancel.is_cancelled() && !matches!(err, ServeError::Timeout { .. }) {
             ServeError::Cancelled(query_id)
         } else {
-            err
+            crate::failure::classify(err)
         }
     });
     lifecycle.finish(&result);

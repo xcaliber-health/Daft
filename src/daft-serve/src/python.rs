@@ -13,23 +13,86 @@ use std::{
 };
 
 use common_daft_config::PyDaftExecutionConfig;
-use common_error::DaftError;
 use daft_local_plan::{ExecutionStats, python::PyExecutionStats};
 use daft_logical_plan::PyLogicalPlanBuilder;
 use daft_micropartition::python::PyMicroPartition;
-use pyo3::prelude::*;
+use pyo3::{prelude::*, types::PyDict};
 
 use crate::{
     auth::AuthPolicy,
     client::{QueryResultStream, ServeClient, referenced_pset_keys},
     codec,
-    error::ServeError,
+    error::{Failure, ServeError},
     server::{DaftServeService, ServeConfig, ServeShutdownHandle, TenantConfig, start_server},
     wire::{self, NamedPartitionSet, QueryPayload, QueryRequest},
 };
 
 fn to_py_err(err: ServeError) -> PyErr {
-    DaftError::from(err).into()
+    served_error(err, None)
+}
+
+/// Builds the exception a failure is raised as on this side.
+///
+/// An engine failure is raised as the engine class it names, a user-defined
+/// function's failure as `UDFException`, and any other failure as
+/// `DaftServeError`, each carrying the failure's fields and `query_id`. A
+/// failure of this side's own engine is raised as it is in-process. No class
+/// is ever imported by a name the server sent.
+fn served_error(err: ServeError, query_id: Option<&str>) -> PyErr {
+    Python::attach(|py| {
+        let built = match err {
+            ServeError::Execution(local) => Ok(PyErr::from(local)),
+            ServeError::Failed { failure, message } => failure_error(py, &failure, message),
+            other => failure_error(py, &other.failure(), other.to_string()),
+        };
+        let raised = built.unwrap_or_else(|building| building);
+        if let Some(query_id) = query_id
+            && let Err(setting) = raised.value(py).setattr("query_id", query_id)
+        {
+            return setting;
+        }
+        raised
+    })
+}
+
+fn failure_error(py: Python<'_>, failure: &Failure, message: String) -> PyResult<PyErr> {
+    if failure.engine {
+        return Ok(common_error::python::engine_exception(
+            &failure.error_class,
+            message,
+        ));
+    }
+    let attrs = PyDict::new(py);
+    attrs.set_item("error_class", &failure.error_class)?;
+    attrs.set_item("retryable", failure.retryable)?;
+    if let Some(python) = &failure.python {
+        attrs.set_item("remote_type", &python.remote_type)?;
+        attrs.set_item("remote_module", &python.remote_module)?;
+        attrs.set_item(
+            "remote_types",
+            pyo3::types::PyTuple::new(py, &python.remote_types)?,
+        )?;
+        let fields = PyDict::new(py);
+        for (name, value) in &python.fields {
+            fields.set_item(name, value)?;
+        }
+        attrs.set_item("fields", fields)?;
+        if python.udf {
+            let raised = py
+                .import(pyo3::intern!(py, "daft.errors"))?
+                .getattr(pyo3::intern!(py, "UDFException"))?
+                .call1((message,))?;
+            for (name, value) in attrs.iter() {
+                raised.setattr(name.extract::<String>()?.as_str(), value)?;
+            }
+            return Ok(PyErr::from_value(raised));
+        }
+    }
+    let raised = py
+        .import(pyo3::intern!(py, "daft.exceptions"))?
+        .getattr(pyo3::intern!(py, "DaftServeError"))?
+        .call((message,), Some(&attrs))?;
+    Ok(PyErr::from_value(raised))
 }
 
 fn block_on<F, T>(py: Python<'_>, future: F) -> PyResult<T>
@@ -39,6 +102,16 @@ where
 {
     py.detach(|| common_runtime::get_io_runtime(true).block_on_current_thread(future))
         .map_err(to_py_err)
+}
+
+/// Runs a call for the query `query_id`, raising its failure with that id.
+fn block_on_query<F, T>(py: Python<'_>, query_id: &str, future: F) -> PyResult<T>
+where
+    F: std::future::Future<Output = Result<T, ServeError>> + Send,
+    T: Send,
+{
+    py.detach(|| common_runtime::get_io_runtime(true).block_on_current_thread(future))
+        .map_err(|err| served_error(err, Some(query_id)))
 }
 
 /// A serving process bound to a host and port.
@@ -284,6 +357,7 @@ impl PyServeServerInfo {
 pub struct PyServeQueryResult {
     stream: tokio::sync::Mutex<QueryResultStream>,
     optimized_locally: bool,
+    query_id: String,
 }
 
 #[pymethods]
@@ -307,7 +381,7 @@ impl PyServeQueryResult {
         match partition {
             None => Ok(None),
             Some(Ok(partition)) => Ok(Some(PyMicroPartition::from(partition))),
-            Some(Err(err)) => Err(to_py_err(err)),
+            Some(Err(err)) => Err(served_error(err, Some(&self.query_id))),
         }
     }
 
@@ -447,11 +521,13 @@ impl PyDaftServeClient {
             query_id,
             results_buffer_size,
         )?;
+        let query_id = request.query_id.clone();
         let mut client = self.inner.clone();
-        let stream = block_on(py, async move { client.run(&request).await })?;
+        let stream = block_on_query(py, &query_id, async move { client.run(&request).await })?;
         Ok(PyServeQueryResult {
             stream: tokio::sync::Mutex::new(stream),
             optimized_locally,
+            query_id,
         })
     }
 
@@ -471,11 +547,13 @@ impl PyDaftServeClient {
             psets: vec![],
             results_buffer_size,
         };
+        let query_id = request.query_id.clone();
         let mut client = self.inner.clone();
-        let stream = block_on(py, async move { client.run(&request).await })?;
+        let stream = block_on_query(py, &query_id, async move { client.run(&request).await })?;
         Ok(PyServeQueryResult {
             stream: tokio::sync::Mutex::new(stream),
             optimized_locally: false,
+            query_id,
         })
     }
 
@@ -499,11 +577,13 @@ impl PyDaftServeClient {
             psets: vec![],
             results_buffer_size,
         };
+        let query_id = request.query_id.clone();
         let mut client = self.inner.clone();
-        let stream = block_on(py, async move { client.run(&request).await })?;
+        let stream = block_on_query(py, &query_id, async move { client.run(&request).await })?;
         Ok(PyServeQueryResult {
             stream: tokio::sync::Mutex::new(stream),
             optimized_locally: false,
+            query_id,
         })
     }
 
@@ -524,8 +604,10 @@ impl PyDaftServeClient {
             psets: vec![],
             results_buffer_size: None,
         };
+        let query_id = request.query_id.clone();
         let mut client = self.inner.clone();
-        let explained = block_on(py, async move { client.explain(&request).await })?;
+        let explained =
+            block_on_query(py, &query_id, async move { client.explain(&request).await })?;
         Ok(explained.optimized_plan)
     }
 
@@ -545,8 +627,10 @@ impl PyDaftServeClient {
             query_id.unwrap_or_else(explain_query_id),
             None,
         )?;
+        let query_id = request.query_id.clone();
         let mut client = self.inner.clone();
-        let explained = block_on(py, async move { client.explain(&request).await })?;
+        let explained =
+            block_on_query(py, &query_id, async move { client.explain(&request).await })?;
         if optimized_locally {
             Ok(format!(
                 "Note: a source in this plan cannot travel, so scan planning \

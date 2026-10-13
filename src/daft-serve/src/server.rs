@@ -327,7 +327,7 @@ impl DaftServeService {
         let request = self.admit_request(body, &limits)?;
         let guard = self.registry.register(&request.query_id, tenant);
         let cancel = guard.token();
-        let _permit = self
+        let permit = self
             .admission
             .pool(tenant)
             .acquire(&request.query_id, &cancel)
@@ -342,6 +342,7 @@ impl DaftServeService {
             origin,
             &cancel,
             limits.query_timeout_secs,
+            permit,
         )
         .await
     }

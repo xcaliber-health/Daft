@@ -7,9 +7,14 @@
 //! server process's subscribers under the query id the client chose.
 //!
 //! Reporting never fails a query: a subscriber's failure is logged and the
-//! query goes on.
+//! query goes on. Nothing is reported after a query's end: planning that
+//! outlives its query, as a host's planning past the time limit does, reports
+//! neither its start nor its optimization.
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{Arc, Mutex, PoisonError},
+    time::Instant,
+};
 
 use common_metrics::{QueryEndState, QueryID};
 use daft_context::subscribers::{QueryFailure, QueryMetadata, QueryResult};
@@ -60,9 +65,19 @@ fn ending(outcome: &Result<(), ServeError>) -> (QueryEndState, String, Option<Qu
 pub struct PlanningEvents {
     query_id: QueryID,
     queued_seconds: f64,
+    /// Whether the query has not yet ended; nothing is reported once it has.
+    open: Arc<Mutex<bool>>,
 }
 
 impl PlanningEvents {
+    /// Runs `report` unless the query has ended, holding its end back meanwhile.
+    fn while_open(&self, report: impl FnOnce()) {
+        let open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        if *open {
+            report();
+        }
+    }
+
     /// Reports that the query started, once its plan exists, and that its
     /// optimization began.
     pub fn started(&self, builder: &LogicalPlanBuilder) {
@@ -85,29 +100,31 @@ impl PlanningEvents {
             ray_version: None,
             queued_seconds: Some(self.queued_seconds),
         });
-        if let Err(err) = ctx.notify_query_start(self.query_id.clone(), metadata) {
-            log::warn!("query {}: could not report its start: {err}", self.query_id);
-        }
-        if let Err(err) = ctx.notify_optimization_start(self.query_id.clone()) {
-            log::warn!(
-                "query {}: could not report its optimization: {err}",
-                self.query_id
-            );
-        }
+        self.while_open(|| {
+            if let Err(err) = ctx.notify_query_start(self.query_id.clone(), metadata) {
+                log::warn!("query {}: could not report its start: {err}", self.query_id);
+            }
+            if let Err(err) = ctx.notify_optimization_start(self.query_id.clone()) {
+                log::warn!(
+                    "query {}: could not report its optimization: {err}",
+                    self.query_id
+                );
+            }
+        });
     }
 
     /// Reports that the query's optimization completed, with its plan.
     pub fn optimized(&self, builder: &LogicalPlanBuilder) {
         let ctx = daft_context::get_context();
         match builder.repr_json(false) {
-            Ok(plan) => {
+            Ok(plan) => self.while_open(|| {
                 if let Err(err) = ctx.notify_optimization_end(self.query_id.clone(), plan.into()) {
                     log::warn!(
                         "query {}: could not report its optimization: {err}",
                         self.query_id
                     );
                 }
-            }
+            }),
             Err(err) => log::warn!("query {}: could not render its plan: {err}", self.query_id),
         }
     }
@@ -129,6 +146,8 @@ pub struct QueryLifecycle {
     rows_returned: u64,
     bytes_returned: u64,
     ended: bool,
+    /// Whether the query has not yet ended, shared with its planning's reporter.
+    open: Arc<Mutex<bool>>,
 }
 
 impl QueryLifecycle {
@@ -157,6 +176,7 @@ impl QueryLifecycle {
             rows_returned: 0,
             bytes_returned: 0,
             ended: false,
+            open: Arc::new(Mutex::new(true)),
         }
     }
 
@@ -171,6 +191,7 @@ impl QueryLifecycle {
         self.listening.then(|| PlanningEvents {
             query_id: self.query_id.clone(),
             queued_seconds: self.queued_seconds,
+            open: self.open.clone(),
         })
     }
 
@@ -193,6 +214,9 @@ impl QueryLifecycle {
         failure: Option<QueryFailure>,
     ) {
         self.ended = true;
+        // Closed before the end is reported, so planning still running reports nothing after it.
+        let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        *open = false;
         if !self.listening {
             return;
         }

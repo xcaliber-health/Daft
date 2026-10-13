@@ -241,6 +241,22 @@ def test_udf_error():
     assert isinstance(exc_info.value.__cause__, ValueError) and str(exc_info.value.__cause__) == "AN ERROR OCCURRED!"
 
 
+def test_a_udf_exception_sent_to_another_process_keeps_its_original():
+    import pickle
+
+    try:
+        try:
+            raise ValueError("AN ERROR OCCURRED!")
+        except ValueError as original:
+            raise UDFException("User-defined function `f` failed") from original
+    except UDFException as raised:
+        received = pickle.loads(pickle.dumps(raised))
+
+    assert received.message == "User-defined function `f` failed"
+    assert received.tb_info is not None and received.tb_info.exc_type is ValueError
+    assert "AN ERROR OCCURRED!" in str(received)
+
+
 @pytest.mark.parametrize("batch_size", [None, 1, 2, 3, 10])
 @pytest.mark.parametrize("use_actor_pool", [False, True])
 def test_no_args_udf_call(batch_size, use_actor_pool):

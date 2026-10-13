@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from daft.daft import PyQueryResult, QueryEndState
+    from daft.errors import UDFException
 
 #: Module whose classes are the engine's own.
 ENGINE_MODULE = "daft.exceptions"
@@ -70,6 +71,7 @@ def failure_kind(exc: BaseException, *, raised_by_host: bool = False) -> Failure
     """
     from daft.errors import UDFException
 
+    exc = _unwrapped(exc)
     kind = type(exc)
     # The engine raises a missing file as the builtin class.
     if kind.__module__ == ENGINE_MODULE or kind is FileNotFoundError:
@@ -77,7 +79,7 @@ def failure_kind(exc: BaseException, *, raised_by_host: bool = False) -> Failure
     udf = isinstance(exc, UDFException)
     original = exc.original_exception if isinstance(exc, UDFException) else None
     named = original if original is not None else exc
-    named_type = type(named)
+    named_type = _raised_type(exc) if isinstance(exc, UDFException) and original is None else type(named)
     return FailureKind(
         error_class=HOST if raised_by_host else PYTHON,
         remote_type=named_type.__name__,
@@ -86,6 +88,22 @@ def failure_kind(exc: BaseException, *, raised_by_host: bool = False) -> Failure
         udf=udf,
         fields=served_fields(named),
     )
+
+
+def _raised_type(exc: UDFException) -> type[BaseException]:
+    """Return the type a function's failure raised in another process, from the traceback it sent back."""
+    raised = getattr(exc.tb_info, "exc_type", None) if exc.tb_info is not None else None
+    if isinstance(raised, type) and issubclass(raised, BaseException):
+        return raised
+    return type(exc)
+
+
+def _unwrapped(exc: BaseException) -> BaseException:
+    """Return the exception a distributed task raised, rather than the wrapper that carried it back."""
+    cause = getattr(exc, "cause", None)
+    if type(exc).__module__.startswith("ray.") and isinstance(cause, BaseException):
+        return cause
+    return exc
 
 
 def query_result(

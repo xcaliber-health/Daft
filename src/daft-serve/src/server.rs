@@ -54,6 +54,8 @@ pub struct TenantConfig {
     /// Ceiling on buffered execution memory per query for this tenant;
     /// queries over it spill to disk rather than grow.
     pub memory_cap_bytes: Option<usize>,
+    /// Cap on the body of one of this tenant's host requests.
+    pub max_request_body_bytes: Option<usize>,
 }
 
 /// Runtime configuration of one serving process.
@@ -82,6 +84,8 @@ pub struct ServeConfig {
     /// Ceiling on buffered execution memory per query; `0` disables it.
     /// Queries over the ceiling spill to disk rather than grow.
     pub query_memory_cap_bytes: usize,
+    /// Cap on the body of one host request.
+    pub max_request_body_bytes: usize,
     /// Named tenants with per-tenant limits; empty for single-credential
     /// or unauthenticated servers.
     pub tenants: Vec<TenantConfig>,
@@ -108,6 +112,11 @@ impl ServeConfig {
         if self.max_concurrent_queries == 0 {
             return Err(ServeError::InvalidEnvelope(
                 "max_concurrent_queries must be at least 1".to_string(),
+            ));
+        }
+        if self.max_request_body_bytes == 0 {
+            return Err(ServeError::InvalidEnvelope(
+                "max_request_body_bytes must be at least 1".to_string(),
             ));
         }
         let mut names = std::collections::HashSet::with_capacity(self.tenants.len());
@@ -138,6 +147,12 @@ impl ServeConfig {
                     tenant.name
                 )));
             }
+            if tenant.max_request_body_bytes == Some(0) {
+                return Err(ServeError::InvalidEnvelope(format!(
+                    "tenant `{}`: max_request_body_bytes must be at least 1",
+                    tenant.name
+                )));
+            }
         }
         Ok(())
     }
@@ -148,6 +163,7 @@ impl ServeConfig {
 struct EffectiveLimits {
     query_timeout_secs: u64,
     max_pset_bytes: usize,
+    max_request_body_bytes: usize,
     memory_cap_bytes: Option<u64>,
 }
 
@@ -158,17 +174,24 @@ pub struct DaftServeService {
     registry: QueryRegistry,
     server_version: String,
     draining: Arc<AtomicBool>,
-    sql_session: Option<Arc<pyo3::Py<pyo3::PyAny>>>,
+    planners: execute::Planners,
+    /// Request kinds the registered host declared at startup; requests of
+    /// any other kind are refused before admission.
+    host_kinds: std::collections::HashSet<String>,
     catalogs: Vec<String>,
 }
 
 impl DaftServeService {
     /// Creates the service from validated configuration.
+    ///
+    /// `planners` holds the session for textual queries and the host for
+    /// requests; `host_kinds` are the request kinds the host declared.
     #[must_use]
     pub fn new(
         config: ServeConfig,
         server_version: String,
-        sql_session: Option<Arc<pyo3::Py<pyo3::PyAny>>>,
+        planners: execute::Planners,
+        host_kinds: std::collections::HashSet<String>,
         catalogs: Vec<String>,
     ) -> Self {
         let default_admission = Admission::new(
@@ -194,7 +217,8 @@ impl DaftServeService {
             registry: QueryRegistry::new(),
             server_version,
             draining: Arc::new(AtomicBool::new(false)),
-            sql_session,
+            planners,
+            host_kinds,
             catalogs,
             config,
         }
@@ -219,6 +243,9 @@ impl DaftServeService {
             max_pset_bytes: overrides
                 .and_then(|t| t.max_pset_bytes)
                 .unwrap_or(self.config.max_pset_bytes),
+            max_request_body_bytes: overrides
+                .and_then(|t| t.max_request_body_bytes)
+                .unwrap_or(self.config.max_request_body_bytes),
             memory_cap_bytes: (memory_cap > 0).then_some(memory_cap as u64),
         }
     }
@@ -244,11 +271,14 @@ impl DaftServeService {
     }
 
     /// Parses and policy-checks a request envelope into a query request,
-    /// applying the caller's effective payload limit.
+    /// applying the caller's effective payload limits.
+    ///
+    /// A host request of a kind the host did not declare is refused here,
+    /// before admission, so it costs no slot and never reaches host code.
     fn admit_request(
         &self,
         ticket_bytes: &[u8],
-        max_pset_bytes: usize,
+        limits: &EffectiveLimits,
     ) -> ServeResult<QueryRequest> {
         if self.draining.load(Ordering::Acquire) {
             return Err(ServeError::Draining);
@@ -260,8 +290,16 @@ impl DaftServeService {
             &envelope.sender_version,
             &self.server_version,
             self.config.disable_plan_payload,
-            max_pset_bytes,
+            limits.max_pset_bytes,
+            limits.max_request_body_bytes,
         )?;
+        if let wire::QueryPayload::Request { kind, .. } = &request.payload
+            && !self.host_kinds.contains(kind)
+        {
+            return Err(ServeError::MalformedPayload(format!(
+                "this server has no host for request kind `{kind}`"
+            )));
+        }
         Ok(request)
     }
 
@@ -277,15 +315,34 @@ impl DaftServeService {
     }
 
     /// Renders the server-side optimized plan for a request without
-    /// executing it, under the caller's effective payload limit.
-    fn explain(&self, body: &[u8], max_pset_bytes: usize) -> ServeResult<ExplainResult> {
-        let request = self.admit_request(body, max_pset_bytes)?;
-        let exec_config = execute::resolve_exec_config(&request)?;
-        let builder = execute::payload_to_builder(&request.payload, self.sql_session.as_ref())?;
-        let optimized = builder.optimize(exec_config)?;
-        Ok(ExplainResult {
-            optimized_plan: optimized.build().repr_ascii(false),
-        })
+    /// executing it.
+    ///
+    /// An explanation is admitted like a run: it takes one of the caller's
+    /// slots (its planning may read catalogs or call the host), is registered
+    /// so it can be cancelled, plans off the async runtime threads, and is
+    /// bounded by the caller's execution time limit.
+    async fn explain(&self, body: &[u8], tenant: Option<&str>) -> ServeResult<ExplainResult> {
+        let limits = self.effective_limits(tenant);
+        let request = self.admit_request(body, &limits)?;
+        let guard = self.registry.register(&request.query_id, tenant);
+        let cancel = guard.token();
+        let _permit = self
+            .admission
+            .pool(tenant)
+            .acquire(&request.query_id, &cancel)
+            .await?;
+        let origin = execute::RequestOrigin {
+            query_id: request.query_id.clone(),
+            caller: tenant.map(str::to_string),
+        };
+        execute::explain(
+            request,
+            self.planners.clone(),
+            origin,
+            &cancel,
+            limits.query_timeout_secs,
+        )
+        .await
     }
 }
 
@@ -372,7 +429,7 @@ impl FlightService for DaftServeService {
         let limits = self.effective_limits(tenant.as_deref());
         let ticket = request.into_inner();
         let query = self
-            .admit_request(&ticket.ticket, limits.max_pset_bytes)
+            .admit_request(&ticket.ticket, &limits)
             .map_err(Status::from)?;
 
         // Registered before it waits for a slot, so a queued query can be
@@ -393,14 +450,15 @@ impl FlightService for DaftServeService {
         // network sends without unbounded memory growth.
         let buffer = query.results_buffer_size.unwrap_or(8).clamp(1, 64);
         let (tx, rx) = async_channel::bounded(buffer);
-        let sql_session = self.sql_session.clone();
+        let planners = self.planners.clone();
         let bounds = execute::QueryBounds {
             timeout_secs: limits.query_timeout_secs,
             memory_cap_bytes: limits.memory_cap_bytes,
             result_buffer_size: buffer,
         };
         let task = common_runtime::get_io_runtime(true).spawn(async move {
-            execute::run_query(query, sql_session, cancel, permit, guard, tx, bounds).await;
+            let hold = execute::QueryHold { permit, guard };
+            execute::run_query(query, planners, tenant, cancel, hold, tx, bounds).await;
         });
 
         // The response stream owns the execution task: dropping the stream
@@ -444,9 +502,9 @@ impl FlightService for DaftServeService {
                 vec![u8::from(found)]
             }
             actions::EXPLAIN => {
-                let limits = self.effective_limits(tenant.as_deref());
                 let explained = self
-                    .explain(&action.body, limits.max_pset_bytes)
+                    .explain(&action.body, tenant.as_deref())
+                    .await
                     .map_err(Status::from)?;
                 wire::encode(&explained).map_err(Status::from)?
             }
@@ -673,6 +731,7 @@ mod tests {
             disable_plan_payload: false,
             query_timeout_secs: 0,
             query_memory_cap_bytes: 0,
+            max_request_body_bytes: 1024 * 1024,
             tenants: vec![],
         }
     }

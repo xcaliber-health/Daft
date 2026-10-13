@@ -7,7 +7,7 @@
 //! network waits never stall unrelated interpreter threads.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -44,7 +44,8 @@ where
 /// A serving process bound to a host and port.
 /// One tenant as configured from the client: name, token, and its optional
 /// per-tenant limits (concurrent queries, queue timeout, query timeout, plan
-/// payload bytes, memory cap bytes), each `None` where the default applies.
+/// payload bytes, memory cap bytes, request body bytes), each `None` where
+/// the default applies.
 type TenantSpec = (
     String,
     String,
@@ -53,7 +54,16 @@ type TenantSpec = (
     Option<u64>,
     Option<usize>,
     Option<usize>,
+    Option<usize>,
 );
+
+/// Reads the request kinds a host declares, once, when the server starts.
+fn declared_kinds(host: &Bound<'_, PyAny>) -> PyResult<HashSet<String>> {
+    host.getattr(pyo3::intern!(host.py(), "kinds"))?
+        .try_iter()?
+        .map(|kind| kind?.extract::<String>())
+        .collect()
+}
 
 #[pyclass(module = "daft.daft", name = "DaftServeServer", frozen)]
 pub struct PyDaftServer {
@@ -81,6 +91,8 @@ impl PyDaftServer {
         tenants=Vec::new(),
         session=None,
         catalogs=Vec::new(),
+        request_host=None,
+        max_request_body_bytes=1024 * 1024,
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -98,7 +110,14 @@ impl PyDaftServer {
         tenants: Vec<TenantSpec>,
         session: Option<Py<PyAny>>,
         catalogs: Vec<String>,
+        request_host: Option<Py<PyAny>>,
+        max_request_body_bytes: usize,
     ) -> PyResult<Self> {
+        let host_kinds = request_host
+            .as_ref()
+            .map(|request_host| declared_kinds(request_host.bind(py)))
+            .transpose()?
+            .unwrap_or_default();
         let tenants: Vec<TenantConfig> = tenants
             .into_iter()
             .map(
@@ -110,6 +129,7 @@ impl PyDaftServer {
                     query_timeout,
                     pset_cap,
                     memory_cap,
+                    request_body_cap,
                 )| {
                     TenantConfig {
                         name,
@@ -119,6 +139,7 @@ impl PyDaftServer {
                         query_timeout_secs: query_timeout,
                         max_pset_bytes: pset_cap,
                         memory_cap_bytes: memory_cap,
+                        max_request_body_bytes: request_body_cap,
                     }
                 },
             )
@@ -149,12 +170,18 @@ impl PyDaftServer {
             disable_plan_payload,
             query_timeout_secs,
             query_memory_cap_bytes,
+            max_request_body_bytes,
             tenants,
+        };
+        let planners = crate::execute::Planners {
+            session: session.map(Arc::new),
+            host: request_host.map(Arc::new),
         };
         let service = DaftServeService::new(
             config,
             common_version::VERSION.to_string(),
-            session.map(Arc::new),
+            planners,
+            host_kinds,
             catalogs,
         );
         let mut handle = py.detach(|| start_server(service)).map_err(to_py_err)?;
@@ -452,14 +479,70 @@ impl PyDaftServeClient {
         })
     }
 
+    /// Submits a request of a kind the server's host plans.
+    ///
+    /// The server routes it by `kind` and hands the host the body unread,
+    /// together with the query id and the authenticated caller.
+    #[pyo3(signature = (kind, body, query_id, results_buffer_size=None))]
+    pub fn run_request(
+        &self,
+        py: Python<'_>,
+        kind: String,
+        body: Vec<u8>,
+        query_id: String,
+        results_buffer_size: Option<usize>,
+    ) -> PyResult<PyServeQueryResult> {
+        let request = QueryRequest {
+            query_id,
+            payload: QueryPayload::Request { kind, body },
+            exec_config: None,
+            psets: vec![],
+            results_buffer_size,
+        };
+        let mut client = self.inner.clone();
+        let stream = block_on(py, async move { client.run(&request).await })?;
+        Ok(PyServeQueryResult {
+            stream: tokio::sync::Mutex::new(stream),
+            optimized_locally: false,
+        })
+    }
+
+    /// Renders the plan the server's host would run for a request, without
+    /// executing it.
+    #[pyo3(signature = (kind, body, query_id=None))]
+    pub fn explain_request(
+        &self,
+        py: Python<'_>,
+        kind: String,
+        body: Vec<u8>,
+        query_id: Option<String>,
+    ) -> PyResult<String> {
+        let request = QueryRequest {
+            query_id: query_id.unwrap_or_else(explain_query_id),
+            payload: QueryPayload::Request { kind, body },
+            exec_config: None,
+            psets: vec![],
+            results_buffer_size: None,
+        };
+        let mut client = self.inner.clone();
+        let explained = block_on(py, async move { client.explain(&request).await })?;
+        Ok(explained.optimized_plan)
+    }
+
     /// Renders the server-side optimized plan without executing.
-    pub fn explain_plan(&self, py: Python<'_>, builder: &PyLogicalPlanBuilder) -> PyResult<String> {
+    #[pyo3(signature = (builder, query_id=None))]
+    pub fn explain_plan(
+        &self,
+        py: Python<'_>,
+        builder: &PyLogicalPlanBuilder,
+        query_id: Option<String>,
+    ) -> PyResult<String> {
         let (request, optimized_locally) = Self::build_plan_request(
             py,
             builder,
             HashMap::new(),
             None,
-            "explain".to_string(),
+            query_id.unwrap_or_else(explain_query_id),
             None,
         )?;
         let mut client = self.inner.clone();
@@ -475,6 +558,14 @@ impl PyDaftServeClient {
             Ok(explained.optimized_plan)
         }
     }
+}
+
+/// A fresh id for an explanation the caller did not name.
+///
+/// An explanation is registered like a query, so concurrent explanations
+/// need distinct ids.
+fn explain_query_id() -> String {
+    format!("explain-{}", uuid::Uuid::new_v4().simple())
 }
 
 /// In-memory cache keys referenced by a plan's sources.

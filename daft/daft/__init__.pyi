@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from daft.catalog import Catalog, Function, Table
     from daft.expressions.visitor import ExpressionVisitor
     from daft.runners.runner import Runner
+    from daft.serve import RequestHost
     from daft.subscribers import Subscriber
     from daft.udf.udf_v2 import ClsBase
 
@@ -2509,9 +2510,11 @@ class DaftServeServer:
         disable_plan_payload: bool = False,
         query_timeout_secs: int = 0,
         query_memory_cap_bytes: int = 0,
-        tenants: list[tuple[str, str, int | None, int | None, int | None, int | None, int | None]] = ...,
+        tenants: list[tuple[str, str, int | None, int | None, int | None, int | None, int | None, int | None]] = ...,
         session: object | None = None,
         catalogs: list[str] = ...,
+        request_host: RequestHost | None = None,
+        max_request_body_bytes: int = 1048576,
     ) -> None: ...
     def address(self) -> str: ...
     def port(self) -> int: ...
@@ -2557,7 +2560,15 @@ class DaftServeClient:
         query_id: str,
         results_buffer_size: int | None = None,
     ) -> DaftServeQueryResult: ...
-    def explain_plan(self, builder: LogicalPlanBuilder) -> str: ...
+    def run_request(
+        self,
+        kind: str,
+        body: bytes,
+        query_id: str,
+        results_buffer_size: int | None = None,
+    ) -> DaftServeQueryResult: ...
+    def explain_request(self, kind: str, body: bytes, query_id: str | None = None) -> str: ...
+    def explain_plan(self, builder: LogicalPlanBuilder, query_id: str | None = None) -> str: ...
 
 def serve_referenced_pset_keys(builder: LogicalPlanBuilder) -> list[str]: ...
 

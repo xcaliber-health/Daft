@@ -61,6 +61,19 @@ pub enum ServeError {
         max_bytes: usize,
     },
 
+    /// A host request's body exceeded the server's configured cap.
+    #[error(
+        "request body of {actual_bytes} bytes exceeds the server cap of \
+         {max_bytes} bytes; send a smaller request or raise the server's \
+         `max_request_body_bytes` limit"
+    )]
+    RequestTooLarge {
+        /// Size of the request body.
+        actual_bytes: usize,
+        /// Server-side cap on request body bytes.
+        max_bytes: usize,
+    },
+
     /// The server is at its concurrent-query capacity and the request timed
     /// out waiting for a slot.
     #[error(
@@ -113,6 +126,7 @@ impl ServeError {
             Self::Unauthenticated(_) => "Unauthenticated",
             Self::PlanPayloadDisabled => "PlanPayloadDisabled",
             Self::PsetTooLarge { .. } => "PsetTooLarge",
+            Self::RequestTooLarge { .. } => "RequestTooLarge",
             Self::AtCapacity { .. } => "AtCapacity",
             Self::Cancelled(_) => "Cancelled",
             Self::Timeout { .. } => "Timeout",
@@ -132,7 +146,9 @@ impl From<ServeError> for tonic::Status {
             ServeError::VersionMismatch { .. } => Self::failed_precondition(err.to_string()),
             ServeError::Unauthenticated(_) => Self::unauthenticated(err.to_string()),
             ServeError::PlanPayloadDisabled => Self::permission_denied(err.to_string()),
-            ServeError::PsetTooLarge { .. } => Self::resource_exhausted(err.to_string()),
+            ServeError::PsetTooLarge { .. } | ServeError::RequestTooLarge { .. } => {
+                Self::resource_exhausted(err.to_string())
+            }
             ServeError::AtCapacity { .. } => Self::resource_exhausted(err.to_string()),
             ServeError::Cancelled(_) => Self::cancelled(err.to_string()),
             ServeError::Timeout { .. } => Self::deadline_exceeded(err.to_string()),
@@ -184,6 +200,13 @@ mod tests {
                     max_bytes: 1,
                 },
                 "PsetTooLarge",
+            ),
+            (
+                ServeError::RequestTooLarge {
+                    actual_bytes: 2,
+                    max_bytes: 1,
+                },
+                "RequestTooLarge",
             ),
             (
                 ServeError::AtCapacity {
@@ -242,6 +265,13 @@ mod tests {
                 ServeError::AtCapacity {
                     max_concurrent: 1,
                     waited_secs: 1,
+                },
+                tonic::Code::ResourceExhausted,
+            ),
+            (
+                ServeError::RequestTooLarge {
+                    actual_bytes: 2,
+                    max_bytes: 1,
                 },
                 tonic::Code::ResourceExhausted,
             ),

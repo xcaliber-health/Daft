@@ -51,8 +51,9 @@ pub struct NamedPartitionSet {
     pub partitions: Vec<Vec<u8>>,
 }
 
-/// The query body: either a serialized unoptimized logical plan or a textual
-/// query resolved against server-side catalogs.
+/// The query body: a serialized unoptimized logical plan, a textual query
+/// resolved against server-side catalogs, or a request a registered host
+/// plans.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum QueryPayload {
     /// Binary-serialized unoptimized logical plan. Requires identical engine
@@ -60,6 +61,16 @@ pub enum QueryPayload {
     Plan(Vec<u8>),
     /// Textual query planned and optimized entirely server-side.
     Sql(String),
+    /// A request the server's registered host plans into a query.
+    ///
+    /// The server routes it by `kind` and passes `body` to the host unread,
+    /// so it tolerates version differences as textual queries do.
+    Request {
+        /// Routing name of the request; the host declares the kinds it accepts.
+        kind: String,
+        /// Request contents, opaque to the server.
+        body: Vec<u8>,
+    },
 }
 
 /// A complete query request.
@@ -256,9 +267,9 @@ pub fn total_pset_bytes(psets: &[NamedPartitionSet]) -> usize {
 
 /// Enforces per-request policy after envelope parsing.
 ///
-/// Checks plan-payload availability, exact version match for plan payloads,
-/// and the shipped in-memory data cap. Textual payloads tolerate version
-/// differences.
+/// Checks a host request's body cap, plan-payload availability, exact
+/// version match for plan payloads, and the shipped in-memory data cap.
+/// Textual and host requests tolerate version differences.
 ///
 /// # Errors
 /// Returns the specific policy violation so clients receive an actionable
@@ -269,7 +280,16 @@ pub fn check_request_policy(
     server_version: &str,
     disable_plan_payload: bool,
     max_pset_bytes: usize,
+    max_request_body_bytes: usize,
 ) -> ServeResult<()> {
+    if let QueryPayload::Request { body, .. } = &request.payload
+        && body.len() > max_request_body_bytes
+    {
+        return Err(ServeError::RequestTooLarge {
+            actual_bytes: body.len(),
+            max_bytes: max_request_body_bytes,
+        });
+    }
     if matches!(request.payload, QueryPayload::Plan(_)) {
         if disable_plan_payload {
             return Err(ServeError::PlanPayloadDisabled);
@@ -315,7 +335,7 @@ mod tests {
         assert_eq!(decoded.query_id, "q-1");
         match decoded.payload {
             QueryPayload::Sql(sql) => assert_eq!(sql, "select 1"),
-            QueryPayload::Plan(_) => panic!("expected sql payload"),
+            other => panic!("expected sql payload, got {other:?}"),
         }
         assert_eq!(decoded.results_buffer_size, Some(4));
     }
@@ -400,36 +420,39 @@ mod tests {
 
     #[test]
     fn plan_payload_with_matching_version_is_admitted() {
-        assert!(check_request_policy(&plan_request(1), "1.0.0", "1.0.0", false, 1024).is_ok());
+        assert!(
+            check_request_policy(&plan_request(1), "1.0.0", "1.0.0", false, 1024, 1024).is_ok()
+        );
     }
 
     #[test]
     fn plan_payload_with_version_mismatch_is_rejected() {
-        let err =
-            check_request_policy(&plan_request(1), "1.0.0", "1.0.1", false, 1024).unwrap_err();
+        let err = check_request_policy(&plan_request(1), "1.0.0", "1.0.1", false, 1024, 1024)
+            .unwrap_err();
         assert!(matches!(err, ServeError::VersionMismatch { .. }));
     }
 
     #[test]
     fn sql_payload_tolerates_version_mismatch() {
-        assert!(check_request_policy(&request(), "1.0.0", "9.9.9", false, 1024).is_ok());
+        assert!(check_request_policy(&request(), "1.0.0", "9.9.9", false, 1024, 1024).is_ok());
     }
 
     #[test]
     fn plan_payload_is_rejected_when_disabled() {
-        let err = check_request_policy(&plan_request(1), "1.0.0", "1.0.0", true, 1024).unwrap_err();
+        let err =
+            check_request_policy(&plan_request(1), "1.0.0", "1.0.0", true, 1024, 1024).unwrap_err();
         assert!(matches!(err, ServeError::PlanPayloadDisabled));
     }
 
     #[test]
     fn sql_payload_is_admitted_when_plans_disabled() {
-        assert!(check_request_policy(&request(), "1.0.0", "9.9.9", true, 1024).is_ok());
+        assert!(check_request_policy(&request(), "1.0.0", "9.9.9", true, 1024, 1024).is_ok());
     }
 
     #[test]
     fn oversized_pset_is_rejected() {
-        let err =
-            check_request_policy(&plan_request(2048), "1.0.0", "1.0.0", false, 1024).unwrap_err();
+        let err = check_request_policy(&plan_request(2048), "1.0.0", "1.0.0", false, 1024, 1024)
+            .unwrap_err();
         assert!(matches!(
             err,
             ServeError::PsetTooLarge {
@@ -457,9 +480,53 @@ mod tests {
         let decoded: QueryRequest = decode(envelope.body).unwrap();
         match decoded.payload {
             QueryPayload::Plan(bytes) => assert_eq!(bytes, vec![1, 2, 3]),
-            QueryPayload::Sql(_) => panic!("expected plan payload"),
+            other => panic!("expected plan payload, got {other:?}"),
         }
         assert_eq!(decoded.exec_config.as_deref(), Some(&[9u8, 9][..]));
         assert_eq!(decoded.psets.len(), 1);
+    }
+
+    fn host_request(body_bytes: usize) -> QueryRequest {
+        QueryRequest {
+            payload: QueryPayload::Request {
+                kind: "kind".to_string(),
+                body: vec![0; body_bytes],
+            },
+            ..request()
+        }
+    }
+
+    #[test]
+    fn host_request_round_trips_with_its_kind_and_body() {
+        let encoded = encode_envelope("1.2.3", &host_request(3)).unwrap();
+        let envelope = parse_envelope(&encoded).unwrap();
+        let decoded: QueryRequest = decode(envelope.body).unwrap();
+        match decoded.payload {
+            QueryPayload::Request { kind, body } => {
+                assert_eq!(kind, "kind");
+                assert_eq!(body, vec![0, 0, 0]);
+            }
+            other => panic!("expected host request payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_request_within_its_body_cap_is_accepted_across_versions() {
+        assert!(
+            check_request_policy(&host_request(1024), "1.0.0", "9.9.9", true, 1024, 1024).is_ok()
+        );
+    }
+
+    #[test]
+    fn host_request_over_its_body_cap_is_refused() {
+        let err = check_request_policy(&host_request(1025), "1.0.0", "1.0.0", false, 1024, 1024)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ServeError::RequestTooLarge {
+                actual_bytes: 1025,
+                max_bytes: 1024
+            }
+        ));
     }
 }

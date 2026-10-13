@@ -12,6 +12,7 @@ import types
 from daft.serve import (
     DEFAULT_MAX_CONCURRENT_QUERIES,
     DEFAULT_MAX_PSET_BYTES,
+    DEFAULT_MAX_REQUEST_BODY_BYTES,
     DEFAULT_PORT,
     DEFAULT_QUEUE_TIMEOUT_SECS,
     ServeSettings,
@@ -68,6 +69,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"cap on in-memory data shipped per query (default: {DEFAULT_MAX_PSET_BYTES})",
     )
     parser.add_argument(
+        "--max-request-body-bytes",
+        type=int,
+        default=None,
+        help=f"cap on one host request's body (default: {DEFAULT_MAX_REQUEST_BODY_BYTES})",
+    )
+    parser.add_argument(
+        "--disable-sql",
+        action="store_true",
+        help="refuse textual queries; serve only plans and the host's requests",
+    )
+    parser.add_argument(
         "--drain-timeout-secs",
         type=int,
         default=120,
@@ -114,6 +126,10 @@ def main(argv: list[str] | None = None) -> int:
         overrides["queue_timeout_secs"] = args.queue_timeout_secs
     if args.max_pset_bytes is not None:
         overrides["max_pset_bytes"] = args.max_pset_bytes
+    if args.max_request_body_bytes is not None:
+        overrides["max_request_body_bytes"] = args.max_request_body_bytes
+    if args.disable_sql:
+        overrides["disable_sql"] = True
     if overrides:
         import dataclasses
 

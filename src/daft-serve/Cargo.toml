@@ -27,6 +27,7 @@ serde = {workspace = true, features = ["rc"]}
 thiserror = {workspace = true}
 tokio = {workspace = true}
 tokio-util = {workspace = true}
+uuid = {workspace = true}
 tonic = {workspace = true}
 tonic-health = {workspace = true}
 

@@ -74,6 +74,66 @@ class RemoteConnection:
         parts = [MicroPartition._from_pymicropartition(part) for part in result]
         return DataFrame._from_micropartitions(*parts)
 
+    def request(
+        self,
+        kind: str,
+        body: bytes,
+        query_id: str | None = None,
+        results_buffer_size: int | None = None,
+    ) -> DataFrame:
+        """Run a request that the server's host plans, and materialize the result.
+
+        The server routes the request by ``kind`` to its registered host,
+        which plans it into a query; the query runs on the server and its
+        rows stream back.
+
+        Parameters
+        ----------
+        kind:
+            Routing name of the request; the server's host must declare it.
+        body:
+            The request's contents, passed to the host unread.
+        query_id:
+            Identifier for the query, used for cancellation and events; a
+            fresh one is generated when omitted.
+        results_buffer_size:
+            Bound on buffered, not-yet-consumed result partitions.
+
+        Returns:
+        -------
+        DataFrame
+            The materialized result.
+        """
+        import uuid
+
+        from daft.dataframe import DataFrame
+        from daft.recordbatch import MicroPartition
+
+        query_id = query_id or f"request-{uuid.uuid4().hex[:12]}"
+        result = self._runner.client.run_request(kind, body, query_id, results_buffer_size)
+        parts = [MicroPartition._from_pymicropartition(part) for part in result]
+        return DataFrame._from_micropartitions(*parts)
+
+    def explain_request(self, kind: str, body: bytes, query_id: str | None = None) -> str:
+        """Render the plan the server's host would run for a request, without running it.
+
+        Parameters
+        ----------
+        kind:
+            Routing name of the request; the server's host must declare it.
+        body:
+            The request's contents, passed to the host unread.
+        query_id:
+            Identifier for the explanation, used for cancellation; a fresh
+            one is generated when omitted.
+
+        Returns:
+        -------
+        str
+            Human-readable rendering of the optimized plan.
+        """
+        return self._runner.client.explain_request(kind, body, query_id)
+
     def explain(self, df: DataFrame) -> str:
         """Render the server-side optimized plan for a DataFrame.
 

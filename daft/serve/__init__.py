@@ -14,22 +14,28 @@ import json
 import logging
 import os
 import pathlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from daft.daft import DaftServeServer
 from daft.session import Session
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
+
     from daft.catalog import Catalog
+    from daft.dataframe import DataFrame
 
 __all__ = [
     "DEFAULT_MAX_CONCURRENT_QUERIES",
     "DEFAULT_MAX_PSET_BYTES",
+    "DEFAULT_MAX_REQUEST_BODY_BYTES",
     "DEFAULT_PORT",
     "DEFAULT_QUERY_TIMEOUT_SECS",
     "DEFAULT_QUEUE_TIMEOUT_SECS",
     "CatalogSpec",
+    "RequestHost",
     "ServeSettings",
+    "ServedRequest",
     "TenantSpec",
     "load_settings",
     "start_server",
@@ -41,7 +47,64 @@ DEFAULT_PORT = 9494
 DEFAULT_MAX_CONCURRENT_QUERIES = 4
 DEFAULT_QUEUE_TIMEOUT_SECS = 60
 DEFAULT_MAX_PSET_BYTES = 256 * 1024 * 1024
+DEFAULT_MAX_REQUEST_BODY_BYTES = 1024 * 1024
 DEFAULT_QUERY_TIMEOUT_SECS = 0
+
+
+@dataclasses.dataclass(frozen=True)
+class ServedRequest:
+    """A request the server hands its host to plan.
+
+    Parameters
+    ----------
+    kind:
+        Routing name the client sent; always one the host declared.
+    body:
+        The request's contents, exactly as the client sent them.
+    query_id:
+        Identifier the client chose for this query; the same id carries the
+        query's events and cancellation.
+    caller:
+        Name of the authenticated caller (the tenant), or ``None`` when the
+        server does not identify callers (one shared token, or none).
+    """
+
+    kind: str
+    body: bytes
+    query_id: str
+    caller: str | None
+
+
+@runtime_checkable
+class RequestHost(Protocol):
+    """Plans requests of the kinds it declares into lazy frames.
+
+    The server reads ``kinds`` once, when it starts, and refuses a request of
+    any other kind before admitting it. ``plan`` is called after admission,
+    within the query's execution slot and time limit, and off the server's
+    network threads. The frame it returns runs as every served query does.
+    An exception it raises fails the query.
+    """
+
+    @property
+    def kinds(self) -> Collection[str]:
+        """Request kinds this host plans."""
+        ...
+
+    def plan(self, request: ServedRequest) -> DataFrame:
+        """Plan one request into a lazy frame.
+
+        Parameters
+        ----------
+        request:
+            The request, its query id, and its caller.
+
+        Returns:
+        -------
+        DataFrame
+            The frame the server runs and streams back.
+        """
+        ...
 
 
 @dataclasses.dataclass(frozen=True)
@@ -103,6 +166,8 @@ class TenantSpec:
     memory_cap_bytes:
         Ceiling on buffered execution memory per query for this tenant;
         queries over it spill to disk rather than grow.
+    max_request_body_bytes:
+        Cap on the body of one of this tenant's host requests.
     """
 
     name: str
@@ -112,6 +177,7 @@ class TenantSpec:
     query_timeout_secs: int | None = None
     max_pset_bytes: int | None = None
     memory_cap_bytes: int | None = None
+    max_request_body_bytes: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -148,6 +214,11 @@ class ServeSettings:
         must present one of the tenant tokens and ``token`` is ignored.
     catalogs:
         Catalogs to attach to the server session at startup.
+    max_request_body_bytes:
+        Cap on the body of one host request.
+    disable_sql:
+        Refuse textual queries. The server then has no session, so only
+        plans (unless disabled) and its host's requests are served.
     """
 
     host: str = "127.0.0.1"
@@ -162,6 +233,8 @@ class ServeSettings:
     query_memory_cap_bytes: int = 0
     tenants: tuple[TenantSpec, ...] = ()
     catalogs: tuple[CatalogSpec, ...] = ()
+    max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES
+    disable_sql: bool = False
 
 
 def _parse_tenants(raw: dict[str, object]) -> tuple[TenantSpec, ...]:
@@ -201,6 +274,7 @@ def _parse_tenants(raw: dict[str, object]) -> tuple[TenantSpec, ...]:
                 query_timeout_secs=_opt_int("query_timeout_secs"),
                 max_pset_bytes=_opt_int("max_pset_bytes"),
                 memory_cap_bytes=_opt_int("memory_cap_bytes"),
+                max_request_body_bytes=_opt_int("max_request_body_bytes"),
             )
         )
     return tuple(tenants)
@@ -248,6 +322,8 @@ def _parse_settings(raw: dict[str, object], token: str | None) -> ServeSettings:
         query_memory_cap_bytes=_int("query_memory_cap_bytes", 0),
         tenants=_parse_tenants(raw),
         catalogs=tuple(catalogs),
+        max_request_body_bytes=_int("max_request_body_bytes", DEFAULT_MAX_REQUEST_BODY_BYTES),
+        disable_sql=bool(raw.get("disable_sql", False)),
     )
 
 
@@ -295,29 +371,43 @@ def load_settings(config_path: str | os.PathLike[str], token_env: str = "DAFT_SE
     return _parse_settings(raw, os.environ.get(token_env))
 
 
-def start_server(settings: ServeSettings) -> DaftServeServer:
+def start_server(settings: ServeSettings, request_host: RequestHost | None = None) -> DaftServeServer:
     """Start a serving process and return its handle.
 
-    Attaches the configured catalogs to a fresh session, binds the
-    endpoint, and returns once the listener is ready. The returned handle
+    Attaches the configured catalogs to a fresh session (unless textual
+    queries are disabled), registers the request host if one is given, binds
+    the endpoint, and returns once the listener is ready. The returned handle
     exposes ``address``, ``wait``, and ``shutdown``.
 
     Parameters
     ----------
     settings:
         Complete server configuration.
+    request_host:
+        Host planning requests of the kinds it declares; ``None`` serves no
+        host requests.
 
     Returns:
     -------
     DaftServeServer
         Handle to the running server.
+
+    Raises:
+    ------
+    ValueError
+        If textual queries are disabled while catalogs are configured, since
+        catalogs are attached to the session that serves them.
     """
-    session = Session()
+    if settings.disable_sql and settings.catalogs:
+        raise ValueError("catalogs are attached to the textual-query session, which `disable_sql` turns off")
+    session: Session | None = None
     catalog_names: list[str] = []
-    for spec in settings.catalogs:
-        session.attach_catalog(spec.load(), alias=spec.name)
-        catalog_names.append(spec.name)
-        logger.info("attached catalog %s", spec.name)
+    if not settings.disable_sql:
+        session = Session()
+        for spec in settings.catalogs:
+            session.attach_catalog(spec.load(), alias=spec.name)
+            catalog_names.append(spec.name)
+            logger.info("attached catalog %s", spec.name)
 
     return DaftServeServer(
         settings.host,
@@ -339,9 +429,12 @@ def start_server(settings: ServeSettings) -> DaftServeServer:
                 tenant.query_timeout_secs,
                 tenant.max_pset_bytes,
                 tenant.memory_cap_bytes,
+                tenant.max_request_body_bytes,
             )
             for tenant in settings.tenants
         ],
         session=session,
         catalogs=catalog_names,
+        request_host=request_host,
+        max_request_body_bytes=settings.max_request_body_bytes,
     )

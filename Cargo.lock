@@ -3558,6 +3558,7 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tonic-health",
+ "uuid",
 ]
 
 [[package]]

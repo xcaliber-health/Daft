@@ -30,21 +30,57 @@ use crate::{
     codec::{self, BatchEncoder},
     error::{ServeError, ServeResult},
     registry::QueryGuard,
-    wire::{NamedPartitionSet, QueryPayload, QueryRequest, QueryStatsWire},
+    wire::{ExplainResult, NamedPartitionSet, QueryPayload, QueryRequest, QueryStatsWire},
 };
+
+/// What turns non-plan payloads into plans on this server: the session that
+/// plans textual queries, and the host that plans requests of its kinds.
+///
+/// Either may be absent, which closes its lane.
+#[derive(Debug, Clone, Default)]
+pub struct Planners {
+    /// Session planning textual queries against the server's catalogs.
+    pub session: Option<Arc<Py<PyAny>>>,
+    /// Registered host planning requests of the kinds it declares.
+    pub host: Option<Arc<Py<PyAny>>>,
+}
+
+/// Who sent a request, and under which id: handed to the host with it.
+#[derive(Debug, Clone)]
+pub struct RequestOrigin {
+    /// Client-chosen query id.
+    pub query_id: String,
+    /// Authenticated caller: the tenant name, or `None` when the server does
+    /// not identify callers.
+    pub caller: Option<String>,
+}
+
+/// Extracts the logical plan builder from a frame returned to the server.
+fn frame_builder(frame: &Bound<'_, PyAny>) -> ServeResult<LogicalPlanBuilder> {
+    let py = frame.py();
+    frame
+        .getattr(intern!(py, "_builder"))
+        .and_then(|b| b.getattr(intern!(py, "_builder")))
+        .and_then(|b| b.extract::<PyLogicalPlanBuilder>().map_err(Into::into))
+        .map(|builder| builder.builder)
+        .map_err(|e: PyErr| ServeError::Execution(e.into()))
+}
 
 /// Reconstructs the logical plan builder from a request payload.
 ///
 /// Plan payloads decode directly; textual payloads are planned against the
-/// server session (which owns catalog attachments) under the interpreter
-/// lock.
+/// server session (which owns catalog attachments), and host requests by the
+/// registered host, both under the interpreter lock. The host is handed the
+/// request together with its query id and authenticated caller.
 ///
 /// # Errors
-/// Returns a malformed-payload error if a plan blob does not decode, or an
-/// execution error if textual planning fails.
+/// Returns a malformed-payload error if a plan blob does not decode or the
+/// payload's lane is closed on this server, or an execution error if
+/// planning fails.
 pub fn payload_to_builder(
     payload: &QueryPayload,
-    sql_session: Option<&Arc<Py<PyAny>>>,
+    planners: &Planners,
+    origin: &RequestOrigin,
 ) -> ServeResult<LogicalPlanBuilder> {
     match payload {
         QueryPayload::Plan(bytes) => {
@@ -52,7 +88,7 @@ pub fn payload_to_builder(
             Ok(LogicalPlanBuilder::new(plan, None))
         }
         QueryPayload::Sql(query) => Python::attach(|py| {
-            let session = sql_session.ok_or_else(|| {
+            let session = planners.session.as_ref().ok_or_else(|| {
                 ServeError::MalformedPayload(
                     "this server has no session configured for textual queries".to_string(),
                 )
@@ -61,14 +97,96 @@ pub fn payload_to_builder(
                 .bind(py)
                 .call_method1(intern!(py, "sql"), (query.as_str(),))
                 .map_err(|e| ServeError::Execution(e.into()))?;
-            let builder = dataframe
-                .getattr(intern!(py, "_builder"))
-                .and_then(|b| b.getattr(intern!(py, "_builder")))
-                .and_then(|b| b.extract::<PyLogicalPlanBuilder>().map_err(Into::into))
-                .map_err(|e: pyo3::PyErr| ServeError::Execution(e.into()))?;
-            Ok(builder.builder)
+            frame_builder(&dataframe)
+        }),
+        QueryPayload::Request { kind, body } => Python::attach(|py| {
+            let host = planners.host.as_ref().ok_or_else(|| {
+                ServeError::MalformedPayload(format!(
+                    "this server has no host for request kind `{kind}`"
+                ))
+            })?;
+            let served = py
+                .import(intern!(py, "daft.serve"))
+                .and_then(|module| module.getattr(intern!(py, "ServedRequest")))
+                .and_then(|served_request| {
+                    served_request.call1((
+                        kind.as_str(),
+                        pyo3::types::PyBytes::new(py, body),
+                        origin.query_id.as_str(),
+                        origin.caller.as_deref(),
+                    ))
+                })
+                .map_err(|e| ServeError::Execution(e.into()))?;
+            let dataframe = host
+                .bind(py)
+                .call_method1(intern!(py, "plan"), (served,))
+                .map_err(|e| ServeError::Execution(e.into()))?;
+            frame_builder(&dataframe)
         }),
     }
+}
+
+/// Plans and optimizes a request off the async runtime threads.
+///
+/// Planning may call into the interpreter and, for textual or host requests,
+/// read catalogs over the network, so it runs on a blocking thread.
+async fn plan_off_runtime(
+    payload: QueryPayload,
+    planners: Planners,
+    origin: RequestOrigin,
+    exec_config: Arc<DaftExecutionConfig>,
+) -> ServeResult<LogicalPlanBuilder> {
+    tokio::task::spawn_blocking(move || -> ServeResult<_> {
+        let builder = payload_to_builder(&payload, &planners, &origin)?;
+        Ok(builder.optimize(exec_config)?)
+    })
+    .await
+    .map_err(|e| {
+        ServeError::Execution(common_error::DaftError::InternalError(format!(
+            "query planning task failed: {e}"
+        )))
+    })?
+}
+
+/// Renders the server-side optimized plan for an admitted request without
+/// executing it.
+///
+/// Planning runs off the async runtime threads, bounded by `timeout_secs`
+/// (`0` leaves it unbounded) and abandoned if `cancel` trips.
+///
+/// # Errors
+/// Returns the planning failure, [`ServeError::Timeout`] if planning exceeds
+/// its limit, or [`ServeError::Cancelled`] if the request is cancelled.
+pub async fn explain(
+    request: QueryRequest,
+    planners: Planners,
+    origin: RequestOrigin,
+    cancel: &CancellationToken,
+    timeout_secs: u64,
+) -> ServeResult<ExplainResult> {
+    let exec_config = resolve_exec_config(&request)?;
+    let query_id = origin.query_id.clone();
+    let planning = plan_off_runtime(request.payload, planners, origin, exec_config);
+    let bounded = async {
+        if timeout_secs > 0 {
+            tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), planning)
+                .await
+                .map_err(|_| ServeError::Timeout {
+                    query_id: query_id.clone(),
+                    limit_secs: timeout_secs,
+                })?
+        } else {
+            planning.await
+        }
+    };
+    let optimized = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Err(ServeError::Cancelled(query_id)),
+        optimized = bounded => optimized?,
+    };
+    Ok(ExplainResult {
+        optimized_plan: optimized.build().repr_ascii(false),
+    })
 }
 
 /// Decodes shipped in-memory partition sets into engine partitions keyed by
@@ -169,24 +287,34 @@ pub struct QueryBounds {
     pub result_buffer_size: usize,
 }
 
+/// What an admitted query holds until it finishes: its execution slot and its
+/// registry entry.
+#[derive(Debug)]
+pub struct QueryHold {
+    /// The execution slot; dropping it frees the slot.
+    pub permit: AdmissionPermit,
+    /// The registry entry; dropping it deregisters the query.
+    pub guard: QueryGuard,
+}
+
 /// Runs one admitted query, sending encoded messages into `tx`.
 ///
-/// The admission permit and registry guard are held for the duration of the
-/// send loop and released on return, whether the query completes, fails,
+/// The query's hold (its execution slot and registry entry) is kept for the
+/// duration of the send loop and released on return, whether the query completes, fails,
 /// times out, or is cancelled. A nonzero timeout in `bounds` limits execution
 /// wall-clock time: on expiry the execution future is dropped, which cancels
 /// the running pipeline and frees the admission slot.
 pub async fn run_query(
     request: QueryRequest,
-    sql_session: Option<Arc<Py<PyAny>>>,
+    planners: Planners,
+    caller: Option<String>,
     cancel: CancellationToken,
-    permit: AdmissionPermit,
-    guard: QueryGuard,
+    hold: QueryHold,
     tx: async_channel::Sender<Result<FlightData, Status>>,
     bounds: QueryBounds,
 ) {
     let query_id = request.query_id.clone();
-    let inner = run_query_inner(request, sql_session, &cancel, &tx, bounds);
+    let inner = run_query_inner(request, planners, caller, &cancel, &tx, bounds);
     let result = if bounds.timeout_secs > 0 {
         match tokio::time::timeout(std::time::Duration::from_secs(bounds.timeout_secs), inner).await
         {
@@ -199,8 +327,7 @@ pub async fn run_query(
     } else {
         inner.await
     };
-    drop(guard);
-    drop(permit);
+    drop(hold);
     if let Err(err) = result {
         let err = if cancel.is_cancelled() && !matches!(err, ServeError::Timeout { .. }) {
             ServeError::Cancelled(query_id)
@@ -214,7 +341,8 @@ pub async fn run_query(
 
 async fn run_query_inner(
     request: QueryRequest,
-    sql_session: Option<Arc<Py<PyAny>>>,
+    planners: Planners,
+    caller: Option<String>,
     cancel: &CancellationToken,
     tx: &async_channel::Sender<Result<FlightData, Status>>,
     bounds: QueryBounds,
@@ -229,14 +357,15 @@ async fn run_query_inner(
     } = request;
 
     log::debug!("serve query {query_id}: setup starting");
-    // Plan building, optimization (including scan planning against remote
-    // catalogs), and translation are blocking and may call into the
-    // interpreter; keep them off the async runtime threads.
+    let origin = RequestOrigin {
+        query_id: query_id.clone(),
+        caller,
+    };
+    let optimized = plan_off_runtime(payload, planners, origin, exec_config.clone()).await?;
+    // Translation reads in-memory data and may call into the interpreter;
+    // keep it off the async runtime threads too.
     let setup = {
-        let exec_config = exec_config.clone();
         tokio::task::spawn_blocking(move || -> ServeResult<_> {
-            let builder = payload_to_builder(&payload, sql_session.as_ref())?;
-            let optimized = builder.optimize(exec_config)?;
             let schema = optimized.schema();
             let optimized_plan = optimized.build();
             // Shipped sets are decoded first (pure engine work, no

@@ -14,7 +14,8 @@ back to any section as a reference.
 **Day-to-day use**
 - [Running a server](#running-a-server)
 - [Connecting a client](#connecting-a-client)
-- [Two ways to send a query](#two-ways-to-send-a-query)
+- [Three ways to send a query](#three-ways-to-send-a-query)
+- [Serving your own requests](#serving-your-own-requests)
 - [Working with data catalogs](#working-with-data-catalogs)
 
 **Operating a server**
@@ -127,7 +128,9 @@ The most common options:
 | `--max-pset-bytes` | `256 MiB` | Largest chunk of in-memory data a client may send with a query. |
 | `--query-timeout` *(config)* | off | Cut off any query that runs longer than this. |
 | `--drain-timeout-secs` | `120` | On shutdown, how long to let running queries finish. |
-| `--disable-plan-payload` | off | Accept only text queries (see [Two ways to send a query](#two-ways-to-send-a-query)). |
+| `--disable-plan-payload` | off | Refuse DataFrame queries (see [Three ways to send a query](#three-ways-to-send-a-query)). |
+| `--disable-sql` | off | Refuse text queries; serve only DataFrame queries and the request host's requests. |
+| `--max-request-body-bytes` | `1 MiB` | Largest host request body a client may send. |
 | `--allow-insecure-remote` | off | Allow a remote server with no token. Development only. |
 
 Command-line options override anything set in a config file.
@@ -210,18 +213,18 @@ for table in runner.run_iter_tables(df._builder):
 
 ---
 
-## Two ways to send a query
+## Three ways to send a query
 
-A query reaches the server in one of two forms. You usually don't choose
+A query reaches the server in one of three forms. You usually don't choose
 explicitly — it follows from how you wrote the query — but it helps to know the
 difference.
 
-| | **DataFrame query** | **Text query** |
-|---|---|---|
-| You write | `df.filter(...).collect()` after `daft.connect` | `conn.sql("SELECT ...")` |
-| Client and server versions | Must be the **same** | Can differ |
-| Needs the client to have data access | Only for direct file reads | Never |
-| Best for | Programmatic pipelines | Ad-hoc queries, thin clients, mixed versions |
+| | **DataFrame query** | **Text query** | **Host request** |
+|---|---|---|---|
+| You write | `df.filter(...).collect()` after `daft.connect` | `conn.sql("SELECT ...")` | `conn.request(kind, body)` |
+| Client and server versions | Must be the **same** | Can differ | Can differ |
+| Needs the client to have data access | Only for direct file reads | Never | Never |
+| Best for | Programmatic pipelines | Ad-hoc queries, thin clients, mixed versions | Your own request format, planned on the server |
 
 **DataFrame queries** send the query's plan to the server, which optimizes and
 runs it. Because the plan is an internal format, the client and server must run
@@ -231,7 +234,68 @@ the same engine version.
 catalogs. They tolerate version differences and work even when the client has no
 data access at all — ideal for lightweight clients and dashboards.
 
-If you run a server with `--disable-plan-payload`, it accepts text queries only.
+**Host requests** carry a request in a format of your own. The server hands it
+to the host you registered, which plans it into a query (see below).
+
+If you run a server with `--disable-plan-payload`, it refuses DataFrame queries;
+with `--disable-sql`, it refuses text queries. Each kind of query is opened or
+closed on its own.
+
+---
+
+## Serving your own requests
+
+A **request host** lets the server answer requests in a format your
+application defines, without the client shipping a plan or SQL. You register
+it when you start the server; it declares the request kinds it accepts and turns
+each request into a lazy DataFrame, which the server then runs like any other
+query.
+
+```python
+import daft
+from daft.serve import ServedRequest, ServeSettings, TenantSpec, start_server
+
+
+class ReportHost:
+    kinds = ("report",)
+
+    def plan(self, request: ServedRequest) -> daft.DataFrame:
+        if request.caller is None:
+            raise PermissionError("reports need a named caller")
+        region = request.body.decode()
+        return daft.read_parquet(f"s3://reports/{region}/*.parquet")
+
+
+server = start_server(
+    ServeSettings(tenants=(TenantSpec(name="analytics", token="..."),)),
+    request_host=ReportHost(),
+)
+```
+
+A client sends one with `conn.request("report", b"emea")` (or explains it
+without running it with `conn.explain_request(...)`).
+
+What the host is handed, as a `ServedRequest`:
+
+| Field | Meaning |
+|---|---|
+| `kind` | The request kind the client sent; always one the host declared. |
+| `body` | The request's bytes, exactly as sent; the server never reads them. |
+| `query_id` | The id the client chose; the same id carries the query's cancellation and events. |
+| `caller` | The authenticated tenant's name, or `None` when the server has no named tenants. |
+
+How the server treats host requests:
+
+- A request of a kind the host did not declare, or with a body over
+  `max_request_body_bytes`, is refused **before** it waits for a slot, so it
+  never reaches your host.
+- `plan` runs after the query is admitted, inside the caller's slot and time
+  limit, and off the server's network threads, so it may read catalogs or call
+  other services.
+- Explaining a request goes through `plan` too, and takes a slot the same way.
+- `caller` is whatever authentication established. A server with one shared
+  token, or none, cannot tell its callers apart, so it reports `None`; a host
+  that admits by caller should refuse a `None` caller.
 
 ---
 
@@ -328,6 +392,7 @@ Each tenant can override these (anything left out inherits the server default):
 | `query_timeout_secs` | Time limit for this tenant's queries. |
 | `max_pset_bytes` | Largest in-memory chunk this tenant may send. |
 | `memory_cap_bytes` | Per-query memory ceiling before this tenant's queries spill to disk. |
+| `max_request_body_bytes` | Largest host request body this tenant may send. |
 
 What you get for free:
 
@@ -384,7 +449,8 @@ buffering everything. You can bound this buffer with `results_buffer_size` on
 
 ### Cancelling a query
 
-You can stop a running query two ways:
+You can stop a query two ways, whether it is running or still waiting for a
+slot (a query cancelled while waiting never runs):
 
 - **Explicitly:** `conn.cancel_query(query_id)`.
 - **Automatically:** just disconnect. If your client goes away, the server
@@ -486,7 +552,9 @@ to `ServeSettings(...)` in Python:
 | `max_concurrent_queries` | `4` | Queries running at once; the rest wait. |
 | `queue_timeout_secs` | `60` | How long a waiting query holds on. |
 | `max_pset_bytes` | `268435456` (256 MiB) | Largest in-memory chunk sent per query. |
-| `disable_plan_payload` | `false` | Accept text queries only. |
+| `disable_plan_payload` | `false` | Refuse DataFrame queries. |
+| `disable_sql` | `false` | Refuse text queries (the server then has no session, so no catalogs). |
+| `max_request_body_bytes` | `1048576` (1 MiB) | Largest host request body. |
 | `query_timeout_secs` | `0` (off) | Per-query time limit. |
 | `query_memory_cap_bytes` | `0` (off) | Per-query memory ceiling, then spill. |
 | `tenants` | none | Named tenants with their own tokens and limits. |
@@ -521,6 +589,7 @@ handle it precisely. The most common ones:
 | `VersionMismatch` | Client and server engine versions differ (DataFrame query). | Match versions, or use `conn.sql(...)`. |
 | `PlanPayloadDisabled` | Server accepts text queries only. | Use `conn.sql(...)`. |
 | `PsetTooLarge` | Sent more in-memory data than `max_pset_bytes` allows. | Raise the limit, or read from a catalog instead. |
+| `RequestTooLarge` | A host request's body is over `max_request_body_bytes`. | Send a smaller request, or raise the limit. |
 | `AtCapacity` | All query slots busy and the wait timed out. | Add slots or replicas, or retry later. |
 | `Timeout` | Query ran past its time limit. | Raise the limit or simplify the query. |
 | `Draining` | Server is shutting down. | Reconnect to a running server. |

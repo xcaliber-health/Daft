@@ -2,6 +2,7 @@ use common_error::{DaftError, DaftResult};
 
 use crate::{AggExpr, ApproxPercentileParams, Expr, ExprRef};
 
+#[recursive::recursive]
 pub fn extract_agg_expr(expr: &ExprRef) -> DaftResult<AggExpr> {
     match expr.as_ref() {
         Expr::Agg(agg_expr) => Ok(agg_expr.clone()),

@@ -256,6 +256,7 @@ fn resolve_list_evals(expr: ExprRef) -> DaftResult<ExprRef> {
     .map(|res| res.data)
 }
 
+#[recursive::recursive]
 fn resolve_to_basic_and_outer_cols(expr: ExprRef, plan: &LogicalPlanRef) -> DaftResult<ExprRef> {
     expr.transform(|e| {
         // A window's partitioning and ordering are not children of its expression, so
@@ -549,6 +550,7 @@ impl ExprResolver<'_> {
     ///     - not an aggregation
     /// - sum(col("a")) + col("b") when "b" is not a group by key
     ///     - not all branches are aggregations, literals, or group by keys
+    #[recursive::recursive]
     fn is_valid_expr_in_agg(&self, expr: &ExprRef) -> bool {
         if self.groupby.contains(expr) {
             return true;

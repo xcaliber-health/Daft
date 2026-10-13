@@ -1931,6 +1931,7 @@ impl LocalPhysicalPlan {
         }
     }
 
+    #[recursive::recursive]
     pub fn single_line_display(&self) -> String {
         let children = self.children();
         if children.is_empty() {

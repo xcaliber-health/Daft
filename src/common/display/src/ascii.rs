@@ -3,6 +3,7 @@ use std::fmt;
 use crate::{DisplayLevel, tree::TreeDisplay};
 
 // Print the tree recursively, and illustrate the tree structure with a single line per node + indentation.
+#[recursive::recursive]
 fn fmt_tree_indent_style<'a, W: fmt::Write + 'a>(
     node: &dyn TreeDisplay,
     indent: usize,
@@ -36,6 +37,7 @@ fn fmt_tree_indent_style<'a, W: fmt::Write + 'a>(
 
 // Print the tree recursively, and illustrate the tree structure in the same style as `git log --graph`.
 // `depth` is the number of forks in this node's ancestors.
+#[recursive::recursive]
 pub fn fmt_tree_gitstyle<'a, W: fmt::Write + 'a>(
     node: &dyn TreeDisplay,
     depth: usize,
@@ -137,6 +139,7 @@ pub trait AsciiTreeDisplay: TreeDisplay {
         fmt_tree_gitstyle(self, 0, w, level)
     }
 
+    #[recursive::recursive]
     fn fmt_tree_indent_style<'a, W: fmt::Write + 'a>(
         &self,
         indent: usize,

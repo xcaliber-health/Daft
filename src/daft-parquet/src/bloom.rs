@@ -51,6 +51,7 @@ pub fn extract_bloom_probes(predicate: &ExprRef) -> Vec<BloomProbe> {
     probes
 }
 
+#[recursive::recursive]
 fn collect_conjuncts(expr: &ExprRef, out: &mut Vec<BloomProbe>) {
     match expr.as_ref() {
         Expr::BinaryOp {

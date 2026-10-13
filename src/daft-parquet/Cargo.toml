@@ -18,6 +18,7 @@ futures = {workspace = true}
 indexmap = {workspace = true}
 parquet = {workspace = true, features = ["async", "experimental"]}
 pyo3 = {workspace = true, optional = true}
+recursive = {workspace = true}
 serde = {workspace = true}
 snafu = {workspace = true}
 tokio = {workspace = true}

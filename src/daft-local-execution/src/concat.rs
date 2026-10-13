@@ -130,6 +130,7 @@ impl TreeDisplay for ConcatNode {
         display
     }
 
+    #[recursive::recursive]
     fn repr_json(&self) -> serde_json::Value {
         let children: Vec<serde_json::Value> = self
             .get_children()
@@ -142,8 +143,9 @@ impl TreeDisplay for ConcatNode {
             "category": "StreamingSink",
             "type": NodeType::Concat.to_string(),
             "name": self.name(),
-            "children": children,
         });
+        // Moved in, not copied: a copy would recurse once per level below.
+        json["children"] = serde_json::Value::Array(children);
 
         if let StatsState::Materialized(stats) = &self.plan_stats {
             json["approx_stats"] = serde_json::json!(stats);
@@ -173,6 +175,7 @@ impl PipelineNode for ConcatNode {
         self.node_info.name.clone()
     }
 
+    #[recursive::recursive]
     fn propagate_morsel_size_requirement(
         &mut self,
         downstream_requirement: MorselSizeRequirement,
@@ -185,6 +188,7 @@ impl PipelineNode for ConcatNode {
             .propagate_morsel_size_requirement(downstream_requirement, default_requirement);
     }
 
+    #[recursive::recursive]
     fn start(
         self: Box<Self>,
         maintain_order: bool,

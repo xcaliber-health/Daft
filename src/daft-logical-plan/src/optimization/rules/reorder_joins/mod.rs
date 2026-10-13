@@ -40,6 +40,7 @@ impl ReorderJoins {
 
 // Reorder joins in a query tree.
 impl OptimizerRule for ReorderJoins {
+    #[recursive::recursive]
     fn try_optimize(&self, plan: Arc<LogicalPlan>) -> DaftResult<Transformed<Arc<LogicalPlan>>> {
         if let LogicalPlan::Join(_) = &*plan {
             let mut join_graph =

@@ -265,6 +265,7 @@ impl Project {
 /// with all occurrences of subexprs_to_replace replaced with a column selection.
 /// e.g. e := (a+b)+c, subexprs := {FieldID("(a + b)")}
 ///  -> Col("(a + b)") + c
+#[recursive::recursive]
 fn replace_column_with_semantic_id(
     e: ExprRef,
     subexprs_to_replace: &IndexSet<FieldID>,

@@ -433,6 +433,7 @@ pub fn translate_physical_plan_to_pipeline(
     Ok((pipeline_node, input_senders))
 }
 
+#[recursive::recursive]
 fn physical_plan_to_pipeline(
     physical_plan: &LocalPhysicalPlan,
     cfg: &Arc<DaftExecutionConfig>,

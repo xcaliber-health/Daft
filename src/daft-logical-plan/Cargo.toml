@@ -26,6 +26,7 @@ itertools = {workspace = true}
 log = {workspace = true}
 num-format = {workspace = true}
 pyo3 = {workspace = true, optional = true}
+recursive = {workspace = true}
 serde = {workspace = true, features = ["rc"]}
 snafu = {workspace = true}
 tokio = {workspace = true}

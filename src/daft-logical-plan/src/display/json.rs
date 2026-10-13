@@ -217,12 +217,10 @@ where
             plans.push(current_node);
         } else {
             // This is the root node
-            let plan = serde_json::json!(&current_node);
-            write!(
-                self.f,
-                "{}",
-                serde_json::to_string(&plan).map_err(DaftError::SerdeJsonError)?
-            )?;
+            let rendered = common_display::json::to_string(&current_node)
+                .map_err(DaftError::SerdeJsonError)?;
+            common_display::json::dismantle(current_node);
+            write!(self.f, "{rendered}")?;
         }
         Ok(common_treenode::TreeNodeRecursion::Continue)
     }

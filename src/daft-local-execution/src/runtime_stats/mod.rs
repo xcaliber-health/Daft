@@ -205,7 +205,7 @@ impl RuntimeStatsManager {
         input_stats: &mut HashMap<(NodeID, InputId), Arc<dyn RuntimeStats>>,
         active_nodes: &mut HashSet<NodeID>,
         query_id: &QueryID,
-        query_plan: &serde_json::Value,
+        query_plan: &Arc<str>,
         progress_bar: Option<&dyn ProgressBar>,
         subscribers: &[Arc<dyn Subscriber>],
         operators: &HashMap<NodeID, Arc<OperatorMeta>>,
@@ -326,14 +326,16 @@ impl RuntimeStatsManager {
             Ok(TreeNodeRecursion::Continue)
         });
 
-        let query_plan = pipeline.repr_json();
-        let serialized_plan: Arc<str> = serde_json::to_string(&query_plan)
+        // Rendered once: every later reader of the plan takes this text.
+        let plan_tree = pipeline.repr_json();
+        let query_plan: Arc<str> = common_display::json::to_string(&plan_tree)
             .expect("Failed to serialize physical plan")
             .into();
+        common_display::json::dismantle(plan_tree);
 
         let exec_start_event = Event::ExecStart(ExecStartEvent {
             header: event_header(query_id.clone()),
-            physical_plan: serialized_plan,
+            physical_plan: query_plan.clone(),
         });
         dispatch_event(&subscribers, &exec_start_event, "notify execution start");
 
@@ -364,7 +366,7 @@ impl RuntimeStatsManager {
     fn new_impl(
         handle: &Handle,
         query_id: QueryID,
-        query_plan: serde_json::Value,
+        query_plan: Arc<str>,
         subscribers: Vec<Arc<dyn Subscriber>>,
         progress_bar: Option<Box<dyn ProgressBar>>,
         node_info_map: HashMap<NodeID, Arc<NodeInfo>>,
@@ -695,7 +697,7 @@ mod tests {
         let stats_manager = RuntimeStatsManager::new_impl(
             &tokio::runtime::Handle::current(),
             query_id.into(),
-            serde_json::Value::Null,
+            Arc::from("null"),
             subscribers,
             None,
             HashMap::from([(0, Arc::new(NodeInfo::default()))]),

@@ -20,7 +20,7 @@ use daft_schema::{
     schema::{Schema, SchemaRef},
 };
 use indexmap::IndexSet;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use snafu::Snafu;
 
 pub use crate::ops::*;
@@ -28,6 +28,7 @@ use crate::stats::{PlanStats, StatsState};
 
 /// Logical plan for a Daft query.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 #[cfg_attr(debug_assertions, derive(Debug))]
 // Allow large enum variant (Join) since boxing it would require changes across 20+ files
 // for marginal benefit — LogicalPlan nodes are always Arc-wrapped in practice.
@@ -63,6 +64,23 @@ pub enum LogicalPlan {
     Window(Window),
     TopN(TopN),
     VLLMProject(VLLMProject),
+}
+
+// A plan nests one level per operation, and a derived (de)serializer recurses
+// once per level. Each level is (de)serialized on a stack grown when it runs
+// low, so a plan of any depth crosses the wire.
+impl Serialize for LogicalPlan {
+    #[recursive::recursive]
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        LogicalPlan::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for LogicalPlan {
+    #[recursive::recursive]
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        LogicalPlan::deserialize(deserializer)
+    }
 }
 
 #[cfg(not(debug_assertions))]
@@ -153,44 +171,54 @@ impl LogicalPlan {
     pub fn schema(&self) -> SchemaRef {
         match self {
             Self::Source(Source { output_schema, .. }) => output_schema.clone(),
-            Self::Shard(Shard { input, .. }) => input.schema(),
+            Self::Shard(Shard { input, .. }) => Self::schema_of_input(input),
             Self::Project(Project {
                 projected_schema, ..
             }) => projected_schema.clone(),
             Self::UDFProject(UDFProject {
                 projected_schema, ..
             }) => projected_schema.clone(),
-            Self::Filter(Filter { input, .. }) => input.schema(),
-            Self::IntoBatches(IntoBatches { input, .. }) => input.schema(),
-            Self::Limit(Limit { input, .. }) => input.schema(),
-            Self::Offset(Offset { input, .. }) => input.schema(),
+            Self::Filter(Filter { input, .. }) => Self::schema_of_input(input),
+            Self::IntoBatches(IntoBatches { input, .. }) => Self::schema_of_input(input),
+            Self::Limit(Limit { input, .. }) => Self::schema_of_input(input),
+            Self::Offset(Offset { input, .. }) => Self::schema_of_input(input),
             Self::Explode(Explode {
                 exploded_schema, ..
             }) => exploded_schema.clone(),
             Self::Unpivot(Unpivot { output_schema, .. }) => output_schema.clone(),
-            Self::Sort(Sort { input, .. }) => input.schema(),
-            Self::Repartition(Repartition { input, .. }) => input.schema(),
-            Self::IntoPartitions(IntoPartitions { input, .. }) => input.schema(),
-            Self::Distinct(Distinct { input, .. }) => input.schema(),
+            Self::Sort(Sort { input, .. }) => Self::schema_of_input(input),
+            Self::Repartition(Repartition { input, .. }) => Self::schema_of_input(input),
+            Self::IntoPartitions(IntoPartitions { input, .. }) => Self::schema_of_input(input),
+            Self::Distinct(Distinct { input, .. }) => Self::schema_of_input(input),
             Self::Aggregate(Aggregate { output_schema, .. }) => output_schema.clone(),
             Self::Pivot(Pivot { output_schema, .. }) => output_schema.clone(),
-            Self::Concat(Concat { input, .. }) => input.schema(),
-            Self::Intersect(Intersect { lhs, .. }) => lhs.schema(),
-            Self::Union(Union { lhs, .. }) => lhs.schema(),
+            Self::Concat(Concat { input, .. }) => Self::schema_of_input(input),
+            Self::Intersect(Intersect { lhs, .. }) => Self::schema_of_input(lhs),
+            Self::Union(Union { lhs, .. }) => Self::schema_of_input(lhs),
             Self::Join(Join { output_schema, .. }) => output_schema.clone(),
             Self::AsofJoin(AsofJoin { output_schema, .. }) => output_schema.clone(),
             Self::Sink(Sink { schema, .. }) => schema.clone(),
-            Self::Sample(Sample { input, .. }) => input.schema(),
-            Self::Shuffle(Shuffle { input, .. }) => input.schema(),
+            Self::Sample(Sample { input, .. }) => Self::schema_of_input(input),
+            Self::Shuffle(Shuffle { input, .. }) => Self::schema_of_input(input),
             Self::MonotonicallyIncreasingId(MonotonicallyIncreasingId { schema, .. }) => {
                 schema.clone()
             }
-            Self::StageCheckpointKeys(StageCheckpointKeys { input, .. }) => input.schema(),
-            Self::SubqueryAlias(SubqueryAlias { input, .. }) => input.schema(),
+            Self::StageCheckpointKeys(StageCheckpointKeys { input, .. }) => {
+                Self::schema_of_input(input)
+            }
+            Self::SubqueryAlias(SubqueryAlias { input, .. }) => Self::schema_of_input(input),
             Self::Window(Window { schema, .. }) => schema.clone(),
-            Self::TopN(TopN { input, .. }) => input.schema(),
+            Self::TopN(TopN { input, .. }) => Self::schema_of_input(input),
             Self::VLLMProject(VLLMProject { output_schema, .. }) => output_schema.clone(),
         }
+    }
+
+    /// The schema of an input a node passes through unchanged, found on a
+    /// stack grown when it runs low: a chain of such nodes recurses once per
+    /// node to reach the one that holds the schema.
+    #[recursive::recursive]
+    fn schema_of_input(input: &Self) -> SchemaRef {
+        input.schema()
     }
 
     pub(crate) fn required_columns(&self) -> RequiredCols {
@@ -883,6 +911,7 @@ impl LogicalPlan {
     }
 
     /// Get the number of nodes in the logical plan tree.
+    #[recursive::recursive]
     pub fn node_count(&self) -> NonZeroUsize {
         match self.children().as_slice() {
             [] => 1usize.try_into().unwrap(),
@@ -928,6 +957,7 @@ impl LogicalPlan {
         names
     }
 
+    #[recursive::recursive]
     pub fn get_schema_for_alias(self: &Arc<Self>, alias: &str) -> DaftResult<Option<SchemaRef>> {
         use common_treenode::TreeNode;
 
@@ -991,6 +1021,7 @@ impl LogicalPlan {
         }
     }
 
+    #[recursive::recursive]
     pub fn get_schema_for_id(self: &Arc<Self>, id: usize) -> DaftResult<Option<SchemaRef>> {
         use common_treenode::TreeNode;
 

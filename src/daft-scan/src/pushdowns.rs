@@ -144,6 +144,7 @@ impl Pushdowns {
         res
     }
 
+    #[recursive::recursive]
     pub fn estimated_selectivity(&self, schema: &Schema) -> f64 {
         if let Some(filters) = &self.filters {
             estimated_selectivity(filters, schema)

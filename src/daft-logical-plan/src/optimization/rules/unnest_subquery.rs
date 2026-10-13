@@ -659,6 +659,7 @@ fn check_joined_rows(
 
 /// Whether `plan` yields exactly one row whatever its input holds: a global aggregation,
 /// seen through projections.
+#[recursive::recursive]
 fn yields_exactly_one_row(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::Project(Project { input, .. }) => yields_exactly_one_row(input),
@@ -672,6 +673,7 @@ fn yields_exactly_one_row(plan: &LogicalPlan) -> bool {
 /// Proven only for an aggregation grouped by nothing but keys, seen through projections
 /// that pass the keys through and through operators that only drop or reorder rows.
 /// Anything else answers `false`, which costs an aggregation but never a wrong answer.
+#[recursive::recursive]
 fn yields_at_most_one_row_per(plan: &LogicalPlan, keys: &[&str]) -> bool {
     match plan {
         LogicalPlan::Project(Project {
@@ -699,6 +701,7 @@ fn yields_at_most_one_row_per(plan: &LogicalPlan, keys: &[&str]) -> bool {
 }
 
 /// The name of the input column `expr` passes through unchanged, if it does.
+#[recursive::recursive]
 fn passed_through_column(expr: &Expr) -> Option<&str> {
     match expr {
         Expr::Alias(inner, _) => passed_through_column(inner),

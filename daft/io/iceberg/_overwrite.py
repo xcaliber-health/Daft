@@ -216,7 +216,9 @@ def overwrite_by_filter(
 
     start = table.current_snapshot()
     start_id = int(start.snapshot_id) if start is not None else None
-    prune = convert_filter(overwrite_filter._expr, table.schema()) or AlwaysTrue()
+    prune = _constant_predicate(overwrite_filter)
+    if prune is None:
+        prune = convert_filter(overwrite_filter._expr, table.schema()) or AlwaysTrue()
     # Planned without the filter: a filtered plan omits row-level deletes whose
     # bounds miss the filter, and those still apply to the rows a rewrite keeps.
     plan = plan_files(table, table.scan(snapshot_id=start_id))
@@ -313,6 +315,18 @@ def _select_files(
     return removed, partial
 
 
+def _constant_predicate(scope: Expression) -> BooleanExpression | None:
+    """Return a constant filter as the table predicate it is, else ``None``.
+
+    A null constant selects no row, as false does.
+    """
+    from pyiceberg.expressions import AlwaysFalse, AlwaysTrue
+
+    if not scope.is_literal():
+        return None
+    return AlwaysTrue() if scope.as_py() is True else AlwaysFalse()
+
+
 def _strict_predicate(scope: Expression, table: PyIcebergTable) -> BooleanExpression | None:
     """Return the filter as a table predicate when it translates exactly, else ``None``."""
     from pyiceberg.exceptions import ValidationError
@@ -321,6 +335,9 @@ def _strict_predicate(scope: Expression, table: PyIcebergTable) -> BooleanExpres
 
     from daft.io.iceberg._visitors import IcebergPredicateVisitor
 
+    constant = _constant_predicate(scope)
+    if constant is not None:
+        return constant
     try:
         predicate = IcebergPredicateVisitor(table.schema()).visit(scope)
         if not isinstance(predicate, BooleanExpression):

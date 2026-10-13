@@ -23,7 +23,7 @@ from pyiceberg.transforms import BucketTransform, IdentityTransform
 from pyiceberg.types import LongType, NestedField, StringType
 
 import daft
-from daft import col
+from daft import col, lit
 from daft.io.iceberg import WriteConflict
 from tests.io.iceberg.actions._helpers import (
     commit_equality_delete_rows,
@@ -117,6 +117,38 @@ def test_only_the_rows_the_filter_selects_are_replaced(
     _frame(new_rows).write_iceberg(table, mode="overwrite", overwrite_filter=scope)
 
     assert _rows(table) == sorted(kept + new_rows, key=repr)
+
+
+@pytest.mark.parametrize(
+    ("scope", "new_rows", "kept"),
+    [
+        pytest.param(lit(True), [(7, "eu", 70)], [], id="true replaces every row"),
+        pytest.param(lit(False), [], [row for rows in SEED for row in rows], id="false replaces none"),
+    ],
+)
+def test_a_constant_filter_reads_no_data_file(
+    local_catalog: Catalog,
+    monkeypatch: pytest.MonkeyPatch,
+    scope: daft.Expression,
+    new_rows: list[Row],
+    kept: list[Row],
+) -> None:
+    from daft.io.iceberg import _overwrite
+
+    table = _table(local_catalog, UNPARTITIONED_PARTITION_SPEC, SEED)
+    counted: list[str] = []
+    real_count = _overwrite._count_rows
+
+    def count_rows(table: Table, plan: _overwrite.ScanPlan, paths: list[str], *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        counted.extend(paths)
+        return real_count(table, plan, paths, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(_overwrite, "_count_rows", count_rows)
+
+    _frame(new_rows).write_iceberg(table, mode="overwrite", overwrite_filter=scope)
+
+    assert _rows(table) == sorted(kept + new_rows, key=repr)
+    assert counted == []
 
 
 def test_a_row_the_filter_is_null_on_is_kept(local_catalog: Catalog) -> None:

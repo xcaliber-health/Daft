@@ -1374,7 +1374,7 @@ class DataFrame:
             snapshot_properties (dict[str, str], optional): Optional snapshot properties to set while writing to the table. Keys with prefix ``daft.idempotence-`` are reserved.
             checkpoint (IdempotentCommit, optional): Bundled checkpoint store + idempotence key for an idempotent commit. When provided, the snapshot summary is tagged with ``daft.idempotence-key`` and retries with the same key recognize the prior attempt without producing a duplicate snapshot. Only ``mode='append'`` is supported. Requires the Ray runner.
             overwrite_filter (Expression, optional): With ``mode='overwrite'``, a boolean expression over the table's columns selecting the existing rows to replace. Requires pyiceberg>=0.11.0.
-            overwrite_keys (DataFrame, optional): With ``mode='overwrite'``, the key set whose keys' existing rows are replaced. Its key columns must compare with the table's: numbers with numbers, text with text, and so on. Cannot be combined with ``overwrite_filter``. Requires pyiceberg>=0.11.0.
+            overwrite_keys (DataFrame, optional): With ``mode='overwrite'``, the key set whose keys' existing rows are replaced. Its key columns must compare with the table's: numbers with numbers, text with text, timestamps with a time zone with timestamps with one, and so on. Cannot be combined with ``overwrite_filter``. Requires pyiceberg>=0.11.0.
 
         Returns:
             DataFrame: The operations that occurred with this write, one row per file: ``operation`` (``ADD`` or

@@ -66,6 +66,7 @@ from daft.runners.partitioning import (
     PartitionMetadata,
     PartitionSet,
     PartitionSetCache,
+    ReturnedCounts,
 )
 from daft.runners.runner import Runner
 
@@ -612,6 +613,11 @@ class RayRunner(Runner[ray.ObjectRef]):
             logger.info("Daft Dashboard: %s/query/%s", dashboard_url, query_id)
 
         heartbeat = Heartbeat(HEARTBEAT_INTERVAL_SEC, ctx, query_id)
+        # What reached the reader, counted as each result is handed over.
+        returned = ReturnedCounts()
+
+        def finished(end_state: QueryEndState, message: str) -> PyQueryResult:
+            return PyQueryResult(end_state, message, returned.rows, returned.bytes)
 
         try:
             # Optimize the logical plan.
@@ -661,7 +667,6 @@ class RayRunner(Runner[ray.ObjectRef]):
                     worker_startup_timeout=self.worker_startup_timeout,
                 )
 
-            total_rows = 0
             result_gen = self.flotilla_plan_runner.stream_plan(
                 distributed_plan, self._part_set_cache.get_all_partition_sets()
             )
@@ -669,8 +674,7 @@ class RayRunner(Runner[ray.ObjectRef]):
             try:
                 while True:
                     result = next(result_gen)
-                    if result.metadata() is not None:
-                        total_rows += result.metadata().num_rows
+                    returned.add(result)
                     yield result
             except StopIteration as e:
                 stats: PyExecutionStats = e.value
@@ -681,7 +685,7 @@ class RayRunner(Runner[ray.ObjectRef]):
 
             try:
                 ctx._notify_exec_end(query_id)
-                ctx._notify_query_end(query_id, PyQueryResult(QueryEndState.Finished, "Query finished"))
+                ctx._notify_query_end(query_id, finished(QueryEndState.Finished, "Query finished"))
             except Exception as e:
                 logger.warning("Failed to send query end notifications: %s", e)
 
@@ -689,22 +693,20 @@ class RayRunner(Runner[ray.ObjectRef]):
             # Generator was abandoned (e.g. .show() breaking out early). Match NativeRunner so
             # subscribers and the dashboard leave the Finalizing state.
             try:
-                query_result = PyQueryResult(QueryEndState.Finished, "Query finished")
-                ctx._notify_query_end(query_id, query_result)
+                ctx._notify_query_end(query_id, finished(QueryEndState.Finished, "Query finished"))
             except Exception as ex:
                 logger.warning("Failed to send query end notification: %s", ex)
             return  # type: ignore[return-value]
         except KeyboardInterrupt as e:
-            query_result = PyQueryResult(QueryEndState.Canceled, "Query canceled by the user.")
-            ctx._notify_query_end(query_id, query_result)
+            ctx._notify_query_end(query_id, finished(QueryEndState.Canceled, "Query canceled by the user."))
             raise e
         except UDFException as e:
             err_msg = f"UDF failed with exception: {e.original_exception}"
-            ctx._notify_query_end(query_id, PyQueryResult(QueryEndState.Failed, err_msg))
+            ctx._notify_query_end(query_id, finished(QueryEndState.Failed, err_msg))
             raise e
         except Exception as e:
             err_msg = f"General Exception raised: {e}"
-            ctx._notify_query_end(query_id, PyQueryResult(QueryEndState.Failed, err_msg))
+            ctx._notify_query_end(query_id, finished(QueryEndState.Failed, err_msg))
             raise e
         finally:
             heartbeat.stop()

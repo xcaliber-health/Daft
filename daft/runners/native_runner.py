@@ -29,6 +29,7 @@ from daft.runners.partitioning import (
     LocalPartitionSet,
     PartitionCacheEntry,
     PartitionSetCache,
+    ReturnedCounts,
 )
 from daft.runners.query_id import emit_query_id
 from daft.runners.runner import LOCAL_PARTITION_SET_CACHE, Runner
@@ -172,37 +173,43 @@ class NativeRunner(Runner[MicroPartition]):
             context,
         )
 
+        # What reached the reader, counted as each result is handed over, so an early
+        # stop still reports what was delivered. Counted only when someone listens.
+        returned = ReturnedCounts() if has_subscribers else None
+
+        def finished(end_state: QueryEndState, message: str) -> PyQueryResult:
+            if returned is None:
+                return PyQueryResult(end_state, message)
+            return PyQueryResult(end_state, message, returned.rows, returned.bytes)
+
         try:
             while True:
                 result = next(results_gen)
+                if returned is not None:
+                    returned.add(result)
                 yield result
         except GeneratorExit:
             # Generator was abandoned (e.g., .show() breaking out early after collecting
             # enough rows). Notify subscribers so the dashboard transitions out of Finalizing.
             try:
-                query_result = PyQueryResult(QueryEndState.Finished, "Query finished")
-                ctx._notify_query_end(query_id, query_result)
+                ctx._notify_query_end(query_id, finished(QueryEndState.Finished, "Query finished"))
             except Exception as e:
                 logger.warning("Failed to send query end notification: %s", e)
             return  # type: ignore[return-value]
         except StopIteration as e:
-            query_result = PyQueryResult(QueryEndState.Finished, "Query finished")
-            ctx._notify_query_end(query_id, query_result)
+            ctx._notify_query_end(query_id, finished(QueryEndState.Finished, "Query finished"))
             physical_plan_json, execution_stats = e.value
             return ExecutionMetadata._from_runner_output(execution_stats, query_id, physical_plan_json)
         except KeyboardInterrupt as e:
-            query_result = PyQueryResult(QueryEndState.Canceled, "Query canceled by the user.")
-            ctx._notify_query_end(query_id, query_result)
+            ctx._notify_query_end(query_id, finished(QueryEndState.Canceled, "Query canceled by the user."))
             raise e
         except UDFException as e:
             err_msg = f"UDF failed with exception: {e.original_exception}"
-            query_result = PyQueryResult(QueryEndState.Failed, err_msg)
-            ctx._notify_query_end(query_id, query_result)
+            ctx._notify_query_end(query_id, finished(QueryEndState.Failed, err_msg))
             raise e
         except Exception as e:
             err_msg = f"General Exception raised: {e}"
-            query_result = PyQueryResult(QueryEndState.Failed, err_msg)
-            ctx._notify_query_end(query_id, query_result)
+            ctx._notify_query_end(query_id, finished(QueryEndState.Failed, err_msg))
             raise e
 
     def run_iter_tables(

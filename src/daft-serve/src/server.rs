@@ -31,6 +31,7 @@ use crate::{
     auth::{AUTHORIZATION_KEY, AuthPolicy},
     error::{ServeError, ServeResult},
     execute,
+    lifecycle::QueryLifecycle,
     registry::QueryRegistry,
     wire::{self, ExplainResult, QueryRequest, ServerInfo, actions},
 };
@@ -432,16 +433,25 @@ impl FlightService for DaftServeService {
             .admit_request(&ticket.ticket, &limits)
             .map_err(Status::from)?;
 
+        let mut lifecycle = QueryLifecycle::accepted(&query, tenant.as_deref());
         // Registered before it waits for a slot, so a queued query can be
         // cancelled; a failed wait drops the guard and deregisters it.
         let guard = self.registry.register(&query.query_id, tenant.as_deref());
         let cancel = guard.token();
-        let permit = self
+        let permit = match self
             .admission
             .pool(tenant.as_deref())
             .acquire(&query.query_id, &cancel)
             .await
-            .map_err(Status::from)?;
+        {
+            Ok(permit) => permit,
+            Err(err) => {
+                let refused = Err(err);
+                lifecycle.finish(&refused);
+                return Err(refused.map_err(Status::from).unwrap_err());
+            }
+        };
+        lifecycle.admitted();
         if let Some(tenant_name) = tenant.as_deref() {
             log::info!("query {} admitted for tenant {tenant_name}", query.query_id);
         }
@@ -457,7 +467,11 @@ impl FlightService for DaftServeService {
             result_buffer_size: buffer,
         };
         let task = common_runtime::get_io_runtime(true).spawn(async move {
-            let hold = execute::QueryHold { permit, guard };
+            let hold = execute::QueryHold {
+                permit,
+                guard,
+                lifecycle,
+            };
             execute::run_query(query, planners, tenant, cancel, hold, tx, bounds).await;
         });
 

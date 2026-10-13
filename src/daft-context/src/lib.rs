@@ -20,7 +20,7 @@ use crate::subscribers::{
     events::{
         ExecEndEvent, ExecStartEvent, OperatorEndEvent, OperatorMeta, OperatorStartEvent,
         OptimizationCompleteEvent, OptimizationStartEvent, QueryEndEvent, QueryHeartbeatEvent,
-        QueryStartEvent, StatsEvent,
+        QueryQueuedEvent, QueryStartEvent, StatsEvent,
     },
 };
 
@@ -155,6 +155,25 @@ impl DaftContext {
             metadata,
         });
         self.dispatch_event(&event, "notify query start")
+    }
+
+    /// Reports a query a server accepted, before it waits for an execution
+    /// slot: its lane (`plan`, `sql` or `request`), a host request's kind, and
+    /// the authenticated caller.
+    pub fn notify_query_queued(
+        &self,
+        query_id: QueryID,
+        lane: String,
+        kind: Option<String>,
+        caller: Option<String>,
+    ) -> DaftResult<()> {
+        let event = Event::QueryQueued(QueryQueuedEvent {
+            header: event_header(query_id),
+            lane,
+            kind,
+            caller,
+        });
+        self.dispatch_event(&event, "notify query queued")
     }
 
     pub fn notify_query_heartbeat(&self, query_id: QueryID) -> DaftResult<()> {

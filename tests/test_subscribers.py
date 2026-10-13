@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 import daft
-from daft.daft import PyQueryMetadata, QueryEndState
+from daft.daft import PyQueryMetadata, PyQueryResult, QueryEndState
 from daft.subscribers import Subscriber
 from daft.subscribers.events import (
     Event,
@@ -32,6 +32,7 @@ class MockSubscriber(Subscriber):
     query_node_stats: defaultdict[str, defaultdict[int, dict[str, Any]]]
     end_states: dict[str, QueryEndState]
     end_messages: dict[str, str]
+    results: dict[str, PyQueryResult]
     query_ids: list[str]
 
     def __init__(self):
@@ -41,6 +42,7 @@ class MockSubscriber(Subscriber):
         self.query_node_stats = defaultdict(lambda: defaultdict(dict))
         self.end_states = {}
         self.end_messages = {}
+        self.results = {}
         self.query_ids = []
 
     def on_query_started(self, event: QueryStarted) -> None:
@@ -50,6 +52,7 @@ class MockSubscriber(Subscriber):
     def on_query_finished(self, event: QueryFinished) -> None:
         self.end_states[event.query_id] = event.result.end_state
         self.end_messages[event.query_id] = event.result.error_message
+        self.results[event.query_id] = event.result
 
     def on_optimization_completed(self, event: OptimizationCompleted) -> None:
         self.query_optimized_plan[event.query_id] = event.optimized_plan
@@ -197,6 +200,21 @@ def test_subscriber_template():
     df.collect()
     # Should only have the previous query
     assert len(subscriber.query_metadata) == 1
+
+
+def test_an_in_process_query_reports_what_it_returned_and_no_queue():
+    subscriber = MockSubscriber()
+    df = daft.from_pydict({"x": list(range(10))}).where(daft.col("x") < 4)
+
+    with daft.with_subscriber("mock", subscriber):
+        rows = len(df.collect())
+
+    query_id = subscriber.query_ids[-1]
+    result = subscriber.results[query_id]
+    assert subscriber.query_metadata[query_id].queued_seconds is None
+    assert result.rows_returned == rows == 4
+    assert result.bytes_returned is not None
+    assert result.bytes_returned > 0
 
 
 def test_execution_events_inherit_from_event_base():

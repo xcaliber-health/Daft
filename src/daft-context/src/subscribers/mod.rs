@@ -27,12 +27,19 @@ pub struct QueryMetadata {
     pub python_version: Option<String>,
     pub daft_version: Option<String>,
     pub ray_version: Option<String>,
+    /// Seconds a served query waited for an execution slot; `None` for a
+    /// query run in-process, which never queues.
+    pub queued_seconds: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
 pub struct QueryResult {
     pub end_state: QueryEndState,
     pub error_message: Option<String>,
+    /// Rows handed to the query's reader; what reached it if it stopped early.
+    pub rows_returned: Option<u64>,
+    /// In-memory size, in bytes, of the batches handed to the query's reader.
+    pub bytes_returned: Option<u64>,
 }
 
 pub fn now_epoch_secs() -> f64 {

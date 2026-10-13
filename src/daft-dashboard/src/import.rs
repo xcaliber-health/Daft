@@ -197,6 +197,8 @@ fn import_event(event: &Event, state: &DashboardState) -> Result<(), EventLogErr
         // TODO add support in  dashboard for process stats
         Event::ProcessStats(_e) => return Ok(()),
         Event::EventLogStarted(_e) => return Ok(()),
+        // The dashboard tracks a query from its start.
+        Event::QueryQueued(_e) => return Ok(()),
     };
 
     if status.is_success() {

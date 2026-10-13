@@ -6,8 +6,8 @@ use crate::subscribers::{
     events::{
         ExecEndEvent, ExecStartEvent, OperatorEndEvent, OperatorStartEvent,
         OptimizationCompleteEvent, OptimizationStartEvent, ProcessStatsEvent, QueryEndEvent,
-        QueryStartEvent, StatsEvent, TaskEndEvent, TaskScheduledEvent, TaskStartEvent,
-        TaskSubmitEvent,
+        QueryQueuedEvent, QueryStartEvent, StatsEvent, TaskEndEvent, TaskScheduledEvent,
+        TaskStartEvent, TaskSubmitEvent,
     },
 };
 
@@ -17,6 +17,14 @@ pub struct DebugSubscriber;
 impl DebugSubscriber {
     pub fn new() -> Self {
         Self
+    }
+
+    fn handle_query_queued(&self, event: &QueryQueuedEvent) -> DaftResult<()> {
+        eprintln!(
+            "query_queued query_id={} lane={} kind={:?} caller={:?}",
+            event.header.query_id, event.lane, event.kind, event.caller
+        );
+        Ok(())
     }
 
     fn handle_query_start(&self, event: &QueryStartEvent) -> DaftResult<()> {
@@ -239,6 +247,7 @@ impl DebugSubscriber {
 impl Subscriber for DebugSubscriber {
     fn on_event(&self, event: Event) -> DaftResult<()> {
         match event {
+            Event::QueryQueued(e) => self.handle_query_queued(&e)?,
             Event::QueryStart(e) => self.handle_query_start(&e)?,
             // ignore heartbeats for debug, too verbose
             Event::QueryHeartbeat(_) => (),

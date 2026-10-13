@@ -13,6 +13,20 @@ class Event(ABC):
 
 
 @dataclass(frozen=True)
+class QueryQueued(Event):
+    """A served query accepted by its server, before it waits for an execution slot.
+
+    A query run in-process never queues, so it never reports this.
+    """
+
+    query_id: str
+    timestamp: float
+    lane: str
+    kind: str | None
+    caller: str | None
+
+
+@dataclass(frozen=True)
 class QueryStarted(Event):
     query_id: str
     metadata: PyQueryMetadata

@@ -2770,6 +2770,7 @@ class PyQueryMetadata:
     python_version: str | None
     daft_version: str | None
     ray_version: str | None
+    queued_seconds: float | None
 
     def __init__(
         self,
@@ -2781,13 +2782,22 @@ class PyQueryMetadata:
         python_version: str | None = None,
         daft_version: str | None = None,
         ray_version: str | None = None,
+        queued_seconds: float | None = None,
     ) -> None: ...
 
 class PyQueryResult:
     end_state: QueryEndState
     error_message: str | None
+    rows_returned: int | None
+    bytes_returned: int | None
 
-    def __init__(self, end_state: QueryEndState, error_message: str | None) -> None: ...
+    def __init__(
+        self,
+        end_state: QueryEndState,
+        error_message: str | None,
+        rows_returned: int | None = None,
+        bytes_returned: int | None = None,
+    ) -> None: ...
 
 class PyDaftContext:
     def __init__(self) -> None: ...

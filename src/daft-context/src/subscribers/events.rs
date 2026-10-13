@@ -9,6 +9,9 @@ use super::{QueryMetadata, QueryResult};
 
 #[derive(Debug, Clone)]
 pub enum Event {
+    /// A query was accepted by a server and waits for an execution slot. A
+    /// query run in-process never queues, so it never reports this.
+    QueryQueued(QueryQueuedEvent),
     QueryStart(QueryStartEvent),
     QueryHeartbeat(QueryHeartbeatEvent),
     QueryEnd(QueryEndEvent),
@@ -134,6 +137,19 @@ pub struct TaskStatsSnapshot {
 pub struct ProcessStatsEvent {
     pub header: EventHeader,
     pub stats: Stats,
+}
+
+/// A query accepted by a server, before it is admitted to run.
+#[derive(Debug, Clone)]
+pub struct QueryQueuedEvent {
+    pub header: EventHeader,
+    /// How the query arrived: `plan`, `sql` or `request`.
+    pub lane: String,
+    /// The request's kind, for a host request.
+    pub kind: Option<String>,
+    /// The authenticated caller, or `None` when the server does not name its
+    /// callers.
+    pub caller: Option<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -17,6 +17,7 @@ from daft.subscribers.events import (
     ProcessStats,
     QueryFinished,
     QueryHeartbeat,
+    QueryQueued,
     QueryStarted,
     Stats,
 )
@@ -43,6 +44,10 @@ class Subscriber(ABC):
         Override to release resources (file handles, connections, etc.).
         """
         pass
+
+    @on_event.register
+    def _(self, event: QueryQueued) -> None:
+        self.on_query_queued(event)
 
     @on_event.register
     def _(self, event: QueryStarted) -> None:
@@ -98,6 +103,10 @@ class Subscriber(ABC):
 
     def on_stats(self, event: Stats) -> None:
         """Called when emitting stats for all running operators in a query."""
+        pass
+
+    def on_query_queued(self, event: QueryQueued) -> None:
+        """Called when a server accepts a query, before it waits for an execution slot."""
         pass
 
     def on_query_started(self, event: QueryStarted) -> None:

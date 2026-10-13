@@ -346,6 +346,24 @@ class LocalPartitionSet(PartitionSet[MicroPartition]):
 
 
 @dataclass
+class ReturnedCounts:
+    """Rows and in-memory bytes handed to a query's reader so far.
+
+    Counted from each result's metadata as it is handed over, so a reader that
+    stops early is credited with what it received, and no partition is fetched.
+    """
+
+    rows: int = 0
+    bytes: int = 0
+
+    def add(self, result: MaterializedResult[PartitionT]) -> None:
+        """Count one result handed to the reader."""
+        metadata = result.metadata()
+        self.rows += metadata.num_rows
+        self.bytes += metadata.size_bytes or 0
+
+
+@dataclass
 class LocalMaterializedResult(MaterializedResult[MicroPartition]):
     _partition: MicroPartition
     _metadata: PartitionMetadata | None = None

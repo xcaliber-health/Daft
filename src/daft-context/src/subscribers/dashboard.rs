@@ -611,6 +611,9 @@ impl Drop for DashboardSubscriber {
 impl Subscriber for DashboardSubscriber {
     fn on_event(&self, event: Event) -> DaftResult<()> {
         match event {
+            // The dashboard tracks a query from its start; a served query's
+            // time in the queue is carried by its start metadata instead.
+            Event::QueryQueued(_) => {}
             Event::QueryStart(e) => {
                 self.on_query_start(e.header.query_id, e.metadata)?;
             }

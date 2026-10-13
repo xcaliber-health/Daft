@@ -15,23 +15,28 @@ from __future__ import annotations
 
 import logging
 import uuid as _uuid
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from decimal import Decimal
+from typing import TYPE_CHECKING, TypeAlias
 
 from daft.io.iceberg._common import begin_transaction, commit_with_retry
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    import pyarrow as pa
     from pyiceberg.expressions import BooleanExpression
     from pyiceberg.io import FileIO
     from pyiceberg.manifest import DataFile
     from pyiceberg.table import Table as PyIcebergTable
     from pyiceberg.table import Transaction
     from pyiceberg.table.snapshots import Operation, Snapshot
+    from pyiceberg.types import IcebergType
 
     from daft.daft import IOConfig
     from daft.dataframe import DataFrame
+    from daft.datatype import DataType
     from daft.expressions import Expression
     from daft.io.iceberg._deletes import PartitionValue, ScanPlan
     from daft.schema import Schema
@@ -204,56 +209,471 @@ def overwrite_by_filter(
     CommitRetryExhausted
         When the commit cannot land within the table's retry budget.
     """
-    from pyiceberg.expressions import AlwaysTrue
+    return _overwrite(df, table, _FilterScope(table, overwrite_filter, df.schema()), io_config, snapshot_properties)
 
+
+def overwrite_by_keys(
+    df: DataFrame,
+    table: PyIcebergTable,
+    keys: DataFrame,
+    io_config: IOConfig,
+    snapshot_properties: dict[str, str],
+) -> DataFrame:
+    """Replace the rows of ``table`` whose key is in the key set ``keys`` with the rows of ``df``.
+
+    A row's key is its values on the key columns, which are ``keys``' columns,
+    matched to the table's columns by name, all together. A row with a null in
+    any key column never matches and is kept. A key of ``keys`` with no new row
+    still loses its existing rows.
+
+    Parameters
+    ----------
+    df
+        The new rows; every one must have its key in ``keys``.
+    table
+        The table to write; its main branch is replaced in.
+    keys
+        The key set K. Its distinct rows are read once and held in memory, in
+        the calling process, without spilling.
+    io_config
+        Storage access for reading and writing data files.
+    snapshot_properties
+        Properties set on the snapshot committed.
+
+    Returns:
+    -------
+    DataFrame
+        The files added and removed, as :func:`write_result` describes them.
+
+    Raises:
+    ------
+    ValueError
+        When a key column is not a column of the table and of ``df``, when a key
+        column's type does not compare with the table's, when the isolation
+        level is not recognized, or when a new row's key is not in ``keys``.
+    WriteConflict
+        When a commit made since the overwrite was planned overlaps it.
+    CommitRetryExhausted
+        When the commit cannot land within the table's retry budget.
+    """
+    return _overwrite(df, table, _KeyScope(table, keys, df.schema()), io_config, snapshot_properties)
+
+
+def _overwrite(
+    df: DataFrame,
+    table: PyIcebergTable,
+    scope: _Scope,
+    io_config: IOConfig,
+    snapshot_properties: dict[str, str],
+) -> DataFrame:
+    """Replace the rows of ``table`` that ``scope`` selects with the rows of ``df``, in one snapshot."""
+    from daft import col
     from daft.io.iceberg._deletes import plan_files, read_with_deletes
-    from daft.io.iceberg._expressions import convert_filter
-    from daft.io.iceberg._metadata import convert_iceberg_schema
 
-    _require_boolean(overwrite_filter, convert_iceberg_schema(table.schema()), "the table's columns")
-    _require_boolean(overwrite_filter, df.schema(), "the written rows' columns")
     isolation = _isolation_level(table)
-
     start = table.current_snapshot()
     start_id = int(start.snapshot_id) if start is not None else None
-    prune = _constant_predicate(overwrite_filter)
-    if prune is None:
-        prune = convert_filter(overwrite_filter._expr, table.schema()) or AlwaysTrue()
-    # Planned without the filter: a filtered plan omits row-level deletes whose
-    # bounds miss the filter, and those still apply to the rows a rewrite keeps.
+    # Planned without the scope: a plan narrowed by it omits row-level deletes
+    # whose bounds miss it, and those still apply to the rows a rewrite keeps.
     plan = plan_files(table, table.scan(snapshot_id=start_id))
-    may_hold = _may_hold_rows_of(table, prune)
-    candidates = [path for path, task in plan.tasks.items() if may_hold(task.file)]
-    removed, partial = _select_files(table, plan, candidates, overwrite_filter, start_id, io_config)
+    candidates = [path for path, task in plan.tasks.items() if scope.may_hold(task.file)]
+    removed, partial = _select_files(table, plan, candidates, scope, start_id, io_config)
 
-    in_scope = overwrite_filter.fill_null(False)
-    new_files, write_df = _write(
-        _checked_against(df, overwrite_filter), table, io_config, require_matching_columns=False
-    )
+    new_files, write_df = _write(scope.checked(df), table, io_config, require_matching_columns=False)
     survivor_files: list[DataFile] = []
     try:
         if partial:
-            survivors = read_with_deletes(
-                table=table, plan=plan, paths=partial, snapshot_id=start_id, io_config=io_config
-            ).where(~in_scope)
+            survivors = (
+                scope.matched(
+                    read_with_deletes(table=table, plan=plan, paths=partial, snapshot_id=start_id, io_config=io_config)
+                )
+                .where(~col(_MATCHED_COL))
+                .select(*[field.name for field in table.schema().fields])
+            )
             survivor_files, _ = _write(survivors, table, io_config, require_matching_columns=True)
         added = [WrittenFile(f, rewritten=False) for f in new_files] + [
             WrittenFile(f, rewritten=True) for f in survivor_files
         ]
+        # An overwrite that removes no row and writes no row changes nothing, so commits nothing.
         if added or removed:
             _commit(
                 table,
                 start_id=start_id,
                 added=added,
                 removed=removed,
-                scope=prune,
-                isolation=isolation,
+                may_hold=scope.may_hold if isolation == ISOLATION_SERIALIZABLE else None,
                 snapshot_properties=snapshot_properties,
             )
     except BaseException:
         _discard(table, [*new_files, *survivor_files])
         raise
     return write_result(table, added, removed, like=write_df)
+
+
+class _Scope(ABC):
+    """The existing rows an overwrite replaces, and the new rows it may write."""
+
+    @abstractmethod
+    def may_hold(self, data_file: DataFile) -> bool:
+        """Whether a data file's metadata allows a row in scope; false only when it holds none."""
+
+    def holds_only(self, data_file: DataFile) -> bool:
+        """Whether a data file's metadata shows every row is in scope, so it is removed unread."""
+        return False
+
+    @abstractmethod
+    def matched(self, frame: DataFrame) -> DataFrame:
+        """``frame`` with a non-null boolean column saying whether each row is in scope."""
+
+    @abstractmethod
+    def checked(self, df: DataFrame) -> DataFrame:
+        """``df`` failing its query on any row not in scope, with its columns unchanged."""
+
+
+class _FilterScope(_Scope):
+    """The rows on which a boolean filter is true."""
+
+    def __init__(self, table: PyIcebergTable, overwrite_filter: Expression, written: Schema) -> None:
+        from pyiceberg.expressions import AlwaysTrue
+        from pyiceberg.expressions.visitors import _StrictMetricsEvaluator
+
+        from daft.io.iceberg._expressions import convert_filter
+        from daft.io.iceberg._metadata import convert_iceberg_schema
+
+        _require_boolean(overwrite_filter, convert_iceberg_schema(table.schema()), "the table's columns")
+        _require_boolean(overwrite_filter, written, "the written rows' columns")
+        self._filter = overwrite_filter
+        prune = _constant_predicate(overwrite_filter)
+        if prune is None:
+            prune = convert_filter(overwrite_filter._expr, table.schema()) or AlwaysTrue()
+        self._may_hold = _may_hold_rows_of(table, prune)
+        strict = _strict_predicate(overwrite_filter, table)
+        self._must_match = (
+            _StrictMetricsEvaluator(table.schema(), strict, case_sensitive=True).eval if strict is not None else None
+        )
+
+    def may_hold(self, data_file: DataFile) -> bool:
+        return self._may_hold(data_file)
+
+    def holds_only(self, data_file: DataFile) -> bool:
+        return self._must_match is not None and bool(self._must_match(data_file))
+
+    def matched(self, frame: DataFrame) -> DataFrame:
+        return frame.with_column(_MATCHED_COL, self._filter.fill_null(False))
+
+    def checked(self, df: DataFrame) -> DataFrame:
+        return _checked_against(
+            df, self._filter, f"a row written by an overwrite must satisfy its filter {self._filter}"
+        )
+
+
+#: A file's bound on a key column, decoded in the order K's values compare in.
+BoundValue: TypeAlias = int | float | str | bytes | bool | Decimal
+
+#: Keys tested at once against a file's bounds on the key columns after the first.
+_BOUNDS_CHUNK = 65_536
+
+
+class _KeyScope(_Scope):
+    """The rows whose key, on every key column together, is a key of a key set K.
+
+    K's distinct rows are read once and held in memory, in the calling process,
+    without spilling: one copy, sorted on the key columns, cast to the table's
+    types. A key with a null in any column, or that the table's column cannot
+    hold, never matches and is dropped.
+
+    A file may hold a key of K when its partition, on the fields drawn from key
+    columns, is one K's keys fall in, and its bounds, on every key column
+    together, enclose a key of K. A file without both bounds on a key column is
+    not ruled out by that column. Testing a file costs ``log |K|`` binary search
+    steps on the first key column, plus a test of the keys inside those bounds
+    on the other key columns that stops at the first key inside every bound:
+    ``files * log |K|`` when the first column's bounds separate the files, up to
+    ``files * |K|`` when they do not and another column's do.
+    """
+
+    def __init__(self, table: PyIcebergTable, keys: DataFrame, written: Schema) -> None:
+        from daft import col, from_arrow, lit
+        from daft.io.iceberg._metadata import convert_iceberg_schema
+
+        names = keys.column_names
+        if not names:
+            raise ValueError("overwrite_keys must have at least one key column")
+        table_schema = convert_iceberg_schema(table.schema())
+        for name in names:
+            if name not in table_schema.column_names():
+                raise ValueError(f"the key column {name!r} is not a column of the table")
+            if name not in written.column_names():
+                raise ValueError(f"the key column {name!r} is not a column of the written rows")
+            for side, dtype in (("key set", keys.schema()[name].dtype), ("written rows", written[name].dtype)):
+                if not _comparable(dtype, table_schema[name].dtype):
+                    raise ValueError(
+                        f"the key column {name!r} of the {side} is {dtype}, which does not compare with "
+                        f"the table's {table_schema[name].dtype}"
+                    )
+        self._names: list[Expression | str] = list(names)
+
+        # Cast to the table's types; a key the table's column cannot hold matches no row.
+        held = keys.select(*names)
+        kept = None
+        for name in names:
+            original = f"__daft_key_original_{name}__"
+            target = table_schema[name].dtype
+            held = held.with_column(original, col(name)).with_column(name, col(name).cast(target))
+            representable = col(name).not_null() & (col(name).cast(keys.schema()[name].dtype) == col(original))
+            kept = representable if kept is None else kept & representable
+        assert kept is not None
+        self._keys = held.where(kept).select(*names).distinct().sort(self._names).to_arrow()
+        self._frame = from_arrow(self._keys).with_column(_MATCHED_COL, lit(True))
+        self._bounds = [_KeyColumn.of(table, name, self._keys.column(name)) for name in names]
+        self._partitions = _key_partitions(table, names, self._keys)
+
+    def may_hold(self, data_file: DataFile) -> bool:
+        if self._keys.num_rows == 0:
+            return False
+        tested = self._partitions.get(int(data_file.spec_id))
+        if tested is not None:
+            positions, allowed = tested
+            if tuple(_canonical(data_file.partition[pos]) for pos in positions) not in allowed:
+                return False
+        return self._bounds_may_hold(data_file)
+
+    def _bounds_may_hold(self, data_file: DataFile) -> bool:
+        import pyarrow.compute as pc
+
+        bounds = [column.bounds(data_file) for column in self._bounds]
+        start, stop = 0, self._keys.num_rows
+        first = bounds[0]
+        if first is not None:
+            start, stop = self._bounds[0].slice_within(*first)
+            if start >= stop:
+                return False
+        rest = [
+            (column.values, bound)
+            for i, (column, bound) in enumerate(zip(self._bounds, bounds))
+            if i > 0 and bound is not None and column.values is not None
+        ]
+        if not rest:
+            return True
+        for offset in range(start, stop, _BOUNDS_CHUNK):
+            length = min(_BOUNDS_CHUNK, stop - offset)
+            inside = None
+            for column_values, (low, high) in rest:
+                values = column_values.slice(offset, length)
+                within = pc.and_(pc.greater_equal(values, low), pc.less_equal(values, high))
+                inside = within if inside is None else pc.and_(inside, within)
+            if inside is not None and pc.any(inside).as_py():
+                return True
+        return False
+
+    def matched(self, frame: DataFrame) -> DataFrame:
+        from daft import col
+
+        return frame.join(self._frame, on=self._names, how="left").with_column(
+            _MATCHED_COL, col(_MATCHED_COL).fill_null(False)
+        )
+
+    def checked(self, df: DataFrame) -> DataFrame:
+        from daft import col
+
+        columns = df.column_names
+        marked = _checked_against(
+            self.matched(df),
+            col(_MATCHED_COL),
+            f"a row written by an overwrite must have its key, on {self._names}, in the key set",
+        )
+        return marked.select(*columns)
+
+
+@dataclass(frozen=True)
+class _KeyColumn:
+    """One key column of K, in the order its file bounds compare in, with its field's type."""
+
+    field_id: int
+    field_type: IcebergType
+    #: K's values in comparison order, or ``None`` when the type's bounds are not compared.
+    #: Kept in K's own chunks, so no copy of K is made.
+    values: pa.ChunkedArray | None
+
+    @classmethod
+    def of(cls, table: PyIcebergTable, name: str, values: pa.ChunkedArray) -> _KeyColumn:
+        field = table.schema().find_field(name)
+        return cls(field.field_id, field.field_type, _comparison_order(field.field_type, values))
+
+    def bounds(self, data_file: DataFile) -> tuple[BoundValue, BoundValue] | None:
+        """The file's lower and upper bound on this column in comparison order, when it records both."""
+        from pyiceberg.conversions import from_bytes
+
+        if self.values is None:
+            return None
+        lower = (data_file.lower_bounds or {}).get(self.field_id)
+        upper = (data_file.upper_bounds or {}).get(self.field_id)
+        if lower is None or upper is None:
+            return None
+        return from_bytes(self.field_type, lower), from_bytes(self.field_type, upper)
+
+    def slice_within(self, low: BoundValue, high: BoundValue) -> tuple[int, int]:
+        """The range of positions of K's sorted values inside ``[low, high]``."""
+        from bisect import bisect_left, bisect_right
+
+        assert self.values is not None
+        view = _SortedView(self.values)
+        return bisect_left(view, low), bisect_right(view, high)
+
+
+class _SortedView:
+    """Sorted values read one at a time, so a binary search converts only the values it visits."""
+
+    def __init__(self, values: pa.ChunkedArray) -> None:
+        self._values = values
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __getitem__(self, position: int) -> BoundValue:
+        return self._values[position].as_py()
+
+
+def _comparison_order(field_type: IcebergType, values: pa.ChunkedArray) -> pa.ChunkedArray | None:
+    """K's values in the form the table's bounds decode to, or ``None`` when that type's bounds are not compared.
+
+    Dates compare as days and times and timestamps as microseconds; strings in
+    code-point order, which is the byte order a truncated bound keeps sound. A
+    value already in that form is returned as it is, sharing K's buffers.
+    """
+    import pyarrow as pa
+    from pyiceberg.types import (
+        BinaryType,
+        BooleanType,
+        DateType,
+        DecimalType,
+        DoubleType,
+        FixedType,
+        FloatType,
+        IntegerType,
+        LongType,
+        StringType,
+        TimestampType,
+        TimestamptzType,
+        TimeType,
+    )
+
+    if isinstance(field_type, (IntegerType, LongType)):
+        return values.cast(pa.int64())
+    if isinstance(field_type, DateType):
+        return values.cast(pa.date32()).cast(pa.int32())
+    if isinstance(field_type, (TimestampType, TimestamptzType)):
+        return values.cast(pa.timestamp("us", tz=values.type.tz)).cast(pa.int64())
+    if isinstance(field_type, TimeType):
+        return values.cast(pa.time64("us")).cast(pa.int64())
+    if isinstance(field_type, (FloatType, DoubleType)):
+        return values.cast(pa.float64())
+    if isinstance(field_type, (StringType, BinaryType, FixedType, DecimalType, BooleanType)):
+        return values
+    return None
+
+
+def _comparable(key: DataType, column: DataType) -> bool:
+    """Whether a key of type ``key`` is compared with a column of type ``column``.
+
+    Types compare within one family: numbers, text, bytes, dates, times,
+    timestamps, or truth values. A key is never matched across families, as a
+    cast from text to a number would.
+    """
+    family = _family(key)
+    return key == column or (family is not None and family == _family(column))
+
+
+def _family(dtype: DataType) -> str | None:
+    """The family of types ``dtype`` compares within, or ``None`` when it compares only with itself."""
+    if dtype.is_numeric():
+        return "number"
+    if dtype.is_string():
+        return "text"
+    if dtype.is_binary() or dtype.is_fixed_size_binary():
+        return "bytes"
+    if dtype.is_date():
+        return "date"
+    if dtype.is_time():
+        return "time"
+    if dtype.is_timestamp():
+        return "timestamp"
+    if dtype.is_boolean():
+        return "truth"
+    return None
+
+
+def _key_partitions(
+    table: PyIcebergTable, names: list[str], keys: pa.Table
+) -> dict[int, tuple[tuple[int, ...], frozenset[tuple[PartitionValue, ...]]]]:
+    """Per partition spec, the fields drawn from key columns and the partition tuples K's keys fall in.
+
+    Each field is computed over K with the transforms the writer partitions by,
+    so a key's bucket or truncated value is the one its row's file records, and
+    the tuples are made distinct by the engine, so only as many reach Python as
+    partitions K falls in. A spec with no field drawn from a key column is left out.
+    """
+    from pyiceberg.transforms import (
+        BucketTransform,
+        DayTransform,
+        HourTransform,
+        IdentityTransform,
+        MonthTransform,
+        TruncateTransform,
+        YearTransform,
+    )
+
+    from daft.io.iceberg.iceberg_write import partition_field_to_expr
+
+    supported = (
+        IdentityTransform,
+        YearTransform,
+        MonthTransform,
+        DayTransform,
+        HourTransform,
+        BucketTransform,
+        TruncateTransform,
+    )
+    schema = table.schema()
+    key_ids = {schema.find_field(name).field_id for name in names}
+    from daft import from_arrow
+
+    frame = from_arrow(keys)
+    tested: dict[int, tuple[tuple[int, ...], frozenset[tuple[PartitionValue, ...]]]] = {}
+    for spec_id, spec in table.specs().items():
+        fields = [
+            (position, field)
+            for position, field in enumerate(spec.fields)
+            if field.source_id in key_ids and isinstance(field.transform, supported)
+        ]
+        if not fields:
+            continue
+        # Made distinct by the engine: only the partitions K falls in reach Python, not every key.
+        computed = (
+            frame.select(
+                *[
+                    partition_field_to_expr(field, schema).alias(f"__daft_partition_{position}")
+                    for position, field in fields
+                ]
+            )
+            .distinct()
+            .to_pydict()
+        )
+        columns = [computed[f"__daft_partition_{position}"] for position, _ in fields]
+        allowed = frozenset(tuple(_canonical(value) for value in row) for row in zip(*columns))
+        tested[int(spec_id)] = (tuple(position for position, _ in fields), allowed)
+    return tested
+
+
+def _canonical(value: PartitionValue) -> PartitionValue:
+    """A partition value in the form the writer records it, so computed and recorded values compare."""
+    import datetime
+
+    from daft.io.iceberg.iceberg_write import to_partition_representation
+
+    if isinstance(value, datetime.datetime) and value.tzinfo is not None:
+        value = value.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    return to_partition_representation(value)
 
 
 def _require_boolean(expression: Expression, schema: Schema, over: str) -> None:
@@ -279,28 +699,22 @@ def _select_files(
     table: PyIcebergTable,
     plan: ScanPlan,
     candidates: list[str],
-    scope: Expression,
+    scope: _Scope,
     snapshot_id: int | None,
     io_config: IOConfig,
 ) -> tuple[list[RemovedFile], list[str]]:
-    """Return which of the ``candidates`` the filter removes, and the paths of those only partly removed.
+    """Return which of the ``candidates`` the scope removes, and the paths of those only partly removed.
 
-    A file without row-level deletes whose metrics show every row matches is
-    removed without being read; the other candidates are read for the filter's
-    columns, and kept whole when no row matches.
+    A file without row-level deletes whose metadata shows every row is in scope
+    is removed without being read; the other candidates are read for the
+    columns the scope needs, and kept whole when no row is in scope.
     """
-    from pyiceberg.expressions.visitors import _StrictMetricsEvaluator
-
-    strict = _strict_predicate(scope, table)
-    must_match = (
-        _StrictMetricsEvaluator(table.schema(), strict, case_sensitive=True).eval if strict is not None else None
-    )
     removed: list[RemovedFile] = []
     to_count: list[str] = []
     for path in candidates:
         task = plan.tasks[path]
         has_deletes = bool(task.delete_files) or path in plan.equality_by_path
-        if must_match is not None and not has_deletes and must_match(task.file):
+        if not has_deletes and scope.holds_only(task.file):
             removed.append(RemovedFile(task.file, int(task.file.record_count)))
         else:
             to_count.append(path)
@@ -356,12 +770,12 @@ def _count_rows(
     snapshot_id: int | None,
     io_config: IOConfig,
     *,
-    scope: Expression | None,
+    scope: _Scope | None,
 ) -> dict[str, tuple[int, int]]:
-    """Return, per file, its live rows and how many of them ``scope`` is true on.
+    """Return, per file, its live rows and how many of them are in ``scope``.
 
-    Only the filter's columns are read. Without a filter, every live row counts
-    as matching. A file whose rows were all deleted is absent.
+    Only the columns the scope needs are read. Without a scope, every live row
+    counts as in scope. A file whose rows were all deleted is absent.
     """
     from daft import col
     from daft.datatype import DataType
@@ -383,9 +797,9 @@ def _count_rows(
         live = first.count("all").alias(_LIVE_COL)
         counts = df.select(col(_FILE_COL), first).groupby(_FILE_COL).agg(live, live.alias(_MATCHED_COL)).to_pydict()
     else:
-        matched = scope.fill_null(False).cast(DataType.int64()).alias(_MATCHED_COL)
         counts = (
-            df.select(col(_FILE_COL), matched)
+            scope.matched(df)
+            .select(col(_FILE_COL), col(_MATCHED_COL).cast(DataType.int64()))
             .groupby(_FILE_COL)
             .agg(col(_MATCHED_COL).count().alias(_LIVE_COL), col(_MATCHED_COL).sum().alias(_MATCHED_COL))
             .to_pydict()
@@ -396,18 +810,13 @@ def _count_rows(
     }
 
 
-def _checked_against(df: DataFrame, scope: Expression) -> DataFrame:
-    """Return ``df`` failing its query on any row where ``scope`` is not true."""
+def _checked_against(df: DataFrame, condition: Expression, message: str) -> DataFrame:
+    """Return ``df`` failing its query, with ``message``, on any row where ``condition`` is not true."""
     from daft import col
     from daft.expressions import Expression
 
     first = df.column_names[0]
-    checked = Expression._call_builtin_scalar_fn(
-        "require_true",
-        col(first),
-        scope,
-        message=f"a row written by an overwrite must satisfy its filter {scope}",
-    )
+    checked = Expression._call_builtin_scalar_fn("require_true", col(first), condition, message=message)
     return df.with_column(first, checked)
 
 
@@ -438,11 +847,14 @@ def _commit(
     start_id: int | None,
     added: list[WrittenFile],
     removed: list[RemovedFile],
-    scope: BooleanExpression,
-    isolation: str,
+    may_hold: Callable[[DataFile], bool] | None,
     snapshot_properties: dict[str, str],
 ) -> None:
-    """Commit one overwrite snapshot, retrying a bare version race and refusing a real overlap."""
+    """Commit one overwrite snapshot, retrying a bare version race and refusing a real overlap.
+
+    ``may_hold``, under serializable isolation, says whether a data file a
+    concurrent commit added may hold a row in scope; ``None`` permits them.
+    """
     from pyiceberg.table.refs import MAIN_BRANCH
     from pyiceberg.table.snapshots import Operation
 
@@ -460,8 +872,7 @@ def _commit(
             start_id=start_id,
             removed_paths=removed_paths,
             touched_partitions=touched_partitions,
-            scope=scope,
-            isolation=isolation,
+            may_hold=may_hold,
         )
         tx = begin_transaction(table)
         producer = _overwrite_producer_class()(
@@ -490,14 +901,14 @@ def _raise_on_conflict(
     start_id: int | None,
     removed_paths: set[str],
     touched_partitions: set[str],
-    scope: BooleanExpression,
-    isolation: str,
+    may_hold: Callable[[DataFile], bool] | None,
 ) -> None:
     """Raise :class:`WriteConflict` when a commit since ``start_id`` overlaps the overwrite.
 
     Any isolation refuses a commit that removed a file the overwrite replaces,
-    or added a row-level delete that may cover one. ``serializable`` also
-    refuses a commit that added a data file the filter may select rows of.
+    or added a row-level delete that may cover one. ``may_hold``, given under
+    serializable isolation, also refuses a commit that added a data file that
+    may hold a row in scope.
     """
     from pyiceberg.manifest import DataFileContent, ManifestEntryStatus
 
@@ -508,7 +919,6 @@ def _raise_on_conflict(
         raise WriteConflict(
             f"the table's history no longer contains snapshot {start_id}, which the overwrite was planned on"
         )
-    may_hold_scope = _may_hold_rows_of(table, scope) if isolation == ISOLATION_SERIALIZABLE else None
     for snapshot in foreign:
         snapshot_id = int(snapshot.snapshot_id)
         for data_file in _entries_of(snapshot, table, ManifestEntryStatus.DELETED, conflict=WriteConflict):
@@ -523,7 +933,7 @@ def _raise_on_conflict(
                         f"snapshot {snapshot_id} added the row-level delete {data_file.file_path!r} "
                         "covering a file the overwrite replaces"
                     )
-            elif may_hold_scope is not None and may_hold_scope(data_file):
+            elif may_hold is not None and may_hold(data_file):
                 raise WriteConflict(
                     f"snapshot {snapshot_id} added {data_file.file_path!r}, which may hold rows "
                     "the overwrite's filter selects"

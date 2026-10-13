@@ -122,6 +122,33 @@ new rows, in one snapshot:
 
 It is copy-on-write, on the main branch, and requires pyiceberg 0.11 or later.
 
+### Replacing the rows of a set of keys
+
+`mode="overwrite"` with `overwrite_keys` replaces the existing rows whose key is in a key set, and writes the new rows,
+in one snapshot. The key set is a DataFrame whose columns are the key columns, named as the table names them:
+
+=== "🐍 Python"
+
+    ```python
+    changed = daft.from_pydict({"customer_id": [17, 42]})
+    df.write_iceberg(table, mode="overwrite", overwrite_keys=changed)
+    ```
+
+- A row's key is its values on every key column together. A row with a null in any key column never matches and is
+  kept, and a key with no new row still loses its existing rows.
+- Every new row must have its key in the key set, or the write fails before anything is committed.
+- Key types compare within a family (numbers with numbers, text with text, and so on); a key of another family is
+  refused, never cast.
+- The key set's distinct rows are read once and held in memory, in the calling process, without spilling.
+- Only files whose partition (identity, bucket, truncate or time transforms of a key column) and column bounds may
+  hold a key are read, and only their key columns, to count matches. Partitioning or sorting the table by the key
+  makes that prune; random keys without either prune nothing.
+- Under `serializable`, a concurrent commit conflicts only when a file it added may hold a key: its partition and
+  bounds are tested against each key, so key sets that do not overlap do not conflict when the table's layout
+  separates them.
+- An overwrite that removes no row and writes no row commits nothing. `overwrite_keys` and `overwrite_filter` cannot be
+  combined.
+
 ## Checkpointing
 
 Daft supports idempotent writes to Iceberg via the `checkpoint=` parameter on [`df.write_iceberg()`][daft.DataFrame.write_iceberg]. Retries of the same logical commit — after a crash, a transient catalog error, or a deliberate re-invocation — produce the same Iceberg state without duplicate snapshots. See the [Checkpointing user guide](../use-case/checkpointing.md) for concepts; the sections below cover Iceberg-specific behavior.

@@ -1344,6 +1344,7 @@ class DataFrame:
         snapshot_properties: dict[str, str] | None = None,
         checkpoint: "IdempotentCommit | None" = None,
         overwrite_filter: Expression | None = None,
+        overwrite_keys: "DataFrame | None" = None,
     ) -> "DataFrame":
         """Writes the DataFrame to an [Iceberg](https://iceberg.apache.org/docs/nightly/) table, returning a new DataFrame with the operations that occurred.
 
@@ -1356,6 +1357,14 @@ class DataFrame:
         ``write.delete.isolation-level`` (``serializable`` by default, which also refuses a concurrent commit that
         added rows the filter may select); an overlap raises ``daft.io.iceberg.WriteConflict`` and commits nothing.
 
+        With ``overwrite_keys``, an overwrite replaces the existing rows whose key is in a key set, in the same way. The
+        key set is a DataFrame whose columns are the key columns, named as the table names them; a row's key is its
+        values on all of them together. A row with a null in any key column never matches and is kept, a key with no
+        new row still loses its existing rows, and every written row must have its key in the key set. The key set's
+        distinct rows are read once and held in memory, without spilling. Only files whose partition and column
+        bounds may hold one of its keys are read, and a concurrent commit conflicts only when a file it added may hold
+        one. An overwrite that removes no row and writes no row commits nothing.
+
         ``write_iceberg`` supports checkpointing via the ``checkpoint=`` parameter. For the conceptual overview, see the [Checkpointing guide](../use-case/checkpointing.md).
 
         Args:
@@ -1365,6 +1374,7 @@ class DataFrame:
             snapshot_properties (dict[str, str], optional): Optional snapshot properties to set while writing to the table. Keys with prefix ``daft.idempotence-`` are reserved.
             checkpoint (IdempotentCommit, optional): Bundled checkpoint store + idempotence key for an idempotent commit. When provided, the snapshot summary is tagged with ``daft.idempotence-key`` and retries with the same key recognize the prior attempt without producing a duplicate snapshot. Only ``mode='append'`` is supported. Requires the Ray runner.
             overwrite_filter (Expression, optional): With ``mode='overwrite'``, a boolean expression over the table's columns selecting the existing rows to replace. Requires pyiceberg>=0.11.0.
+            overwrite_keys (DataFrame, optional): With ``mode='overwrite'``, the key set whose keys' existing rows are replaced. Its key columns must compare with the table's: numbers with numbers, text with text, and so on. Cannot be combined with ``overwrite_filter``. Requires pyiceberg>=0.11.0.
 
         Returns:
             DataFrame: The operations that occurred with this write, one row per file: ``operation`` (``ADD`` or
@@ -1414,6 +1424,8 @@ class DataFrame:
             >>> df = df.write_iceberg(
             ...     table, mode="overwrite", overwrite_filter=daft.col("user_id") <= 3
             ... )  # doctest: +SKIP
+            >>> changed = daft.from_pydict({"user_id": [2, 3]})
+            >>> df = df.write_iceberg(table, mode="overwrite", overwrite_keys=changed)  # doctest: +SKIP
             >>>
             >>> store = daft.CheckpointStore("s3://my-bucket/ckpt/")  # doctest: +SKIP
             >>> df = daft.read_parquet(
@@ -1444,13 +1456,17 @@ class DataFrame:
         if mode not in ["append", "overwrite"]:
             raise ValueError(f"Only support `append` or `overwrite` mode. {mode} is unsupported")
 
-        if overwrite_filter is not None:
+        if overwrite_filter is not None and overwrite_keys is not None:
+            raise ValueError("overwrite_filter and overwrite_keys cannot be combined; an overwrite has one scope")
+        for scope_name, scope in (("overwrite_filter", overwrite_filter), ("overwrite_keys", overwrite_keys)):
+            if scope is None:
+                continue
             if mode != "overwrite":
-                raise ValueError("overwrite_filter requires mode='overwrite'")
+                raise ValueError(f"{scope_name} requires mode='overwrite'")
             if checkpoint is not None:
-                raise ValueError("overwrite_filter cannot be combined with checkpoint")
+                raise ValueError(f"{scope_name} cannot be combined with checkpoint")
             if parse(pyiceberg.__version__) < parse("0.11.0"):
-                raise ValueError("write_iceberg with overwrite_filter requires pyiceberg>=0.11.0")
+                raise ValueError(f"write_iceberg with {scope_name} requires pyiceberg>=0.11.0")
 
         if checkpoint is not None and mode == "overwrite":
             raise NotImplementedError(
@@ -1482,12 +1498,15 @@ class DataFrame:
             RemovedFile,
             WrittenFile,
             overwrite_by_filter,
+            overwrite_by_keys,
             removed_whole,
             write_result,
         )
 
         if overwrite_filter is not None:
             return overwrite_by_filter(self, table, overwrite_filter, io_config, snapshot_properties or {})
+        if overwrite_keys is not None:
+            return overwrite_by_keys(self, table, overwrite_keys, io_config, snapshot_properties or {})
 
         builder = self._builder.write_iceberg(table, io_config)
         write_df = DataFrame(builder)

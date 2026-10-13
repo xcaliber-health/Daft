@@ -352,12 +352,141 @@ impl PyServeServerInfo {
     }
 }
 
-/// One query's result stream, iterated synchronously.
+/// The failure a result's stream ended with, kept so it can be raised as its class.
+type EndedWith = Arc<Mutex<Option<(Failure, String)>>>;
+
+/// One query's result stream, read once: iterated part by part, or read as an
+/// Arrow stream through `__arrow_c_stream__`.
 #[pyclass(module = "daft.daft", name = "DaftServeQueryResult", frozen)]
 pub struct PyServeQueryResult {
-    stream: tokio::sync::Mutex<QueryResultStream>,
+    stream: Arc<tokio::sync::Mutex<QueryResultStream>>,
     optimized_locally: bool,
     query_id: String,
+    /// Whether the result is being read as an Arrow stream, which then owns its reading.
+    exported: std::sync::atomic::AtomicBool,
+    ended_with: EndedWith,
+}
+
+impl PyServeQueryResult {
+    fn new(stream: QueryResultStream, optimized_locally: bool, query_id: String) -> Self {
+        Self {
+            stream: Arc::new(tokio::sync::Mutex::new(stream)),
+            optimized_locally,
+            query_id,
+            exported: std::sync::atomic::AtomicBool::new(false),
+            ended_with: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn refuse_if_exported(&self) -> PyResult<()> {
+        if self.exported.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "this result is being read as an Arrow stream, which reads it to its end",
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_schema(&self, py: Python<'_>) -> PyResult<daft_core::prelude::SchemaRef> {
+        py.detach(|| {
+            common_runtime::get_io_runtime(true)
+                .block_on_current_thread(async { self.stream.lock().await.read_schema().await })
+        })
+        .map_err(|err| {
+            remember(&self.ended_with, &err);
+            served_error(err, Some(&self.query_id))
+        })
+    }
+}
+
+/// Keeps the failure a stream ended with.
+fn remember(ended_with: &EndedWith, err: &ServeError) {
+    let record = match err {
+        ServeError::Failed { failure, message } => (failure.as_ref().clone(), message.clone()),
+        other => (other.failure(), other.to_string()),
+    };
+    *ended_with
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
+}
+
+/// Reads a served result as Arrow record batches, one part at a time as each
+/// is read, converting each exactly as a local result converts its own.
+///
+/// A failure ends the stream with its class and message as text, as Arrow's
+/// interface carries only text; the result keeps it to raise as its class.
+struct ServedBatchReader {
+    stream: Arc<tokio::sync::Mutex<QueryResultStream>>,
+    schema: arrow_schema::SchemaRef,
+    pending: std::collections::VecDeque<arrow_array::RecordBatch>,
+    ended_with: EndedWith,
+    done: bool,
+}
+
+impl ServedBatchReader {
+    fn convert(
+        &self,
+        partition: &daft_micropartition::MicroPartition,
+    ) -> Result<Vec<arrow_array::RecordBatch>, arrow_schema::ArrowError> {
+        let fields = self.schema.fields();
+        partition
+            .record_batches()
+            .iter()
+            .map(|batch| {
+                daft_recordbatch::ffi::record_batch_to_arrow_rs(batch)
+                    .and_then(|arrow| {
+                        daft_recordbatch::ffi::cast_record_batch_to_schema(&arrow, fields)
+                    })
+                    .map_err(|e| arrow_schema::ArrowError::ExternalError(Box::new(e)))
+            })
+            .collect()
+    }
+}
+
+impl Iterator for ServedBatchReader {
+    type Item = Result<arrow_array::RecordBatch, arrow_schema::ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(batch) = self.pending.pop_front() {
+                return Some(Ok(batch));
+            }
+            if self.done {
+                return None;
+            }
+            let stream = self.stream.clone();
+            let part = common_runtime::get_io_runtime(true)
+                .block_on_current_thread(async move { stream.lock().await.next_partition().await });
+            match part {
+                None => self.done = true,
+                Some(Err(err)) => {
+                    self.done = true;
+                    remember(&self.ended_with, &err);
+                    let failure = err.failure();
+                    let message = match &err {
+                        ServeError::Failed { message, .. } => message.clone(),
+                        other => other.to_string(),
+                    };
+                    return Some(Err(arrow_schema::ArrowError::ExternalError(
+                        format!("[{}] {message}", failure.error_class).into(),
+                    )));
+                }
+                Some(Ok(partition)) => match self.convert(&partition) {
+                    Ok(batches) => self.pending.extend(batches),
+                    Err(e) => {
+                        self.done = true;
+                        return Some(Err(e));
+                    }
+                },
+            }
+        }
+    }
+}
+
+impl arrow_array::RecordBatchReader for ServedBatchReader {
+    fn schema(&self) -> arrow_schema::SchemaRef {
+        self.schema.clone()
+    }
 }
 
 #[pymethods]
@@ -374,6 +503,7 @@ impl PyServeQueryResult {
     }
 
     fn __next__(&self, py: Python<'_>) -> PyResult<Option<PyMicroPartition>> {
+        self.refuse_if_exported()?;
         let partition = py.detach(|| {
             common_runtime::get_io_runtime(true)
                 .block_on_current_thread(async { self.stream.lock().await.next_partition().await })
@@ -381,8 +511,75 @@ impl PyServeQueryResult {
         match partition {
             None => Ok(None),
             Some(Ok(partition)) => Ok(Some(PyMicroPartition::from(partition))),
-            Some(Err(err)) => Err(served_error(err, Some(&self.query_id))),
+            Some(Err(err)) => {
+                remember(&self.ended_with, &err);
+                Err(served_error(err, Some(&self.query_id)))
+            }
         }
+    }
+
+    /// The result's Arrow schema, which the server sends before any row; an
+    /// empty result still has one.
+    pub fn __arrow_c_schema__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let schema = self.read_schema(py)?.to_arrow()?;
+        common_arrow_ffi::schema_to_pycapsule(py, &schema)
+    }
+
+    /// Reads the result as an Arrow stream, one part at a time as it arrives.
+    ///
+    /// Each part is converted as a local result converts its own, and cast to
+    /// `requested_schema` when one is given. The stream reads the result to
+    /// its end, so it can be taken once, and the result is not iterated after.
+    #[pyo3(signature = (requested_schema=None))]
+    pub fn __arrow_c_stream__<'py>(
+        &self,
+        py: Python<'py>,
+        requested_schema: Option<Bound<'py, pyo3::types::PyCapsule>>,
+    ) -> PyResult<Py<PyAny>> {
+        if self
+            .exported
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "this result is already being read as an Arrow stream",
+            ));
+        }
+        let own = Arc::new(self.read_schema(py)?.to_arrow()?);
+        let schema = match requested_schema.as_ref() {
+            Some(capsule) => Arc::new(common_arrow_ffi::schema_from_requested_schema(capsule)?),
+            None => own,
+        };
+        let reader = ServedBatchReader {
+            stream: self.stream.clone(),
+            schema,
+            pending: std::collections::VecDeque::new(),
+            ended_with: self.ended_with.clone(),
+            done: false,
+        };
+        common_arrow_ffi::reader_to_stream_pycapsule(py, Box::new(reader))
+    }
+
+    /// The failure the result's stream ended with, as its class, or `None`.
+    ///
+    /// Arrow's stream interface carries a failure only as text; this raises
+    /// nothing, and returns the failure to raise as the class it would be
+    /// raised as when the result is iterated.
+    #[getter]
+    pub fn failure(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        let record = self
+            .ended_with
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        let (failure, message) = record;
+        let err = served_error(
+            ServeError::Failed {
+                failure: Box::new(failure),
+                message,
+            },
+            Some(&self.query_id),
+        );
+        Some(err.into_value(py).into_any())
     }
 
     /// Execution statistics, available after the stream is fully drained:
@@ -524,11 +721,7 @@ impl PyDaftServeClient {
         let query_id = request.query_id.clone();
         let mut client = self.inner.clone();
         let stream = block_on_query(py, &query_id, async move { client.run(&request).await })?;
-        Ok(PyServeQueryResult {
-            stream: tokio::sync::Mutex::new(stream),
-            optimized_locally,
-            query_id,
-        })
+        Ok(PyServeQueryResult::new(stream, optimized_locally, query_id))
     }
 
     /// Submits a textual query resolved against server-side catalogs.
@@ -550,11 +743,7 @@ impl PyDaftServeClient {
         let query_id = request.query_id.clone();
         let mut client = self.inner.clone();
         let stream = block_on_query(py, &query_id, async move { client.run(&request).await })?;
-        Ok(PyServeQueryResult {
-            stream: tokio::sync::Mutex::new(stream),
-            optimized_locally: false,
-            query_id,
-        })
+        Ok(PyServeQueryResult::new(stream, false, query_id))
     }
 
     /// Submits a request of a kind the server's host plans.
@@ -580,11 +769,7 @@ impl PyDaftServeClient {
         let query_id = request.query_id.clone();
         let mut client = self.inner.clone();
         let stream = block_on_query(py, &query_id, async move { client.run(&request).await })?;
-        Ok(PyServeQueryResult {
-            stream: tokio::sync::Mutex::new(stream),
-            optimized_locally: false,
-            query_id,
-        })
+        Ok(PyServeQueryResult::new(stream, false, query_id))
     }
 
     /// Renders the plan the server's host would run for a request, without

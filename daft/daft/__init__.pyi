@@ -4,6 +4,8 @@ from collections.abc import AsyncIterator, Callable
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Concatenate, Literal, TypeAlias, TypeVar
 
+from typing_extensions import CapsuleType
+
 from daft.dataframe.display import MermaidOptions
 from daft.io import DataSink
 from daft.io.scan import ScanOperator
@@ -2535,10 +2537,18 @@ class DaftServeServerInfo:
     def catalogs(self) -> list[str]: ...
 
 class DaftServeQueryResult:
+    """One query's result, read once: part by part, or as an Arrow stream."""
+
     @property
     def optimized_locally(self) -> bool: ...
+    @property
+    def failure(self) -> BaseException | None:
+        """The failure the result's stream ended with, as its class, or None."""
+        ...
     def __iter__(self) -> DaftServeQueryResult: ...
     def __next__(self) -> PyMicroPartition: ...
+    def __arrow_c_schema__(self) -> CapsuleType: ...
+    def __arrow_c_stream__(self, requested_schema: CapsuleType | None = None) -> CapsuleType: ...
     def stats(self) -> tuple[str | None, PyExecutionStats] | None: ...
 
 class DaftServeClient:

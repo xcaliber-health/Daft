@@ -3534,6 +3534,7 @@ dependencies = [
  "arrow-schema 59.0.0",
  "async-channel 2.5.0",
  "async-stream",
+ "common-arrow-ffi",
  "common-daft-config",
  "common-error",
  "common-metrics",

@@ -1,7 +1,8 @@
-//! Registry of running queries, enabling cross-connection cancellation.
+//! Registry of accepted queries, enabling cross-connection cancellation.
 //!
-//! Each admitted query registers a cancellation token under its
-//! client-supplied id. A `cancel_query` action from any connection trips the
+//! Each accepted query registers a cancellation token under its
+//! client-supplied id before it waits for an execution slot, so a query can
+//! be cancelled while queued as well as while running. A `cancel_query` action from any connection trips the
 //! token; the execution task observes it and aborts. Entries deregister on
 //! completion via a drop guard, so the registry cannot leak entries even when
 //! execution fails or the client disconnects mid-stream. Re-registering an id
@@ -99,8 +100,8 @@ impl QueryRegistry {
     /// Cancelling an unknown or already-finished query is a no-op, making
     /// cancellation idempotent.
     ///
-    /// Returns whether a running query with that id was found and owned by
-    /// the caller.
+    /// Returns whether a queued or running query with that id was found and
+    /// owned by the caller.
     pub fn cancel(&self, query_id: &str, caller: Option<&str>) -> bool {
         let inner = lock_inner(&self.inner);
         inner.entries.get(query_id).is_some_and(|entry| {

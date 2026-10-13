@@ -375,14 +375,16 @@ impl FlightService for DaftServeService {
             .admit_request(&ticket.ticket, limits.max_pset_bytes)
             .map_err(Status::from)?;
 
+        // Registered before it waits for a slot, so a queued query can be
+        // cancelled; a failed wait drops the guard and deregisters it.
+        let guard = self.registry.register(&query.query_id, tenant.as_deref());
+        let cancel = guard.token();
         let permit = self
             .admission
             .pool(tenant.as_deref())
-            .acquire()
+            .acquire(&query.query_id, &cancel)
             .await
             .map_err(Status::from)?;
-        let guard = self.registry.register(&query.query_id, tenant.as_deref());
-        let cancel = guard.token();
         if let Some(tenant_name) = tenant.as_deref() {
             log::info!("query {} admitted for tenant {tenant_name}", query.query_id);
         }
@@ -508,7 +510,8 @@ impl ServeShutdownHandle {
         }
     }
 
-    /// Number of queries currently executing.
+    /// Number of queries accepted and not yet finished, whether waiting for an
+    /// execution slot or executing.
     #[must_use]
     pub fn active_queries(&self) -> usize {
         self.registry.len()

@@ -180,7 +180,8 @@ impl PyDaftServer {
         self.port
     }
 
-    /// Number of queries currently executing.
+    /// Number of queries accepted and not yet finished, whether waiting for an
+    /// execution slot or executing.
     pub fn active_queries(&self) -> usize {
         self.shutdown.active_queries()
     }

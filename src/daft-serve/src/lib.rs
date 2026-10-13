@@ -16,6 +16,7 @@
 //! - [`error`] — typed errors and their transport mapping
 //! - [`lifecycle`] — a served query's lifecycle events
 //! - `server` / `execute` — the serving endpoint and query driver
+//! - `failure` — classifying a failure as the class it is raised as in-process
 //! - `client` — the connecting side, decoding result streams
 
 pub mod admission;
@@ -30,6 +31,8 @@ pub mod wire;
 pub mod client;
 #[cfg(feature = "python")]
 pub mod execute;
+#[cfg(feature = "python")]
+pub mod failure;
 #[cfg(feature = "python")]
 mod python;
 #[cfg(feature = "python")]

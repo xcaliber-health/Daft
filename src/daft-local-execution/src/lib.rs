@@ -325,6 +325,9 @@ impl From<Error> for DaftError {
                 source
             }
             Error::ValueError { message } => Self::ValueError(message),
+            // A Python exception keeps its type: it is raised as itself.
+            #[cfg(feature = "python")]
+            Error::PyIO { source } => Self::PyO3Error(source),
             _ => Self::External(err.into()),
         }
     }

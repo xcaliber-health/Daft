@@ -6,6 +6,7 @@ import sys
 from typing import TYPE_CHECKING
 
 import daft
+from daft._failures import query_result
 from daft.context import get_context
 from daft.daft import (
     FileFormatConfig,
@@ -177,10 +178,14 @@ class NativeRunner(Runner[MicroPartition]):
         # stop still reports what was delivered. Counted only when someone listens.
         returned = ReturnedCounts() if has_subscribers else None
 
-        def finished(end_state: QueryEndState, message: str) -> PyQueryResult:
-            if returned is None:
-                return PyQueryResult(end_state, message)
-            return PyQueryResult(end_state, message, returned.rows, returned.bytes)
+        def finished(end_state: QueryEndState, message: str, failed_with: BaseException | None = None) -> PyQueryResult:
+            return query_result(
+                end_state,
+                message,
+                rows_returned=None if returned is None else returned.rows,
+                bytes_returned=None if returned is None else returned.bytes,
+                failed_with=failed_with,
+            )
 
         try:
             while True:
@@ -205,11 +210,11 @@ class NativeRunner(Runner[MicroPartition]):
             raise e
         except UDFException as e:
             err_msg = f"UDF failed with exception: {e.original_exception}"
-            ctx._notify_query_end(query_id, finished(QueryEndState.Failed, err_msg))
+            ctx._notify_query_end(query_id, finished(QueryEndState.Failed, err_msg, e))
             raise e
         except Exception as e:
             err_msg = f"General Exception raised: {e}"
-            ctx._notify_query_end(query_id, finished(QueryEndState.Failed, err_msg))
+            ctx._notify_query_end(query_id, finished(QueryEndState.Failed, err_msg, e))
             raise e
 
     def run_iter_tables(

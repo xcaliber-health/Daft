@@ -40,6 +40,24 @@ pub struct QueryResult {
     pub rows_returned: Option<u64>,
     /// In-memory size, in bytes, of the batches handed to the query's reader.
     pub bytes_returned: Option<u64>,
+    /// What kind of failure ended a failed query; `None` otherwise.
+    pub failure: Option<QueryFailure>,
+}
+
+/// The kind of failure a query ended with, as its caller receives it.
+///
+/// It names the failure only: an exception's named text fields never reach
+/// an event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryFailure {
+    /// The engine class's name, `Host`, `Python`, or a server's own class.
+    pub error_class: String,
+    /// For a Python failure, the name of the raised type.
+    pub remote_type: Option<String>,
+    /// For a Python failure, the module of the raised type.
+    pub remote_module: Option<String>,
+    /// For a Python failure, the names of the raised type's hierarchy, nearest first.
+    pub remote_types: Vec<String>,
 }
 
 pub fn now_epoch_secs() -> f64 {

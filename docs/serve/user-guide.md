@@ -602,10 +602,36 @@ A catalog entry has a `name` (the alias clients use in text queries) and
 
 ## Error reference
 
-When something goes wrong, the client receives a specific, named error so you can
-handle it precisely. The most common ones:
+A served query fails with the class it fails with in-process, and every failure
+carries the `query_id` it was sent with (`None` if it failed before a query was
+sent, such as when connecting):
 
-| Error | Means | What to do |
+- **An engine failure** arrives as its engine class, such as
+  `DaftCardinalityError` or `DaftFieldNotFoundError`. That holds when the request
+  host raised it while planning, too.
+- **A Python exception** never arrives as a class the client imports. Its type
+  travels by name, on `daft.exceptions.DaftServeError`:
+  - `error_class` is `"Host"` when your request host's `plan` raised it, before
+    anything ran.
+  - It is `"Python"` when Python code raised it while the query executed, so
+    rows may already have been read.
+  - `remote_type`, `remote_module` and `remote_types` name the raised type and
+    its hierarchy.
+  - A failure of a function declared with `@daft.udf` arrives as `UDFException`
+    with the same fields, as it does in-process.
+- **Fields for your caller.** A host's exception can carry named text fields in
+  `served_fields`, a mapping of text to text. These reach the client as
+  `DaftServeError.fields`, and are never logged, sent in the message, or put in
+  an event. They are limited to 32 fields and 8 KiB in all; fields that break
+  those limits are dropped, and the failure still arrives.
+- **The server's own failures** arrive as `DaftServeError`, with `error_class`
+  naming them (below). `retryable` is true for `AtCapacity`, `Timeout` and
+  `Draining`, where sending the same query later may succeed.
+
+A failed query's `QueryFinished` event names the same kind in
+`result.error_class` and `result.remote_type`, without the fields.
+
+| `error_class` | Means | What to do |
 |---|---|---|
 | `Unauthenticated` | Wrong or missing token. | Check the token you passed to `daft.connect`. |
 | `VersionMismatch` | Client and server engine versions differ (DataFrame query). | Match versions, or use `conn.sql(...)`. |

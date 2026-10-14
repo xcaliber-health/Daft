@@ -2771,6 +2771,7 @@ pub fn is_udf(expr: &ExprRef) -> bool {
     )
 }
 
+#[recursive::recursive]
 pub fn estimated_selectivity(expr: &Expr, schema: &Schema) -> f64 {
     let estimate = match expr {
         // Boolean operations that filter rows

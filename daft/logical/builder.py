@@ -403,11 +403,14 @@ class LogicalPlanBuilder:
         target_file_size_bytes: int | None = None,
         partition_spec_id: int | None = None,
         *,
-        require_matching_columns: bool = False,
         sort_order_id: int = 0,
         inflation_factor: float | None = None,
     ) -> LogicalPlanBuilder:
         """Build a plan that writes this DataFrame as data files for a destination table.
+
+        The DataFrame's columns are checked against the table's when the plan is
+        built: each must be a column of the table, of a type its writer keeps value
+        by value, and each column the DataFrame lacks must be optional.
 
         Parameters
         ----------
@@ -423,11 +426,6 @@ class LogicalPlanBuilder:
             When set, writes using the destination's partition spec with this id
             rather than its current spec. Used by compaction when re-clustering a
             group into a different partitioning.
-        require_matching_columns
-            When set, refuse a write whose columns do not line up with the
-            destination's. Used by compaction, where the rows came from the table
-            itself, so a mismatch means they were read under names it no longer
-            uses and writing would empty a column.
         sort_order_id
             Identifier of the order the rows being written are in. Defaults to the
             unsorted order, which is what a write that does not order its rows
@@ -436,16 +434,21 @@ class LogicalPlanBuilder:
         inflation_factor
             Measured ratio of in-memory to on-disk size, used to size the first
             output file. Left unset the writer starts from a configured guess.
+
+        Raises:
+        ------
+        ValueError
+            If the DataFrame carries a column the table does not, lacks one the
+            table requires, or holds a column the table's column would have to
+            convert by rounding, parsing, formatting or assuming a time zone.
         """
-        from daft.io.iceberg.iceberg_write import get_missing_columns, partition_field_to_expr
+        from daft.io.iceberg.iceberg_write import partition_field_to_expr, planned_columns
 
         name = ".".join(table.name())
         location = table.metadata.properties.get("write.data.path", f"{table.location()}/data")
         partition_spec = table.spec() if partition_spec_id is None else table.specs()[partition_spec_id]
         schema = table.schema()
-        missing_columns = get_missing_columns(
-            self.schema().to_pyarrow_schema(), schema, require_matching_columns=require_matching_columns
-        )
+        missing_columns = planned_columns(self.schema().to_pyarrow_schema(), schema)
         builder = (
             self._builder
             if len(missing_columns) == 0

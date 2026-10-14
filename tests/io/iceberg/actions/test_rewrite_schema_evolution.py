@@ -108,39 +108,23 @@ def test_time_travel_filter_on_a_renamed_column_still_prunes(make_tiny_table):
     assert as_of.to_pydict()["id"] == [5]
 
 
-def test_writing_data_that_both_lacks_and_adds_columns_is_refused():
-    """A backstop under the rewrite's read path: never pad one column while dropping another.
+def test_writing_data_under_a_stale_column_name_is_refused(local_catalog):
+    """A backstop under the rewrite's read path: rows read under a name the table no longer uses.
 
-    Padding and dropping together is what a stale column name looks like from the
-    writer's side, and it empties the column rather than failing.
+    Written, the stale column would be dropped and the column it became filled
+    with nulls; the write is refused instead, with nothing committed.
     """
     from pyiceberg.schema import Schema
     from pyiceberg.types import LongType, NestedField
 
-    from daft.io.iceberg.iceberg_write import get_missing_columns
+    import daft
 
-    target = Schema(
-        NestedField(1, "id", LongType(), required=False),
-        NestedField(2, "tag", StringType(), required=False),
-    )
-    stale = pa.schema([("id", pa.int64()), ("label", pa.string())])
-
-    with pytest.raises(ValueError, match="do not line up"):
-        get_missing_columns(stale, target, require_matching_columns=True)
-
-
-def test_writing_data_missing_only_columns_still_pads_them():
-    """The refusal is narrow: a genuinely absent column is still filled with nulls."""
-    from pyiceberg.schema import Schema
-    from pyiceberg.types import LongType, NestedField
-
-    from daft.io.iceberg.iceberg_write import get_missing_columns
-
-    target = Schema(
-        NestedField(1, "id", LongType(), required=False),
-        NestedField(2, "tag", StringType(), required=False),
+    table = local_catalog.create_table(
+        "default.stale_name",
+        Schema(NestedField(1, "id", LongType(), required=False), NestedField(2, "tag", StringType(), required=False)),
     )
 
-    added = get_missing_columns(pa.schema([("id", pa.int64())]), target)
+    with pytest.raises(ValueError, match="\\['label'\\], which the table does not have"):
+        daft.from_pydict({"id": [1], "label": ["a"]}).write_iceberg(table)
 
-    assert [expr.name() for expr in added] == ["tag"]
+    assert local_catalog.load_table("default.stale_name").current_snapshot() is None

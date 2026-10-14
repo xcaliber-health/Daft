@@ -279,7 +279,7 @@ def _overwrite(
     candidates = [path for path, task in plan.tasks.items() if scope.may_hold(task.file)]
     removed, partial = _select_files(table, plan, candidates, scope, start_id, io_config)
 
-    new_files, write_df = _write(scope.checked(df), table, io_config, require_matching_columns=False)
+    new_files, write_df = _write(scope.checked(df), table, io_config)
     survivor_files: list[DataFile] = []
     try:
         if partial:
@@ -290,7 +290,7 @@ def _overwrite(
                 .where(~col(_MATCHED_COL))
                 .select(*[field.name for field in table.schema().fields])
             )
-            survivor_files, _ = _write(survivors, table, io_config, require_matching_columns=True)
+            survivor_files, _ = _write(survivors, table, io_config)
         added = [WrittenFile(f, rewritten=False) for f in new_files] + [
             WrittenFile(f, rewritten=True) for f in survivor_files
         ]
@@ -823,13 +823,11 @@ def _checked_against(df: DataFrame, condition: Expression, message: str) -> Data
     return df.with_column(first, checked)
 
 
-def _write(
-    df: DataFrame, table: PyIcebergTable, io_config: IOConfig, *, require_matching_columns: bool
-) -> tuple[list[DataFile], DataFrame]:
+def _write(df: DataFrame, table: PyIcebergTable, io_config: IOConfig) -> tuple[list[DataFile], DataFrame]:
     """Write ``df`` as data files of ``table`` without committing them; return them and the write's frame."""
     from daft.dataframe import DataFrame
 
-    write_df = DataFrame(df._builder.write_iceberg(table, io_config, require_matching_columns=require_matching_columns))
+    write_df = DataFrame(df._builder.write_iceberg(table, io_config))
     write_df.collect()
     data_files = write_df.to_pydict().get("data_file", [])
     return [data_file for data_file in data_files if data_file is not None], write_df

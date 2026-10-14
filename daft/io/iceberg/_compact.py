@@ -816,7 +816,6 @@ def _collect_data_files(
         io_config,
         target_file_size_bytes=target_size,
         partition_spec_id=output_spec_id,
-        require_matching_columns=True,
         sort_order_id=output_sort_order_id,
         inflation_factor=inflation_factor,
     )

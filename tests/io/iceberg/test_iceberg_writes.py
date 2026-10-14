@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import decimal
+import zoneinfo
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import unquote, urlparse
@@ -35,6 +36,9 @@ from pyiceberg.types import (
     DateType,
     DecimalType,
     DoubleType,
+    FixedType,
+    FloatType,
+    IntegerType,
     ListType,
     LongType,
     MapType,
@@ -42,6 +46,7 @@ from pyiceberg.types import (
     StringType,
     StructType,
     TimestampType,
+    TimestamptzType,
 )
 from pyiceberg.types import NestedField as _NestedField
 
@@ -256,34 +261,22 @@ def test_write_overwrite_with_snapshot_properties(simple_local_table):
     assert _get_snapshot_property(table, "mypath.myproperty") == "my-property-value"
 
 
-def test_missing_columns_write(simple_local_table):
+def test_a_frame_holding_none_of_the_tables_columns_is_refused(simple_local_table):
     table, _ = simple_local_table
 
-    df = daft.from_pydict({"x": [1, 2, 3, 4, 5]})
+    with pytest.raises(ValueError, match="\\['y'\\], which the table does not have"):
+        daft.from_pydict({"y": [1, 2, 3, 4, 5]}).write_iceberg(table)
 
-    df = daft.from_pydict({"y": [1, 2, 3, 4, 5]})
-    result = df.write_iceberg(table)
-    as_dict = result.to_pydict()
-    assert as_dict["operation"] == ["ADD"]
-    assert as_dict["rows"] == [5]
-    read_back = daft.read_iceberg(table)
-    assert read_back.to_pydict() == {"x": [None] * 5}
+    assert table.refresh().current_snapshot() is None
 
 
-def test_too_many_columns_write(simple_local_table):
-    table, num_partitions = simple_local_table
+def test_a_column_the_table_lacks_is_refused_under_every_partitioning(simple_local_table):
+    table, _ = simple_local_table
 
-    df = daft.from_pydict({"x": [1, 2, 3, 4, 5]})
-    as_arrow = df.to_arrow()
+    with pytest.raises(ValueError, match="\\['y'\\], which the table does not have"):
+        daft.from_pydict({"x": [1, 2, 3, 4, 5], "y": [6, 7, 8, 9, 10]}).write_iceberg(table)
 
-    df = daft.from_pydict({"x": [1, 2, 3, 4, 5], "y": [6, 7, 8, 9, 10]})
-    result = df.write_iceberg(table)
-    as_dict = result.to_pydict()
-    assert len(as_dict["operation"]) == num_partitions
-    assert all(op == "ADD" for op in as_dict["operation"]), as_dict["operation"]
-    assert sum(as_dict["rows"]) == 5, as_dict["rows"]
-    read_back = daft.read_iceberg(table)
-    assert as_arrow == read_back.to_arrow().sort_by("x")
+    assert table.refresh().current_snapshot() is None
 
 
 def test_read_after_write_nested_fields(local_catalog):
@@ -752,3 +745,188 @@ def test_protocol_alias_unknown_scheme_raises_without_alias():
     """Without a matching protocol alias, Daft raises NotImplementedError for an unknown URI scheme."""
     with pytest.raises(NotImplementedError, match="Cannot infer PyArrow filesystem"):
         _resolve_paths_and_filesystem("unknownscheme://bucket/path")
+
+
+# A write keeps each value as it is or refuses it. The types it writes are the
+# column's own, and those the writer converts value by value, failing rather than
+# changing a value; a conversion that would round, parse, format or assume a time
+# zone is refused when the write is planned, before any row is computed.
+
+_NOON = datetime.datetime(2026, 1, 1, 12)
+
+_REFUSED = {
+    "zoneless into zoned": (TimestamptzType(), pa.array([_NOON], pa.timestamp("us"))),
+    "zoned into zoneless": (
+        TimestampType(),
+        pa.array([_NOON.replace(tzinfo=datetime.timezone.utc)], pa.timestamp("us", tz="UTC")),
+    ),
+    "float into decimal": (DecimalType(10, 2), pa.array([1.239], pa.float64())),
+    "double into float": (FloatType(), pa.array([1.1], pa.float64())),
+    "decimal into double": (DoubleType(), pa.array([decimal.Decimal("1.23")], pa.decimal128(10, 2))),
+    "text into date": (DateType(), pa.array(["2026-01-01"], pa.string())),
+    "number into text": (StringType(), pa.array([5], pa.int64())),
+    "truth into number": (LongType(), pa.array([True], pa.bool_())),
+    "timestamp into date": (DateType(), pa.array([_NOON], pa.timestamp("us"))),
+    "date into zoned": (TimestamptzType(), pa.array([datetime.date(2026, 1, 1)], pa.date32())),
+    "long into a narrow decimal": (DecimalType(10, 2), pa.array([5], pa.int64())),
+}
+
+_WRITTEN = {
+    "long into long": (LongType(), pa.array([5], pa.int64()), [5]),
+    "int into long": (LongType(), pa.array([5], pa.int32()), [5]),
+    "uint64 into long": (LongType(), pa.array([5], pa.uint64()), [5]),
+    "long into int": (IntegerType(), pa.array([5], pa.int64()), [5]),
+    "int into a decimal holding every int": (DecimalType(12, 2), pa.array([5], pa.int32()), [decimal.Decimal("5.00")]),
+    "decimal into a decimal of other scale": (
+        DecimalType(10, 2),
+        pa.array([decimal.Decimal("1.230")], pa.decimal128(10, 3)),
+        [decimal.Decimal("1.23")],
+    ),
+    "float into double": (DoubleType(), pa.array([1.5], pa.float32()), [1.5]),
+    "long into double": (DoubleType(), pa.array([5], pa.int64()), [5.0]),
+    "double into long": (LongType(), pa.array([5.0], pa.float64()), [5]),
+    "milliseconds into microseconds": (TimestampType(), pa.array([_NOON], pa.timestamp("ms")), [_NOON]),
+    "date into zoneless timestamp": (
+        TimestampType(),
+        pa.array([datetime.date(2026, 1, 1)], pa.date32()),
+        [datetime.datetime(2026, 1, 1)],
+    ),
+    "a fixed-size list into a list": (
+        ListType(2, DoubleType(), element_required=False),
+        pa.array([[1.0, 2.0]], pa.list_(pa.float64(), 2)),
+        [[1.0, 2.0]],
+    ),
+    "bytes into a fixed length": (FixedType(2), pa.array([b"ab"], pa.binary()), [b"ab"]),
+    "New York into UTC": (
+        TimestamptzType(),
+        pa.array(
+            [datetime.datetime(2026, 1, 1, 7, tzinfo=zoneinfo.ZoneInfo("America/New_York"))],
+            pa.timestamp("us", tz="America/New_York"),
+        ),
+        [_NOON.replace(tzinfo=datetime.timezone.utc)],
+    ),
+}
+
+
+def _counted_rows(values: pa.Array) -> tuple[daft.DataFrame, list[int]]:
+    """A frame of ``values`` whose rows are counted as they are computed."""
+    computed = [0]
+
+    @daft.func.batch(return_dtype=daft.DataType.from_arrow_type(values.type))
+    def counted(column: daft.Series) -> daft.Series:
+        computed[0] += len(column)
+        return column
+
+    frame = daft.from_arrow(pa.table({"v": values})).select(counted(daft.col("v")).alias("v"))
+    return frame, computed
+
+
+@pytest.mark.parametrize("case", sorted(_REFUSED))
+def test_a_conversion_that_changes_a_value_is_refused_when_planned(local_catalog, case: str) -> None:
+    column, values = _REFUSED[case]
+    table = local_catalog.create_table("default.refused", Schema(NestedField(1, "v", column, required=False)))
+    frame, computed = _counted_rows(values)
+
+    with pytest.raises(ValueError, match="Refusing the write: .*'v'"):
+        frame.write_iceberg(table)
+
+    assert computed == [0]
+    assert local_catalog.load_table("default.refused").current_snapshot() is None
+
+
+@pytest.mark.parametrize("case", sorted(_WRITTEN))
+def test_a_value_the_column_holds_is_written(local_catalog, case: str) -> None:
+    column, values, expected = _WRITTEN[case]
+    table = local_catalog.create_table("default.written", Schema(NestedField(1, "v", column, required=False)))
+
+    daft.from_arrow(pa.table({"v": values})).write_iceberg(table)
+
+    assert local_catalog.load_table("default.written").scan().to_arrow().column("v").to_pylist() == expected
+
+
+def test_a_value_the_column_cannot_hold_is_still_refused_when_written(local_catalog) -> None:
+    table = local_catalog.create_table("default.narrowed", Schema(NestedField(1, "v", IntegerType(), required=False)))
+
+    with pytest.raises(Exception, match="not in range"):
+        daft.from_arrow(pa.table({"v": pa.array([2**40], pa.int64())})).write_iceberg(table)
+
+    assert local_catalog.load_table("default.narrowed").current_snapshot() is None
+
+
+@pytest.mark.parametrize(
+    ("column", "values", "named"),
+    [
+        (
+            StructType(NestedField(2, "t", TimestamptzType(), required=False)),
+            pa.array([{"t": _NOON}], pa.struct([("t", pa.timestamp("us"))])),
+            "'v.t'",
+        ),
+        (
+            ListType(2, LongType(), element_required=False),
+            pa.array([["5"]], pa.list_(pa.string())),
+            "'v.element'",
+        ),
+        (
+            MapType(2, StringType(), 3, DoubleType(), value_required=False),
+            pa.array([[("a", decimal.Decimal("1.5"))]], pa.map_(pa.string(), pa.decimal128(5, 2))),
+            "'v.value'",
+        ),
+        (
+            StructType(NestedField(2, "t", LongType(), required=False)),
+            pa.array([{"t": 1, "u": 2}], pa.struct([("t", pa.int64()), ("u", pa.int64())])),
+            "'v' has the fields \\['u'\\]",
+        ),
+        (
+            StructType(NestedField(2, "t", LongType(), required=False), NestedField(3, "u", LongType(), required=True)),
+            pa.array([{"t": 1}], pa.struct([("t", pa.int64())])),
+            "'v' lacks the field 'u'",
+        ),
+    ],
+    ids=["struct field", "list element", "map value", "extra struct field", "missing required struct field"],
+)
+def test_a_nested_conversion_is_refused_naming_its_field(local_catalog, column, values, named: str) -> None:
+    table = local_catalog.create_table("default.nested", Schema(NestedField(1, "v", column, required=False)))
+
+    with pytest.raises(ValueError, match=f"Refusing the write: the column {named}"):
+        daft.from_arrow(pa.table({"v": values})).write_iceberg(table)
+
+
+def test_a_required_column_the_data_lacks_is_refused_before_any_row_is_computed(local_catalog) -> None:
+    table = local_catalog.create_table(
+        "default.required",
+        Schema(NestedField(1, "v", LongType(), required=False), NestedField(2, "kept", LongType(), required=True)),
+    )
+    frame, computed = _counted_rows(pa.array(list(range(1_000)), pa.int64()))
+
+    with pytest.raises(ValueError, match="required columns \\['kept'\\]"):
+        frame.write_iceberg(table)
+
+    assert computed == [0]
+
+
+def test_an_optional_column_the_data_lacks_is_written_as_nulls(local_catalog) -> None:
+    table = local_catalog.create_table(
+        "default.optional",
+        Schema(NestedField(1, "v", LongType(), required=False), NestedField(2, "tag", StringType(), required=False)),
+    )
+
+    daft.from_pydict({"v": [1, 2]}).write_iceberg(table)
+
+    assert local_catalog.load_table("default.optional").scan().to_arrow().to_pydict() == {
+        "v": [1, 2],
+        "tag": [None, None],
+    }
+
+
+def test_a_column_the_table_lacks_is_refused(local_catalog) -> None:
+    # A misspelled column would otherwise be dropped, and the column it meant
+    # written as nulls.
+    table = local_catalog.create_table(
+        "default.extra",
+        Schema(NestedField(1, "v", LongType(), required=False), NestedField(2, "tag", StringType(), required=False)),
+    )
+
+    with pytest.raises(ValueError, match="\\['tagg'\\], which the table does not have"):
+        daft.from_pydict({"v": [1], "tagg": ["a"]}).write_iceberg(table)
+
+    assert local_catalog.load_table("default.extra").current_snapshot() is None

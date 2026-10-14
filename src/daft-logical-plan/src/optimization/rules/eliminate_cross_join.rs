@@ -227,23 +227,23 @@ fn extract_possible_join_keys(expr: &Expr, join_keys: &mut JoinKeySet) {
 /// * `None` otherwise
 #[recursive::recursive]
 fn remove_join_expressions(expr: ExprRef, join_keys: &JoinKeySet) -> Option<Expr> {
-    match Arc::unwrap_or_clone(expr) {
+    match expr.as_ref() {
         Expr::BinaryOp {
             left,
             op: Operator::Eq,
             right,
-        } if join_keys.contains(&left, &right) => {
+        } if join_keys.contains(left, right) => {
             // was a join key, so remove it
             None
         }
         // Fix for join predicates from inside of OR expr also pulled up properly.
-        Expr::BinaryOp { left, op, right } if op == Operator::And => {
-            let l = remove_join_expressions(left, join_keys);
-            let r = remove_join_expressions(right, join_keys);
+        Expr::BinaryOp { left, op, right } if *op == Operator::And => {
+            let l = remove_join_expressions(left.clone(), join_keys);
+            let r = remove_join_expressions(right.clone(), join_keys);
             match (l, r) {
                 (Some(ll), Some(rr)) => Some(Expr::BinaryOp {
                     left: Arc::new(ll),
-                    op,
+                    op: *op,
                     right: Arc::new(rr),
                 }),
                 (Some(ll), _) => Some(ll),
@@ -251,13 +251,13 @@ fn remove_join_expressions(expr: ExprRef, join_keys: &JoinKeySet) -> Option<Expr
                 _ => None,
             }
         }
-        Expr::BinaryOp { left, op, right } if op == Operator::Or => {
-            let l = remove_join_expressions(left, join_keys);
-            let r = remove_join_expressions(right, join_keys);
+        Expr::BinaryOp { left, op, right } if *op == Operator::Or => {
+            let l = remove_join_expressions(left.clone(), join_keys);
+            let r = remove_join_expressions(right.clone(), join_keys);
             match (l, r) {
                 (Some(ll), Some(rr)) => Some(Expr::BinaryOp {
                     left: Arc::new(ll),
-                    op,
+                    op: *op,
                     right: Arc::new(rr),
                 }),
                 // When either `left` or `right` is empty, it means they are `true`
@@ -265,7 +265,7 @@ fn remove_join_expressions(expr: ExprRef, join_keys: &JoinKeySet) -> Option<Expr
                 _ => None,
             }
         }
-        other => Some(other),
+        _ => Some(Arc::unwrap_or_clone(expr)),
     }
 }
 

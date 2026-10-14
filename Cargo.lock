@@ -2810,6 +2810,7 @@ dependencies = [
  "recursive",
  "rstest",
  "serde",
+ "stacker",
  "tokio",
  "typetag",
 ]
@@ -3652,10 +3653,12 @@ dependencies = [
  "daft-session",
  "itertools 0.14.0",
  "pyo3",
+ "recursive",
  "regex",
  "rstest",
  "snafu",
  "sqlparser",
+ "stacker",
 ]
 
 [[package]]

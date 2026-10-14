@@ -23,8 +23,10 @@ import pytest
 SHAPES = {
     "chained offsets": ("offset", 1000),
     "chained filters": ("filter", 1500),
+    "chained distinct filters": ("distinct_filter", 2000),
     "chained column rewrites": ("with_column", 400),
     "one chained expression": ("expr", 1000),
+    "one chained predicate": ("predicate", 2000),
     "chained concatenations": ("concat", 1000),
 }
 
@@ -48,6 +50,12 @@ PROGRAM = textwrap.dedent(
             for i in range(depth):
                 frame = frame.where(col("x") >= i % 7)
             return frame
+        if shape == "distinct_filter":
+            # Each predicate differs, so merging them builds one conjunction as deep as the chain.
+            frame = base
+            for i in range(depth):
+                frame = frame.where(col("x") > -i - 1)
+            return frame
         if shape == "with_column":
             frame = base
             for _ in range(depth):
@@ -58,6 +66,11 @@ PROGRAM = textwrap.dedent(
             for _ in range(depth):
                 e = e + 1
             return base.select(e.alias("x")).limit(3)
+        if shape == "predicate":
+            e = col("x") >= 0
+            for i in range(depth):
+                e = e & (col("x") >= -i)
+            return base.where(e).limit(3)
         frame = base.limit(1)
         for _ in range(depth):
             frame = frame.concat(base.limit(1))
@@ -95,8 +108,12 @@ def _expected(shape: str, depth: int) -> list[int]:
         return [depth, depth + 1, depth + 2]
     if shape == "filter":
         return list(range(6, 2000))
+    if shape == "distinct_filter":
+        return list(range(2000))
     if shape in ("with_column", "expr"):
         return [depth, depth + 1, depth + 2]
+    if shape == "predicate":
+        return [0, 1, 2]
     return [0] * (depth + 1)
 
 

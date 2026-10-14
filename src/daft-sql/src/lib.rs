@@ -3,6 +3,7 @@ pub mod functions;
 
 mod exec;
 mod modules;
+mod nesting;
 mod planner;
 mod schema;
 mod statement;

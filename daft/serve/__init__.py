@@ -33,6 +33,7 @@ __all__ = [
     "DEFAULT_QUERY_TIMEOUT_SECS",
     "DEFAULT_QUEUE_TIMEOUT_SECS",
     "CatalogSpec",
+    "DescribingHost",
     "RequestHost",
     "ServeSettings",
     "ServedRequest",
@@ -83,7 +84,8 @@ class RequestHost(Protocol):
     any other kind before admitting it. ``plan`` is called after admission,
     within the query's execution slot and time limit, and off the server's
     network threads. The frame it returns runs as every served query does.
-    An exception it raises fails the query.
+    An exception it raises fails the query. A host may also describe how a frame
+    it planned failed while running; see ``DescribingHost``.
     """
 
     @property
@@ -103,6 +105,42 @@ class RequestHost(Protocol):
         -------
         DataFrame
             The frame the server runs and streams back.
+        """
+        ...
+
+
+@runtime_checkable
+class DescribingHost(RequestHost, Protocol):
+    """A request host that can also describe how a frame it planned failed.
+
+    The server checks for ``describe`` once, when it starts. It calls it only when
+    a frame the host planned fails while it runs, never for a success, for a
+    failure ``plan`` raised itself, or for the server's own failures (capacity,
+    time limit, cancellation, draining). It runs off the server's network
+    threads, within the query's execution slot and what remains of its time
+    limit, and is abandoned if the query is cancelled.
+
+    What it returns reaches the client as the failure's ``detail``, bounded to
+    2 KiB; the failure's class and message are never changed. If it raises,
+    returns ``None``, or runs out of time, the failure reaches the client as
+    the engine raised it, and what it raised is logged by its type only.
+    """
+
+    def describe(self, request: ServedRequest, failure: Exception) -> str | None:
+        """Describe how the frame planned for ``request`` failed.
+
+        Parameters
+        ----------
+        request:
+            The request, its query id, and its caller.
+        failure:
+            The failure as the client will raise it: an engine class, or
+            ``DaftServeError``, with its ``query_id``.
+
+        Returns:
+        -------
+        str | None
+            The description to send with the failure, or ``None`` for none.
         """
         ...
 

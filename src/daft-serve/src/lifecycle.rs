@@ -255,6 +255,7 @@ mod tests {
     fn host_failure() -> ServeError {
         ServeError::Failed {
             failure: Box::new(Failure {
+                detail: None,
                 error_class: "Host".into(),
                 engine: false,
                 retryable: false,

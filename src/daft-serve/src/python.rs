@@ -37,15 +37,24 @@ fn to_py_err(err: ServeError) -> PyErr {
 /// function's failure as `UDFException`, and any other failure as
 /// `DaftServeError`, each carrying the failure's fields and `query_id`. A
 /// failure of this side's own engine is raised as it is in-process. No class
-/// is ever imported by a name the server sent.
-fn served_error(err: ServeError, query_id: Option<&str>) -> PyErr {
+/// is ever imported by a name the server sent. A served failure also carries
+/// `detail`, the host's description of it or `None`.
+pub(crate) fn served_error(err: ServeError, query_id: Option<&str>) -> PyErr {
     Python::attach(|py| {
-        let built = match err {
-            ServeError::Execution(local) => Ok(PyErr::from(local)),
-            ServeError::Failed { failure, message } => failure_error(py, &failure, message),
-            other => failure_error(py, &other.failure(), other.to_string()),
+        let (built, detail) = match err {
+            ServeError::Execution(local) => return PyErr::from(local),
+            ServeError::Failed { failure, message } => {
+                let detail = failure.detail.clone();
+                (failure_error(py, &failure, message), detail)
+            }
+            other => (failure_error(py, &other.failure(), other.to_string()), None),
         };
         let raised = built.unwrap_or_else(|building| building);
+        // Every served failure carries `detail`: the host's description of it, if
+        // it gave one.
+        if let Err(setting) = raised.value(py).setattr("detail", detail) {
+            return setting;
+        }
         if let Some(query_id) = query_id
             && let Err(setting) = raised.value(py).setattr("query_id", query_id)
         {
@@ -246,9 +255,15 @@ impl PyDaftServer {
             max_request_body_bytes,
             tenants,
         };
+        let host_describes = request_host.as_ref().is_some_and(|host| {
+            host.bind(py)
+                .hasattr(pyo3::intern!(py, "describe"))
+                .unwrap_or(false)
+        });
         let planners = crate::execute::Planners {
             session: session.map(Arc::new),
             host: request_host.map(Arc::new),
+            host_describes,
         };
         let service = DaftServeService::new(
             config,

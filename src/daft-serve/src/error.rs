@@ -16,6 +16,33 @@ pub const ERROR_CLASS_METADATA_KEY: &str = "x-daft-error-class";
 /// Binary metadata key carrying a failure's [`Failure`] record.
 pub const FAILURE_METADATA_KEY: &str = "x-daft-failure-bin";
 
+/// Binary metadata key carrying a failure's description, as UTF-8 text.
+///
+/// Kept apart from the [`Failure`] record, so that a client or server that
+/// predates descriptions reads the rest as before.
+pub const DETAIL_METADATA_KEY: &str = "x-daft-detail-bin";
+
+/// The most bytes of a failure's description that are sent.
+///
+/// A longer one is cut at a character boundary and marked with an ellipsis. The
+/// response's metadata, which carries it, is bounded by the transport.
+pub const MAX_DETAIL_BYTES: usize = 2048;
+
+/// `detail` bounded to [`MAX_DETAIL_BYTES`], cut at a character boundary and
+/// marked with an ellipsis when it is longer.
+#[must_use]
+pub fn bounded_detail(detail: String) -> String {
+    const ELLIPSIS: &str = "…";
+    if detail.len() <= MAX_DETAIL_BYTES {
+        return detail;
+    }
+    let mut end = MAX_DETAIL_BYTES - ELLIPSIS.len();
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{ELLIPSIS}", &detail[..end])
+}
+
 /// What a client needs to raise a failure as the class it is raised as where
 /// the query ran; its message travels as the status message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +55,11 @@ pub struct Failure {
     pub retryable: bool,
     /// The raised Python type, for a `Host` or `Python` failure.
     pub python: Option<PythonFailure>,
+    /// How the failure came about, in the words of the host that planned the
+    /// query, when it described it. Travels apart from the record, under
+    /// [`DETAIL_METADATA_KEY`].
+    #[serde(skip)]
+    pub detail: Option<String>,
 }
 
 /// The raised type of a Python failure, by name only: a client never imports it.
@@ -200,12 +232,14 @@ impl ServeError {
         match self {
             Self::Failed { failure, .. } => failure.as_ref().clone(),
             Self::Execution(_) => Failure {
+                detail: None,
                 error_class: "DaftCoreException".to_string(),
                 engine: true,
                 retryable: false,
                 python: None,
             },
             other => Failure {
+                detail: None,
                 error_class: other.class().to_string(),
                 engine: false,
                 retryable: other.retryable(),
@@ -251,6 +285,12 @@ impl From<ServeError> for tonic::Status {
                 tonic::metadata::MetadataValue::from_bytes(&bytes),
             );
         }
+        if let Some(detail) = &failure.detail {
+            status.metadata_mut().insert_bin(
+                DETAIL_METADATA_KEY,
+                tonic::metadata::MetadataValue::from_bytes(detail.as_bytes()),
+            );
+        }
         status
     }
 }
@@ -262,12 +302,13 @@ impl From<ServeError> for tonic::Status {
 /// `Transport`, raised as the base class.
 #[must_use]
 pub fn failure_of_status(status: &tonic::Status) -> ServeError {
-    let failure = status
+    let mut failure = status
         .metadata()
         .get_bin(FAILURE_METADATA_KEY)
         .and_then(|value| value.to_bytes().ok())
         .and_then(|bytes| crate::wire::decode::<Failure>(&bytes).ok())
         .unwrap_or_else(|| Failure {
+            detail: None,
             error_class: status
                 .metadata()
                 .get(ERROR_CLASS_METADATA_KEY)
@@ -278,6 +319,11 @@ pub fn failure_of_status(status: &tonic::Status) -> ServeError {
             retryable: false,
             python: None,
         });
+    failure.detail = status
+        .metadata()
+        .get_bin(DETAIL_METADATA_KEY)
+        .and_then(|value| value.to_bytes().ok())
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
     ServeError::Failed {
         failure: Box::new(failure),
         message: status.message().to_string(),
@@ -379,6 +425,7 @@ mod tests {
     #[test]
     fn a_failure_crosses_a_status_whole() {
         let sent = Failure {
+            detail: None,
             error_class: "Host".into(),
             engine: false,
             retryable: false,
@@ -490,5 +537,61 @@ mod tests {
             let status: tonic::Status = err.into();
             assert_eq!(status.code(), code);
         }
+    }
+
+    fn failed(detail: Option<&str>) -> ServeError {
+        ServeError::Failed {
+            failure: Box::new(Failure {
+                detail: detail.map(str::to_string),
+                error_class: "DaftCardinalityError".to_string(),
+                engine: true,
+                retryable: false,
+                python: None,
+            }),
+            message: "single_value found a group holding more than one row".to_string(),
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::described(Some("a group by g held 3"))]
+    #[case::not_described(None)]
+    fn a_description_travels_beside_the_failure(#[case] detail: Option<&str>) {
+        let status: tonic::Status = failed(detail).into();
+
+        let ServeError::Failed { failure, message } = failure_of_status(&status) else {
+            unreachable!("a failure reads back as one");
+        };
+
+        assert_eq!(failure.detail.as_deref(), detail);
+        assert_eq!(failure.error_class, "DaftCardinalityError");
+        assert_eq!(
+            message,
+            "single_value found a group holding more than one row"
+        );
+    }
+
+    #[test]
+    fn a_description_is_not_part_of_the_failure_record() {
+        let encoded = crate::wire::encode(&failed(Some("a group by g held 3")).failure()).unwrap();
+
+        let decoded: Failure = crate::wire::decode(&encoded).unwrap();
+
+        assert_eq!(decoded, failed(None).failure());
+    }
+
+    #[rstest::rstest]
+    #[case::short("held 3".to_string(), "held 3".to_string())]
+    #[case::at_the_bound("a".repeat(MAX_DETAIL_BYTES), "a".repeat(MAX_DETAIL_BYTES))]
+    fn a_description_within_the_bound_is_kept(#[case] detail: String, #[case] kept: String) {
+        assert_eq!(bounded_detail(detail), kept);
+    }
+
+    #[test]
+    fn a_longer_description_is_cut_at_a_character_boundary() {
+        let bounded = bounded_detail("é".repeat(MAX_DETAIL_BYTES));
+
+        assert!(bounded.len() <= MAX_DETAIL_BYTES);
+        assert!(bounded.ends_with('…'));
+        assert!(bounded.trim_end_matches('…').chars().all(|c| c == 'é'));
     }
 }

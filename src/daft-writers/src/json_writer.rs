@@ -1,13 +1,17 @@
 use std::{fmt::Write, path::PathBuf, sync::Arc};
 
 use arrow_array::{
-    Array, ArrayRef, RecordBatch as ArrowRecordBatch, builder::LargeStringBuilder, cast::AsArray,
-    types::Date32Type,
+    Array, ArrayAccessor, ArrayRef, RecordBatch as ArrowRecordBatch, builder::LargeStringBuilder,
+    cast::AsArray, types::Date32Type,
 };
-use arrow_json::{LineDelimitedWriter, WriterBuilder, writer::LineDelimited};
+use arrow_json::{
+    Encoder, EncoderFactory, EncoderOptions, LineDelimitedWriter, WriterBuilder,
+    writer::{LineDelimited, NullableEncoder},
+};
 use arrow_schema::{
     ArrowError, DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit,
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, NaiveDate, format::StrftimeItems};
 use chrono_tz::Tz;
 use common_error::{DaftError, DaftResult};
@@ -21,7 +25,7 @@ use crate::{
     AsyncFileWriter,
     batch_file_writer::BatchFileWriter,
     storage_backend::{FileStorageBackend, ObjectStorageBackend, StorageBackend},
-    utils::build_filename,
+    utils::{build_filename, build_filename_single},
 };
 
 type JsonFinishFn<B> =
@@ -54,62 +58,120 @@ where
     Ok(result)
 }
 
-fn native_json_field_supported(field: &Arc<arrow_schema::Field>) -> bool {
+/// Whether JSON can hold a column of `field`'s type: every type but an extension
+/// type (a tensor, an image, a Python object, …), at any depth.
+fn json_can_hold(field: &Arc<arrow_schema::Field>) -> bool {
     if field.extension_type_name().is_some() {
         return false;
     }
 
     match field.data_type() {
-        arrow_schema::DataType::Duration(_) => false,
-        arrow_schema::DataType::Binary
-        | arrow_schema::DataType::FixedSizeBinary(_)
-        | arrow_schema::DataType::LargeBinary => false,
         arrow_schema::DataType::List(inner)
         | arrow_schema::DataType::FixedSizeList(inner, _)
-        | arrow_schema::DataType::LargeList(inner) => native_json_field_supported(inner),
-        arrow_schema::DataType::Struct(fields) => fields.iter().all(native_json_field_supported),
-        arrow_schema::DataType::Union(fields, _) => fields
-            .iter()
-            .all(|(_, field)| native_json_field_supported(field)),
-        arrow_schema::DataType::Map(inner, _) => native_json_field_supported(inner),
+        | arrow_schema::DataType::LargeList(inner) => json_can_hold(inner),
+        arrow_schema::DataType::Struct(fields) => fields.iter().all(json_can_hold),
+        arrow_schema::DataType::Union(fields, _) => {
+            fields.iter().all(|(_, field)| json_can_hold(field))
+        }
+        arrow_schema::DataType::Map(inner, _) => json_can_hold(inner),
         _ => true,
     }
 }
 
-/// Helper function that checks if we support native writes given the schema
-pub(crate) fn native_json_writer_supported(file_schema: &SchemaRef) -> DaftResult<bool> {
-    Ok(file_schema
-        .to_arrow()?
-        .fields
+/// The first column of `file_schema` JSON cannot hold, if any.
+///
+/// # Errors
+/// Returns an error if the schema cannot be converted to Arrow's.
+pub(crate) fn column_json_cannot_hold(file_schema: &SchemaRef) -> DaftResult<Option<Field>> {
+    let arrow_schema = file_schema.to_arrow()?;
+    Ok(arrow_schema
+        .fields()
         .iter()
-        .all(native_json_field_supported))
+        .position(|field| !json_can_hold(field))
+        .map(|index| file_schema[index].clone()))
 }
 
+/// Writes binary values (`Binary`, `LargeBinary` and `FixedSizeBinary`, at any
+/// depth) as base64 text: RFC 4648, standard alphabet, padded. JSON has no bytes,
+/// and base64 is the form JSON readers most widely decode as bytes. Every other
+/// type is left to the default encoders.
+#[derive(Debug)]
+struct Base64Binary;
+
+impl EncoderFactory for Base64Binary {
+    fn make_default_encoder<'a>(
+        &self,
+        _field: &'a arrow_schema::FieldRef,
+        array: &'a dyn Array,
+        _options: &'a EncoderOptions,
+    ) -> Result<Option<NullableEncoder<'a>>, ArrowError> {
+        let encoder: Box<dyn Encoder + 'a> = match array.data_type() {
+            ArrowDataType::Binary => Box::new(Base64Encoder(array.as_binary::<i32>())),
+            ArrowDataType::LargeBinary => Box::new(Base64Encoder(array.as_binary::<i64>())),
+            ArrowDataType::FixedSizeBinary(_) => {
+                Box::new(Base64Encoder(array.as_fixed_size_binary()))
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(NullableEncoder::new(encoder, array.nulls().cloned())))
+    }
+}
+
+/// Encodes each value of a binary array as a quoted base64 string. Base64's
+/// characters need no escaping inside a JSON string.
+struct Base64Encoder<A>(A);
+
+impl<'a, A: ArrayAccessor<Item = &'a [u8]>> Encoder for Base64Encoder<A> {
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        let bytes = self.0.value(idx);
+        // `None` only for an encoding longer than memory can hold.
+        let encoded = base64::encoded_len(bytes.len(), true).unwrap_or(0);
+        out.push(b'"');
+        let start = out.len();
+        out.resize(start + encoded, 0);
+        // The buffer was just sized to the encoding, which is all that can fail.
+        let _ = STANDARD.encode_slice(bytes, &mut out[start..]);
+        out.push(b'"');
+    }
+}
+
+/// Creates a writer of newline-delimited JSON under `root_dir`, or, with
+/// `single_file`, of one file at exactly `root_dir`, replacing a local file there
+/// when `overwrite_single_file_target`.
 pub(crate) fn create_native_json_writer(
     root_dir: &str,
     file_idx: usize,
     partition_values: Option<&RecordBatch>,
     io_config: Option<IOConfig>,
     json_option: JsonFormatOption,
+    single_file: bool,
+    overwrite_single_file_target: bool,
 ) -> DaftResult<Box<dyn AsyncFileWriter<Input = MicroPartition, Result = Option<RecordBatch>>>> {
     // Parse the root directory and add partition values if present.
     let (source_type, root_dir) = parse_url(root_dir)?;
-    let filename = build_filename(
-        &source_type,
-        root_dir.as_ref(),
-        partition_values,
-        file_idx,
-        "json",
-    )?;
+    let filename = if single_file {
+        build_filename_single(&source_type, root_dir.as_ref())?
+    } else {
+        build_filename(
+            &source_type,
+            root_dir.as_ref(),
+            partition_values,
+            file_idx,
+            "json",
+        )?
+    };
     match source_type {
         SourceType::File => {
             let storage_backend = FileStorageBackend::default();
-            Ok(Box::new(make_json_writer(
-                filename,
-                partition_values.cloned(),
-                storage_backend,
-                json_option,
-            )))
+            Ok(Box::new(
+                make_json_writer(
+                    filename,
+                    partition_values.cloned(),
+                    storage_backend,
+                    json_option,
+                )
+                .with_overwrite_existing_target(overwrite_single_file_target),
+            ))
         }
         source if source.supports_native_writer() => {
             let ObjectPath { scheme, .. } = daft_io::utils::parse_object_url(root_dir.as_ref())?;
@@ -141,7 +203,7 @@ fn make_json_writer<B: StorageBackend + Send + Sync>(
     let date_format = json_option.date_format.clone();
     let timestamp_format = json_option.timestamp_format;
     let builder = Arc::new(move |backend: B::Writer| {
-        let mut builder = WriterBuilder::new();
+        let mut builder = WriterBuilder::new().with_encoder_factory(Arc::new(Base64Binary));
 
         if let Some(ignore_null_fields) = ignore_null_fields {
             builder = builder.with_explicit_nulls(!ignore_null_fields);

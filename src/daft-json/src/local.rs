@@ -1,6 +1,6 @@
 use std::{borrow::Cow, collections::HashSet, num::NonZeroUsize, sync::Arc};
 
-use arrow::array::builder::ArrayBuilder;
+use arrow::{array::builder::ArrayBuilder, error::ArrowError};
 use common_error::{DaftError, DaftResult};
 use daft_core::prelude::*;
 use daft_dsl::{Expr, ExprRef, expr::bound_expr::BoundExpr, optimization::get_required_columns};
@@ -136,8 +136,14 @@ pub fn read_json_array_impl(
 
     let mut columns: IndexMap<Cow<str>, Box<dyn ArrayBuilder>> = arrow_fields
         .iter()
-        .map(|f| (Cow::Owned(f.name().clone()), allocate_array(f, bytes.len())))
-        .collect();
+        .map(|f| {
+            Ok((
+                Cow::Owned(f.name().clone()),
+                allocate_array(f, bytes.len())?,
+            ))
+        })
+        .collect::<Result<_, ArrowError>>()
+        .context(ArrowSnafu)?;
 
     let mut num_rows = 0;
     for record in iter {
@@ -346,12 +352,13 @@ impl<'a> JsonReader<'a> {
         let mut columns: IndexMap<Cow<str>, Box<dyn ArrayBuilder>> = arrow_fields
             .iter()
             .map(|f| {
-                (
+                Ok((
                     Cow::Owned(f.name().clone()),
-                    allocate_array(f, estimated_rows),
-                )
+                    allocate_array(f, estimated_rows)?,
+                ))
             })
-            .collect();
+            .collect::<Result<_, ArrowError>>()
+            .context(ArrowSnafu)?;
 
         let mut num_rows = 0;
         for record in iter {

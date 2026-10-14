@@ -245,6 +245,12 @@ pub fn make_physical_writer_factory(
                 cfg.json_inflation_factor,
             );
 
+            if file_info.single_file {
+                return Ok(Arc::new(SingleFileWriterFactory::new(Arc::new(
+                    base_writer_factory,
+                ))));
+            }
+
             let file_writer_factory = TargetFileSizeWriterFactory::new(
                 Arc::new(base_writer_factory),
                 Arc::new(file_size_calculator),

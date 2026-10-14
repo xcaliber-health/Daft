@@ -92,12 +92,17 @@ impl BlockingSink for CommitWriteSink {
                         })
                         .collect::<Vec<_>>();
 
-                    // If nothing was written, create an empty file for Parquet/CSV when not partitioned
+                    // If nothing was written, create an empty file for Parquet/CSV when not
+                    // partitioned, and for JSON when asked for one file at an exact path. An
+                    // empty JSON write to a directory still writes no file.
                     if written_file_path_record_batches.is_empty()
                         && file_info.partition_cols.is_none()
                     {
                         match file_info.file_format {
-                            FileFormat::Parquet | FileFormat::Csv => {
+                            FileFormat::Parquet | FileFormat::Csv | FileFormat::Json
+                                if file_info.file_format != FileFormat::Json
+                                    || file_info.single_file =>
+                            {
                                 let writer_factory =
                                     daft_writers::physical::PhysicalWriterFactory::new(
                                         file_info.clone(),

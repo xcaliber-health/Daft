@@ -149,45 +149,59 @@ def test_a_write_that_fails_part_way_leaves_no_file(tmp_path: Path, fmt: str, pa
     assert _files_in(tmp_path) == []
 
 
-# --- csv can be written as one file ---
+# --- csv and json can be written as one file ---
 
 _NATIVE_ONLY = pytest.mark.skipif(
     get_tests_daft_runner_name() != "native",
     reason="single_file is only supported on the native runner",
 )
 
+OneFileWriter = Callable[..., daft.DataFrame]
+
+ONE_FILE: dict[str, tuple[OneFileWriter, Reader]] = {
+    "csv": (daft.DataFrame.write_csv, daft.read_csv),
+    "json": (daft.DataFrame.write_json, daft.read_json),
+}
+
 
 @_NATIVE_ONLY
-def test_a_csv_write_can_be_one_file(tmp_path: Path) -> None:
-    target = tmp_path / "panel.csv"
+@pytest.mark.parametrize("fmt", list(ONE_FILE))
+def test_a_write_can_be_one_file(tmp_path: Path, fmt: str) -> None:
+    write, read = ONE_FILE[fmt]
+    target = tmp_path / f"panel.{fmt}"
 
-    result = _rows(10).into_partitions(3).write_csv(str(target), single_file=True)
+    result = write(_rows(10).into_partitions(3), str(target), single_file=True)
 
     assert target.is_file()
     assert result.to_pydict() == {"path": [str(target)], "num_rows": [10]}
-    assert daft.read_csv(str(target)).sort("v").to_pydict() == _rows(10).sort("v").to_pydict()
+    assert read(str(target)).sort("v").to_pydict() == _rows(10).sort("v").to_pydict()
 
 
 @_NATIVE_ONLY
-def test_a_one_file_csv_write_replaces_what_is_there_when_overwriting(tmp_path: Path) -> None:
-    target = tmp_path / "panel.csv"
-    _rows(10).write_csv(str(target), single_file=True)
+@pytest.mark.parametrize("fmt", list(ONE_FILE))
+def test_a_one_file_write_replaces_what_is_there_when_overwriting(tmp_path: Path, fmt: str) -> None:
+    write, read = ONE_FILE[fmt]
+    target = tmp_path / f"panel.{fmt}"
+    write(_rows(10), str(target), single_file=True)
 
-    _rows(4).write_csv(str(target), write_mode="overwrite", single_file=True)
+    write(_rows(4), str(target), write_mode="overwrite", single_file=True)
 
-    assert daft.read_csv(str(target)).count_rows() == 4
+    assert read(str(target)).count_rows() == 4
 
 
 @_NATIVE_ONLY
-def test_an_empty_one_file_csv_write_still_writes_the_file(tmp_path: Path) -> None:
-    target = tmp_path / "panel.csv"
+@pytest.mark.parametrize("fmt", list(ONE_FILE))
+def test_an_empty_one_file_write_still_writes_the_file(tmp_path: Path, fmt: str) -> None:
+    write, _ = ONE_FILE[fmt]
+    target = tmp_path / f"panel.{fmt}"
 
-    result = _rows(3).where(col("v") < 0).write_csv(str(target), single_file=True)
+    result = write(_rows(3).where(col("v") < 0), str(target), single_file=True)
 
     assert target.is_file()
     assert result.to_pydict()["num_rows"] == [0]
 
 
+@pytest.mark.parametrize("fmt", list(ONE_FILE))
 @pytest.mark.parametrize(
     ("options", "refusal"),
     [
@@ -199,8 +213,10 @@ def test_an_empty_one_file_csv_write_still_writes_the_file(tmp_path: Path) -> No
         ),
     ],
 )
-def test_a_one_file_csv_write_refuses_what_one_file_cannot_honor(
-    tmp_path: Path, options: dict[str, str | list[str]], refusal: str
+def test_a_one_file_write_refuses_what_one_file_cannot_honor(
+    tmp_path: Path, fmt: str, options: dict[str, str | list[str]], refusal: str
 ) -> None:
+    write, _ = ONE_FILE[fmt]
+
     with pytest.raises(ValueError, match=refusal):
-        _rows(3).write_csv(str(tmp_path / "panel.csv"), single_file=True, **options)
+        write(_rows(3), str(tmp_path / f"panel.{fmt}"), single_file=True, **options)

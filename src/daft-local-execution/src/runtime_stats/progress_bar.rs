@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc};
 
 use common_error::DaftResult;
 use common_logging::GLOBAL_LOGGER;
@@ -36,8 +36,6 @@ impl ProgressBarColor {
         }
     }
 }
-
-const TICK_INTERVAL: Duration = Duration::from_millis(100);
 
 struct IndicatifLogger<L: Log> {
     pbar: indicatif::MultiProgress,
@@ -188,9 +186,12 @@ impl Drop for IndicatifProgressBarManager {
 }
 
 impl ProgressBar for IndicatifProgressBarManager {
+    // Bars advance when the stats manager reports each active node, rather than
+    // on a ticking thread per bar: a plan of thousands of nodes would otherwise
+    // start thousands of threads.
     fn initialize_node(&self, node_id: NodeID) {
         let pb = self.pbars.get(node_id).unwrap();
-        pb.enable_steady_tick(TICK_INTERVAL);
+        pb.tick();
     }
 
     fn finalize_node(&self, node_id: NodeID, last_snapshot: &StatSnapshot) {
@@ -202,6 +203,7 @@ impl ProgressBar for IndicatifProgressBarManager {
     fn handle_event(&self, node_id: NodeID, event: &StatSnapshot) {
         let pb = self.pbars.get(node_id).unwrap();
         pb.set_message(event.to_message());
+        pb.tick();
     }
 
     fn finish(mut self: Box<Self>) -> DaftResult<()> {

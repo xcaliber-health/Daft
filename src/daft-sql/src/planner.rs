@@ -28,10 +28,10 @@ use itertools::Itertools;
 use sqlparser::{
     ast::{
         self, BinaryOperator, CastKind, ColumnDef, DateTimeField, Distinct, ExcludeSelectItem,
-        FunctionArg, FunctionArgExpr, GroupByExpr, Ident, ObjectName, Query, SelectItem, SetExpr,
-        Subscript, TableAlias, TableFunctionArgs, TableSample, TableSampleBucket, TableSampleKind,
-        TableSampleQuantity, TableSampleSeed, TableSampleUnit, TableWithJoins, TimezoneInfo,
-        UnaryOperator, Value, WildcardAdditionalOptions, With,
+        FunctionArg, FunctionArgExpr, GroupByExpr, Ident, LimitClause, ObjectName, OrderBy, Query,
+        SelectItem, SetExpr, Subscript, TableAlias, TableFunctionArgs, TableSample,
+        TableSampleBucket, TableSampleKind, TableSampleQuantity, TableSampleSeed, TableSampleUnit,
+        TableWithJoins, TimezoneInfo, UnaryOperator, Value, WildcardAdditionalOptions, With,
     },
     dialect::GenericDialect,
     parser::{Parser, ParserOptions},
@@ -39,8 +39,13 @@ use sqlparser::{
 };
 
 use crate::{
-    column_not_found_err, error::*, invalid_operation_err, schema::sql_dtype_to_dtype,
-    statement::Statement, table_not_found_err, unsupported_sql_err,
+    column_not_found_err,
+    error::*,
+    invalid_operation_err,
+    nesting::{Nested, Nesting, significant, with_stack_for},
+    schema::sql_dtype_to_dtype,
+    statement::Statement,
+    table_not_found_err, unsupported_sql_err,
 };
 
 /// Map a sqlparser ParserError to PlannerError with caret-formatted message.
@@ -174,6 +179,8 @@ pub struct SQLPlanner<'sess> {
     /// Aliases from selection that can be used in other clauses
     /// but may not yet be in the schema of `current_relation`.
     bound_columns: Bindings<ExprRef>,
+    /// How deeply the statement being planned nests, shared by all its scopes
+    nesting: Nesting,
     session: &'sess Session,
 }
 
@@ -188,6 +195,7 @@ impl<'a> SQLPlanner<'a> {
             current_plan: None,
             right_side_plan: None,
             bound_columns: Bindings::default(),
+            nesting: self.nesting.clone(),
             session: self.session,
         }
     }
@@ -204,6 +212,7 @@ impl<'sess> SQLPlanner<'sess> {
             current_plan: None,
             right_side_plan: None,
             bound_columns: Bindings::default(),
+            nesting: Nesting::default(),
             session,
         }
     }
@@ -222,6 +231,7 @@ impl SQLPlanner<'_> {
             current_plan: None,
             right_side_plan: None,
             bound_columns: Bindings::default(),
+            nesting: self.nesting.clone(),
             session: self.session,
         }
     }
@@ -359,32 +369,36 @@ impl SQLPlanner<'_> {
             }
         }
 
-        let mut parser = Parser::new(&GenericDialect {})
-            .with_options(ParserOptions {
-                trailing_commas: true,
-                ..Default::default()
-            })
-            .with_tokens_with_locations(tokens);
+        // the statement's syntax tree is built, planned and dropped on a stack sized to it
+        let significant = significant(tokens.iter().map(|token| &token.token));
+        with_stack_for(significant, || {
+            let mut parser = Parser::new(&GenericDialect {})
+                .with_options(ParserOptions {
+                    trailing_commas: true,
+                    ..Default::default()
+                })
+                .with_tokens_with_locations(tokens);
 
-        // currently only allow one statement
-        let statements = parser
-            .parse_statements()
-            .map_err(|e| map_parser_error(input, e))?;
-        if statements.len() > 1 {
-            unsupported_sql_err!(
-                "Only exactly one SQL statement allowed, found {}",
-                statements.len()
-            )
-        }
-        if statements.is_empty() {
-            invalid_operation_err!("Empty SQL statement")
-        }
+            // currently only allow one statement
+            let statements = parser
+                .parse_statements()
+                .map_err(|e| map_parser_error(input, e))?;
+            if statements.len() > 1 {
+                unsupported_sql_err!(
+                    "Only exactly one SQL statement allowed, found {}",
+                    statements.len()
+                )
+            }
+            if statements.is_empty() {
+                invalid_operation_err!("Empty SQL statement")
+            }
 
-        // plan single statement
-        let stmt = &statements[0];
-        let stmt = self.plan_statement(stmt)?;
-        self.clear_context();
-        Ok(stmt)
+            // plan single statement
+            let stmt = &statements[0];
+            let stmt = self.plan_statement(stmt)?;
+            self.clear_context();
+            Ok(stmt)
+        })
     }
 
     pub fn plan_sql(&mut self, sql: &str) -> SQLPlannerResult<LogicalPlanRef> {
@@ -397,8 +411,28 @@ impl SQLPlanner<'_> {
 
     pub(crate) fn plan_query(&mut self, query: &Query) -> SQLPlannerResult<LogicalPlanBuilder> {
         check_query_features(query)?;
+        self.plan_query_body(
+            &query.body,
+            query.with.as_ref(),
+            query.order_by.as_ref(),
+            query.limit_clause.as_ref(),
+        )
+    }
 
-        let selection = match query.body.as_ref() {
+    /// Plans a query's body with the clauses that apply to it.
+    ///
+    /// Each side of a set operation is planned as a body of its own, with none of
+    /// the clauses: a chain of set operations nests one level per operation.
+    #[recursive::recursive]
+    fn plan_query_body(
+        &mut self,
+        body: &SetExpr,
+        with: Option<&With>,
+        order_by: Option<&OrderBy>,
+        limit_clause: Option<&LimitClause>,
+    ) -> SQLPlannerResult<LogicalPlanBuilder> {
+        let _level = self.nesting.descend(Nested::Query, 1)?;
+        let selection = match body {
             SetExpr::Select(selection) => selection,
             SetExpr::Query(_) => unsupported_sql_err!("Subqueries are not supported"),
             SetExpr::SetOperation {
@@ -411,23 +445,13 @@ impl SQLPlanner<'_> {
                     SetOperator::{Intersect, Union},
                     SetQuantifier as SQLSetQuantifier,
                 };
-                fn make_query(expr: &SetExpr) -> Query {
-                    Query {
-                        with: None,
-                        body: Box::new(expr.clone()),
-                        order_by: None,
-                        limit_clause: None,
-                        fetch: None,
-                        locks: vec![],
-                        for_clause: None,
-                        settings: None,
-                        format_clause: None,
-                        pipe_operators: vec![],
-                    }
-                }
 
-                let left = self.new_with_context().plan_query(&make_query(left))?;
-                let right = self.new_with_context().plan_query(&make_query(right))?;
+                let left = self
+                    .new_with_context()
+                    .plan_query_body(left, None, None, None)?;
+                let right = self
+                    .new_with_context()
+                    .plan_query_body(right, None, None, None)?;
 
                 return match (op, set_quantifier) {
                     (Union, set_quantifier) => {
@@ -469,13 +493,12 @@ impl SQLPlanner<'_> {
         };
         check_select_features(selection)?;
 
-        if let Some(with) = &query.with {
+        if let Some(with) = with {
             self.plan_ctes(with)?;
         }
 
         // FROM/JOIN
-        let from = selection.clone().from;
-        self.plan_from(&from)?;
+        self.plan_from(&selection.from)?;
 
         // SELECT
         let projections = selection
@@ -522,9 +545,7 @@ impl SQLPlanner<'_> {
         }
 
         // ORDER BY
-        let order_by = query
-            .order_by
-            .as_ref()
+        let order_by = order_by
             .map(|order_by| {
                 if order_by.interpolate.is_some() {
                     unsupported_sql_err!("ORDER BY [query] [INTERPOLATE]");
@@ -572,7 +593,7 @@ impl SQLPlanner<'_> {
         // Daft's SQL dialect closely follows both DuckDB and PostgreSQL, So unlike DataFrame, when
         // LIMIT and OFFSET appear at the same time, we need to ignore the order of LIMIT and OFFSET
         // and ensure that OFFSET is a child node of LIMIT.
-        if let Some(limit_clause) = &query.limit_clause {
+        if let Some(limit_clause) = limit_clause {
             match limit_clause {
                 ast::LimitClause::LimitOffset { offset, limit, .. } => {
                     if let Some(offset) = offset {
@@ -912,8 +933,9 @@ impl SQLPlanner<'_> {
 
     /// Plans a single set of table and joins in a FROM clause.
     fn plan_single_from(&self, from: &TableWithJoins) -> SQLPlannerResult<LogicalPlanBuilder> {
-        let relation = from.relation.clone();
-        let left_plan = self.plan_relation(&relation)?;
+        // each join nests the joins before it
+        let _levels = self.nesting.descend(Nested::Query, from.joins.len())?;
+        let left_plan = self.plan_relation(&from.relation)?;
         let mut left_planner = self.new_with_context();
         left_planner.set_plan(left_plan);
 
@@ -997,6 +1019,8 @@ impl SQLPlanner<'_> {
     /// Plans the FROM clause of a query and populates `self.current_relation`.
     /// Should only be called once per query.
     fn plan_from(&mut self, from: &[TableWithJoins]) -> SQLPlannerResult<()> {
+        // each item is joined onto the items before it
+        let _levels = self.nesting.descend(Nested::Query, from.len())?;
         let plan = if let Some(plan) = from
             .iter()
             .map(|f| self.plan_single_from(f))
@@ -1638,8 +1662,10 @@ impl SQLPlanner<'_> {
         })
     }
 
+    #[recursive::recursive]
     pub(crate) fn plan_expr(&self, expr: &sqlparser::ast::Expr) -> SQLPlannerResult<ExprRef> {
         use sqlparser::ast::Expr as SQLExpr;
+        let _level = self.nesting.descend(Nested::Expression, 1)?;
         match expr {
             SQLExpr::Identifier(ident) => self.plan_identifier(std::slice::from_ref(ident)),
             SQLExpr::Value(v) => self.value_to_lit(&v.value).map(Expr::Literal).map(Arc::new),
@@ -1676,7 +1702,11 @@ impl SQLPlanner<'_> {
             SQLExpr::IsNull(expr) => Ok(self.plan_expr(expr)?.is_null()),
             SQLExpr::IsNotNull(expr) => Ok(self.plan_expr(expr)?.is_null().not()),
             SQLExpr::UnaryOp { op, expr } => self.plan_unary_op(op, expr),
-            SQLExpr::CompoundIdentifier(idents) => self.plan_identifier(idents),
+            SQLExpr::CompoundIdentifier(idents) => {
+                // each part after the first gets a field of the part before it
+                let _levels = self.nesting.descend(Nested::Expression, idents.len())?;
+                self.plan_identifier(idents)
+            }
             SQLExpr::IsUnknown(_) => unsupported_sql_err!("IS UNKNOWN"),
             SQLExpr::IsNotUnknown(_) => {
                 unsupported_sql_err!("IS NOT UNKNOWN")
@@ -1886,6 +1916,8 @@ impl SQLPlanner<'_> {
                     unsupported_sql_err!("CASE with operand not yet supported");
                 }
 
+                // each condition nests the conditions after it
+                let _levels = self.nesting.descend(Nested::Expression, conditions.len())?;
                 let else_expr = match else_result {
                     Some(expr) => self.plan_expr(expr)?,
                     None => unsupported_sql_err!("CASE with no else result"),
@@ -1932,11 +1964,8 @@ impl SQLPlanner<'_> {
                     .iter()
                     .map(|expr| {
                         let expr = self.plan_expr(expr)?;
-                        // this should always unwrap
-                        // there is no way to have multiple references to the same expr at this point
-                        let expr = Arc::unwrap_or_clone(expr);
-                        match expr {
-                            Expr::Literal(lit) => Ok(lit),
+                        match expr.as_ref() {
+                            Expr::Literal(lit) => Ok(lit.clone()),
                             _ => unsupported_sql_err!("Tuple with non-literal"),
                         }
                     })
@@ -2464,21 +2493,25 @@ pub fn sql_expr<S: AsRef<str>>(s: S) -> SQLPlannerResult<ExprRef> {
             PlannerError::caret_error(e.message.clone(), sql, e.location.line, e.location.column)
         })?;
 
-    let mut parser = Parser::new(&GenericDialect {})
-        .with_options(ParserOptions {
-            trailing_commas: true,
-            ..Default::default()
-        })
-        .with_tokens_with_locations(tokens);
+    // the expression's syntax tree is built, planned and dropped on a stack sized to it
+    let significant = significant(tokens.iter().map(|token| &token.token));
+    with_stack_for(significant, || {
+        let mut parser = Parser::new(&GenericDialect {})
+            .with_options(ParserOptions {
+                trailing_commas: true,
+                ..Default::default()
+            })
+            .with_tokens_with_locations(tokens);
 
-    let expr = parser
-        .parse_select_item()
-        .map_err(|e| map_parser_error(sql, e))?;
-    let exprs = planner.select_item_to_expr(&expr)?;
-    if exprs.len() != 1 {
-        invalid_operation_err!("expected a single expression, found {}", exprs.len())
-    }
-    Ok(exprs.into_iter().next().unwrap())
+        let expr = parser
+            .parse_select_item()
+            .map_err(|e| map_parser_error(sql, e))?;
+        let exprs = planner.select_item_to_expr(&expr)?;
+        if exprs.len() != 1 {
+            invalid_operation_err!("expected a single expression, found {}", exprs.len())
+        }
+        Ok(exprs.into_iter().next().unwrap())
+    })
 }
 
 // ----------------

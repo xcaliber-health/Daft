@@ -75,18 +75,20 @@ class FailingSource(DataSource):
         yield FailingTask()
 
 
+# A legacy UDF is attached to the session under its own name, so it must not
+# shadow a SQL function that tests sharing this process call.
 @daft.udf(return_dtype=daft.DataType.int64())
-def explode(v: daft.Series) -> daft.Series:
+def failing_udf(v: daft.Series) -> daft.Series:
     raise KeyError("no such row")
 
 
 @daft.func.batch(return_dtype=daft.DataType.int64())
-def explode_batch(v: daft.Series) -> daft.Series:
+def failing_batch(v: daft.Series) -> daft.Series:
     raise KeyError("no such batch")
 
 
 @daft.func(return_dtype=daft.DataType.int64())
-def explode_rows(v: int) -> int:
+def failing_rows(v: int) -> int:
     raise KeyError("no such row")
 
 
@@ -99,15 +101,15 @@ def _missing_column() -> daft.DataFrame:
 
 
 def _a_udf_failure() -> daft.DataFrame:
-    return daft.from_pydict({"v": [1]}).select(explode(col("v")))
+    return daft.from_pydict({"v": [1]}).select(failing_udf(col("v")))
 
 
 def _a_batch_failure() -> daft.DataFrame:
-    return daft.from_pydict({"v": [1]}).select(explode_batch(col("v")))
+    return daft.from_pydict({"v": [1]}).select(failing_batch(col("v")))
 
 
 def _row_failures() -> daft.DataFrame:
-    return daft.from_pydict({"v": [1]}).select(explode_rows(col("v")))
+    return daft.from_pydict({"v": [1]}).select(failing_rows(col("v")))
 
 
 def _a_source_failure() -> daft.DataFrame:

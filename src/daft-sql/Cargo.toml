@@ -18,7 +18,9 @@ daft-recordbatch = {path = "../daft-recordbatch"}
 daft-session = {path = "../daft-session"}
 itertools = {workspace = true}
 pyo3 = {workspace = true, optional = true}
+recursive = {workspace = true}
 sqlparser = {workspace = true}
+stacker = {workspace = true}
 regex.workspace = true
 snafu.workspace = true
 

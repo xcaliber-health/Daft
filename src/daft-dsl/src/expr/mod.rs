@@ -8,6 +8,7 @@ mod tests;
 
 use std::{
     any::Any,
+    cell::Cell,
     collections::HashSet,
     fmt::Formatter,
     hash::{DefaultHasher, Hash, Hasher},
@@ -336,6 +337,55 @@ impl<'de> Deserialize<'de> for Expr {
     #[recursive::recursive]
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Expr::deserialize(deserializer)
+    }
+}
+
+/// Remaining stack, in bytes, below which an expression's drop takes its
+/// children apart on the heap instead of recursing into them.
+const DISMANTLE_BELOW: usize = 64 * 1024;
+
+thread_local! {
+    /// Whether this thread is taking an expression apart. While it is, each
+    /// expression it drops leaves its children to it.
+    static DISMANTLING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Marks this thread as taking an expression apart until dropped, unwinding included.
+struct Dismantling;
+
+impl Dismantling {
+    fn begin() -> Self {
+        DISMANTLING.set(true);
+        Self
+    }
+}
+
+impl Drop for Dismantling {
+    fn drop(&mut self) {
+        DISMANTLING.set(false);
+    }
+}
+
+// Dropping an expression drops its children, recursing once per level. While the
+// stack has room that is all it does. Once the stack runs low, the expression's
+// children are held on the heap while it drops, and each one this drop was the
+// last owner of is taken apart the same way, one level at a time.
+impl Drop for Expr {
+    fn drop(&mut self) {
+        if stacker::remaining_stack().is_none_or(|remaining| remaining >= DISMANTLE_BELOW)
+            || DISMANTLING.get()
+        {
+            return;
+        }
+        let _dismantling = Dismantling::begin();
+        let node = std::mem::replace(self, Self::Literal(Literal::Null));
+        let mut pending = node.children();
+        drop(node);
+        while let Some(child) = pending.pop() {
+            if let Some(expr) = Arc::into_inner(child) {
+                pending.extend(expr.children());
+            }
+        }
     }
 }
 
@@ -2771,6 +2821,7 @@ pub fn is_udf(expr: &ExprRef) -> bool {
     )
 }
 
+#[recursive::recursive]
 pub fn estimated_selectivity(expr: &Expr, schema: &Schema) -> f64 {
     let estimate = match expr {
         // Boolean operations that filter rows

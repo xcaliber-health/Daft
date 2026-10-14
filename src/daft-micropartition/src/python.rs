@@ -1153,30 +1153,51 @@ pub fn read_sql_into_py_table(
         .extract()?)
 }
 
+/// Reads the batches of a scan task whose sources are Python factory functions.
+///
+/// Each source's factory is called once, here, and must return an iterator of
+/// record batches; the returned iterator then takes each batch as it is asked
+/// for, attaching to the interpreter only for that. A factory that cannot be
+/// found or called, that returns something other than an iterator, or whose
+/// iterator yields something other than a record batch, is reported as an
+/// error, never a panic. Pushed-down filters and limits are applied to the
+/// batches read.
+///
+/// # Errors
+/// Returns an error if a source is not a factory function, or a factory cannot
+/// be called or returns no iterator. Each item is an error where reading,
+/// filtering or limiting that batch failed.
 pub fn read_pyfunc_into_table_iter(
     scan_task: ScanTaskRef,
 ) -> crate::Result<impl Iterator<Item = crate::Result<RecordBatch>>> {
-    let table_iterators = scan_task.sources.iter().map(|source| {
-        // Call Python function to create an Iterator (Grabs the GIL and then releases it)
-        match &source.kind {
-            ScanSourceKind::PythonFactoryFunction {
+    let table_iterators = scan_task
+        .sources
+        .iter()
+        .map(|source| {
+            let ScanSourceKind::PythonFactoryFunction {
                 module,
                 func_name,
                 func_args,
-            } => {
-                Python::attach(|py| {
-                    let func = py.import(module.as_str())
-                        .unwrap_or_else(|_| panic!("Cannot import factory function from module {module}"))
-                        .getattr(func_name.as_str())
-                        .unwrap_or_else(|_| panic!("Cannot find function {func_name} in module {module}"));
-                    func.call(func_args.to_pytuple(py).with_context(|_| PyIOSnafu)?, None)
-                        .with_context(|_| PyIOSnafu)
-                        .map(Into::<pyo3::Py<pyo3::PyAny>>::into)
-                })
-            },
-            _ => unreachable!("PythonFunction file format must be paired with PythonFactoryFunction scan sources"),
-        }
-    }).collect::<crate::Result<Vec<_>>>()?;
+            } = &source.kind
+            else {
+                return Err(crate::Error::DaftCoreCompute {
+                    source: DaftError::InternalError(
+                        "a Python function scan task holds a source that is not a factory function"
+                            .to_string(),
+                    ),
+                });
+            };
+            Python::attach(|py| {
+                let batches = py
+                    .import(module.as_str())?
+                    .getattr(func_name.as_str())?
+                    .call(func_args.to_pytuple(py)?, None)?
+                    .cast_into::<pyo3::types::PyIterator>()?;
+                Ok(batches.unbind())
+            })
+            .with_context(|_| PyIOSnafu)
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
 
     let scan_task_limit = scan_task.pushdowns.limit;
     // If aggregation pushdown is present, the Python factory function is expected to have applied
@@ -1194,19 +1215,15 @@ pub fn read_pyfunc_into_table_iter(
         .flat_map(move |iter| {
             std::iter::from_fn(move || {
                 Python::attach(|py| {
-                    iter.cast_bound::<pyo3::types::PyIterator>(py)
-                        .expect("Function must return an iterator of tables")
-                        .clone()
-                        .next()
-                        .map(|result| {
-                            result
-                                .map(|tbl| {
-                                    tbl.extract::<daft_recordbatch::python::PyRecordBatch>()
-                                        .expect("Must be a PyRecordBatch")
-                                        .record_batch
-                                })
-                                .with_context(|_| PyIOSnafu)
-                        })
+                    iter.bind(py).clone().next().map(|batch| {
+                        batch
+                            .and_then(|batch| {
+                                Ok(batch
+                                    .extract::<daft_recordbatch::python::PyRecordBatch>()?
+                                    .record_batch)
+                            })
+                            .with_context(|_| PyIOSnafu)
+                    })
                 })
             })
         })

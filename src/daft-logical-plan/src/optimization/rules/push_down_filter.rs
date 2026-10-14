@@ -6,9 +6,9 @@ use std::{
 use common_error::DaftResult;
 use common_treenode::{DynTreeNode, Transformed, TreeNode};
 use daft_algebra::boolean::{combine_conjunction, split_conjunction, to_cnf};
-use daft_core::join::JoinType;
+use daft_core::{join::JoinType, prelude::Schema};
 use daft_dsl::{
-    ExprRef,
+    ExprRef, estimated_selectivity,
     optimization::{get_required_columns, replace_columns_with_expressions},
     resolved_col,
 };
@@ -17,7 +17,7 @@ use daft_scan::{PredicateGroups, ScanState, rewrite_predicate_for_partitioning};
 use super::OptimizerRule;
 use crate::{
     LogicalPlan,
-    ops::{Concat, Filter, Join, Project},
+    ops::{Concat, Filter, Join},
     source_info::SourceInfo,
 };
 
@@ -264,64 +264,69 @@ impl PushDownFilter {
                 // don't involve compute.
                 //
                 // Filter-Projection --> {Filter-}Projection-Filter
-                let predicates = split_conjunction(&filter.predicate);
-                let projection_input_mapping = child_project
-                    .projection
-                    .iter()
-                    .filter_map(|e| {
-                        e.input_mapping()
-                            .map(|s| (e.name().to_string(), resolved_col(s)))
-                    })
-                    .collect::<HashMap<String, ExprRef>>();
-                // Split predicate expressions into those that don't depend on projection compute (can_push) and those
-                // that do (can_not_push).
+                //
                 // TODO(Clark): Push Filters depending on Projection columns involving compute if those expressions are
                 // (1) deterministic && (pure || idempotent),
                 // (2) inexpensive to recompute.
                 // This can be done by rewriting the Filter predicate expression to contain the relevant Projection expression.
-                let mut can_push: Vec<ExprRef> = vec![];
-                let mut can_not_push: Vec<ExprRef> = vec![];
-                for predicate in predicates {
-                    let predicate_cols = get_required_columns(&predicate);
-                    if predicate_cols
-                        .iter()
-                        .all(|col| projection_input_mapping.contains_key(col))
-                    {
-                        // Can push predicate through expression.
-                        let new_predicate = replace_columns_with_expressions(
-                            predicate.clone(),
-                            &projection_input_mapping,
-                        );
-                        can_push.push(new_predicate);
-                    } else {
-                        // Can't push predicate expression through projection.
-                        can_not_push.push(predicate.clone());
-                    }
-                }
-                if can_push.is_empty() {
-                    // No predicate expressions can be pushed through projection.
+                let passed_through = passed_through_columns(&child_project.projection);
+                // A projection keeps every row, so even a non-deterministic conjunct
+                // reads the same rows on either side of it.
+                let (Some(below), above) =
+                    split_conjuncts(&filter.predicate, &passed_through, None)
+                else {
                     return Ok(Transformed::no(plan));
-                }
-                // Create new Filter with predicates that can be pushed past Projection.
-                let predicates_to_push = combine_conjunction(can_push).unwrap();
-                let push_down_filter: LogicalPlan =
-                    Filter::try_new(child_project.input.clone(), predicates_to_push)?.into();
-                // Create new Projection.
-                let new_projection: LogicalPlan =
-                    Project::try_new(push_down_filter.into(), child_project.projection.clone())?
-                        .into();
-                if can_not_push.is_empty() {
-                    // If all Filter predicate expressions were pushable past Projection, return new
-                    // Projection-Filter subplan.
-                    new_projection.into()
-                } else {
-                    // Otherwise, add a Filter after Projection that filters with predicate expressions
-                    // that couldn't be pushed past the Projection, returning a Filter-Projection-Filter subplan.
-                    let post_projection_predicate = combine_conjunction(can_not_push).unwrap();
-                    let post_projection_filter: LogicalPlan =
-                        Filter::try_new(new_projection.into(), post_projection_predicate)?.into();
-                    post_projection_filter.into()
-                }
+                };
+                place_around(child_plan, &child_project.input, below, above)?
+            }
+            // A restriction on the columns rows are grouped by keeps or drops each
+            // group whole, so it may drop the group's rows before they are grouped:
+            // fewer rows are grouped, and the restriction can reach the scan.
+            //
+            // Not through a global aggregate, which answers one row even over no
+            // rows, nor a window with no partitions, nor for a non-deterministic
+            // conjunct, which would run once per row instead of once per group.
+            LogicalPlan::Aggregate(aggregate) if !aggregate.groupby.is_empty() => {
+                let passed_through = passed_through_columns(&aggregate.groupby);
+                let (Some(below), above) = split_conjuncts(
+                    &filter.predicate,
+                    &passed_through,
+                    Some(&child_plan.schema()),
+                ) else {
+                    return Ok(Transformed::no(plan));
+                };
+                place_around(child_plan, &aggregate.input, below, above)?
+            }
+            LogicalPlan::Window(window) if !window.window_spec.partition_by.is_empty() => {
+                let passed_through = passed_through_columns(&window.window_spec.partition_by);
+                let (Some(below), above) = split_conjuncts(
+                    &filter.predicate,
+                    &passed_through,
+                    Some(&child_plan.schema()),
+                ) else {
+                    return Ok(Transformed::no(plan));
+                };
+                place_around(child_plan, &window.input, below, above)?
+            }
+            LogicalPlan::Distinct(distinct) => {
+                let passed_through = match &distinct.columns {
+                    Some(columns) => passed_through_columns(columns),
+                    // Distinct over whole rows groups by every column.
+                    None => distinct
+                        .input
+                        .schema()
+                        .field_names()
+                        .map(|name| (name.to_string(), resolved_col(name)))
+                        .collect(),
+                };
+                let (Some(below), above) = split_conjuncts(
+                    &filter.predicate,
+                    &passed_through,
+                    Some(&child_plan.schema()),
+                ) else {
+                    return Ok(Transformed::no(plan));
+                };
+                place_around(child_plan, &distinct.input, below, above)?
             }
             LogicalPlan::Sort(_)
             | LogicalPlan::Shuffle(_)
@@ -461,7 +466,9 @@ impl PushDownFilter {
                     return Ok(Transformed::no(plan));
                 }
             }
-            LogicalPlan::Limit(_)
+            LogicalPlan::Aggregate(..)
+            | LogicalPlan::Window(..)
+            | LogicalPlan::Limit(_)
             | LogicalPlan::Offset(_)
             | LogicalPlan::TopN(..)
             | LogicalPlan::Sample(..)
@@ -470,14 +477,11 @@ impl PushDownFilter {
             | LogicalPlan::UDFProject(..)
             | LogicalPlan::Unpivot(..)
             | LogicalPlan::Pivot(..)
-            | LogicalPlan::Aggregate(..)
             | LogicalPlan::Intersect(..)
             | LogicalPlan::Union(..)
             | LogicalPlan::Sink(..)
             | LogicalPlan::MonotonicallyIncreasingId(..)
             | LogicalPlan::SubqueryAlias(..)
-            | LogicalPlan::Window(..)
-            | LogicalPlan::Distinct(..)
             | LogicalPlan::AsofJoin(..)
             | LogicalPlan::VLLMProject(..)
             | LogicalPlan::StageCheckpointKeys(..) => {
@@ -486,6 +490,77 @@ impl PushDownFilter {
         };
         Ok(Transformed::yes(new_plan))
     }
+}
+
+/// The output columns of `exprs` that pass an input column through unchanged (a
+/// column, or an alias of one), each mapped to the input column it reads.
+fn passed_through_columns(exprs: &[ExprRef]) -> HashMap<String, ExprRef> {
+    exprs
+        .iter()
+        .filter_map(|e| {
+            e.input_mapping()
+                .map(|input| (e.name().to_string(), resolved_col(input)))
+        })
+        .collect()
+}
+
+/// The largest share of a grouping's input rows a conjunct may be estimated to keep
+/// and still move below the grouping.
+///
+/// Below, the conjunct copies every input row it keeps; above, only one row per
+/// group. Over 10M rows in 100,000 groups, a filter keeping half the rows ran
+/// faster below an aggregate (31 ms against 38), one keeping 90% or all of them
+/// ran slower (55–59 ms against 37), and one pruning row groups ran 3× faster.
+const MOST_KEPT_BELOW_GROUPING: f64 = 0.5;
+
+/// Splits `predicate` into the conjunction that may run below a node, rewritten
+/// onto its input, and the conjunction that stays above it; either is `None` when
+/// no conjunct belongs to it.
+///
+/// A conjunct moves when every column it reads is one `passed_through` maps to
+/// the node's input. Below a grouping, whose output schema is `grouping`, it must
+/// also be deterministic, so that it runs once per row with the answer it would
+/// give once per group, and estimated to keep at most
+/// [`MOST_KEPT_BELOW_GROUPING`] of the rows, so that moving it saves more than it
+/// costs.
+fn split_conjuncts(
+    predicate: &ExprRef,
+    passed_through: &HashMap<String, ExprRef>,
+    grouping: Option<&Schema>,
+) -> (Option<ExprRef>, Option<ExprRef>) {
+    let mut below = vec![];
+    let mut above = vec![];
+    for conjunct in split_conjunction(predicate) {
+        let movable = get_required_columns(&conjunct)
+            .iter()
+            .all(|column| passed_through.contains_key(column))
+            && grouping.is_none_or(|schema| {
+                conjunct.is_deterministic()
+                    && estimated_selectivity(&conjunct, schema) <= MOST_KEPT_BELOW_GROUPING
+            });
+        if movable {
+            below.push(replace_columns_with_expressions(conjunct, passed_through));
+        } else {
+            above.push(conjunct);
+        }
+    }
+    (combine_conjunction(below), combine_conjunction(above))
+}
+
+/// Rebuilds `node` over its only `input` filtered by `below`, and filters the
+/// result by `above`, if given.
+fn place_around(
+    node: &LogicalPlan,
+    input: &Arc<LogicalPlan>,
+    below: ExprRef,
+    above: Option<ExprRef>,
+) -> DaftResult<Arc<LogicalPlan>> {
+    let filtered_input: LogicalPlan = Filter::try_new(input.clone(), below)?.into();
+    let rebuilt: Arc<LogicalPlan> = node.with_new_children(&[filtered_input.into()]).into();
+    Ok(match above {
+        Some(above) => Arc::new(Filter::try_new(rebuilt, above)?.into()),
+        None => rebuilt,
+    })
 }
 
 #[cfg(test)]
@@ -1266,5 +1341,166 @@ mod tests {
 
         assert_optimized_plan_eq(plan, expected, false)?;
         Ok(())
+    }
+
+    /// A scan of `k` and `v` whose limit keeps filters from being absorbed into it,
+    /// so a filter pushed down stays visible directly above it. Plans compared
+    /// with each other must share one scan.
+    fn grouped_scan() -> crate::LogicalPlanBuilder {
+        thread_local! {
+            static SCAN: crate::LogicalPlanBuilder = dummy_scan_node_with_pushdowns(
+                dummy_scan_operator(vec![
+                    Field::new("k", DataType::Int64),
+                    Field::new("v", DataType::Int64),
+                ]),
+                Pushdowns::default().with_limit(Some(1)),
+            );
+        }
+        SCAN.with(Clone::clone)
+    }
+
+    /// A predicate the engine cannot know to be deterministic: a Python function.
+    fn not_known_deterministic(input: ExprRef) -> ExprRef {
+        ExprRef::from(daft_dsl::Expr::Function {
+            func: daft_dsl::functions::FunctionExpr::Python(
+                daft_dsl::functions::python::LegacyPythonUDF::new_testing_udf(),
+            ),
+            inputs: vec![input],
+        })
+        .gt(lit(0))
+    }
+
+    /// A conjunct on the group key runs below the aggregate; one on its result stays.
+    #[test]
+    fn filter_on_group_key_runs_below_aggregate() -> DaftResult<()> {
+        let aggregations = vec![resolved_col("v").sum().alias("total")];
+        let on_key = resolved_col("k").eq(lit(1));
+        let on_total = resolved_col("total").gt(lit(10));
+        let plan = grouped_scan()
+            .aggregate(aggregations.clone(), vec![resolved_col("k")])?
+            .filter(on_key.clone().and(on_total.clone()))?
+            .build();
+        let expected = grouped_scan()
+            .filter(on_key)?
+            .aggregate(aggregations, vec![resolved_col("k")])?
+            .filter(on_total)?
+            .build();
+        assert_optimized_plan_eq(plan, expected, false)
+    }
+
+    /// A group key that renames its column is read by its input's name below.
+    #[test]
+    fn filter_on_renamed_group_key_runs_below_aggregate() -> DaftResult<()> {
+        let aggregations = vec![resolved_col("v").sum().alias("total")];
+        let groupby = vec![resolved_col("k").alias("key")];
+        let plan = grouped_scan()
+            .aggregate(aggregations.clone(), groupby.clone())?
+            .filter(resolved_col("key").eq(lit(1)))?
+            .build();
+        let expected = grouped_scan()
+            .filter(resolved_col("k").eq(lit(1)))?
+            .aggregate(aggregations, groupby)?
+            .build();
+        assert_optimized_plan_eq(plan, expected, false)
+    }
+
+    /// A filter stays above an aggregate it cannot move below: a global one, which
+    /// answers a row even over no rows; one over a computed group key; one whose
+    /// predicate is not known to be deterministic; and one estimated to keep most
+    /// rows, which costs more below than it saves.
+    #[rstest]
+    #[case::global(vec![], lit(false))]
+    #[case::computed_key(vec![resolved_col("k").add(lit(1)).alias("k1")], resolved_col("k1").eq(lit(1)))]
+    #[case::not_deterministic(vec![resolved_col("k")], not_known_deterministic(resolved_col("k")))]
+    #[case::keeps_most_rows(vec![resolved_col("k")], resolved_col("k").not_null())]
+    fn filter_stays_above_aggregate(
+        #[case] groupby: Vec<ExprRef>,
+        #[case] predicate: ExprRef,
+    ) -> DaftResult<()> {
+        let plan = grouped_scan()
+            .aggregate(vec![resolved_col("v").sum().alias("total")], groupby)?
+            .filter(predicate)?
+            .build();
+        let expected = plan.clone();
+        assert_optimized_plan_eq(plan, expected, false)
+    }
+
+    fn windowed(
+        scan: crate::LogicalPlanBuilder,
+        partition_by: Vec<ExprRef>,
+    ) -> DaftResult<Arc<LogicalPlan>> {
+        use daft_dsl::{WindowExpr, expr::window::WindowSpec};
+
+        let window_spec = Arc::new(WindowSpec {
+            partition_by,
+            ..Default::default()
+        });
+        let total: WindowExpr = resolved_col("v").sum().try_into()?;
+        Ok(LogicalPlan::from(crate::ops::Window::try_new(
+            scan.build(),
+            vec![total],
+            vec!["total".to_string()],
+            window_spec,
+        )?)
+        .arced())
+    }
+
+    /// A conjunct on the partition key runs below the window; one on its result stays.
+    #[test]
+    fn filter_on_partition_key_runs_below_window() -> DaftResult<()> {
+        let on_key = resolved_col("k").eq(lit(1));
+        let on_total = resolved_col("total").gt(lit(10));
+        let plan =
+            crate::LogicalPlanBuilder::from(windowed(grouped_scan(), vec![resolved_col("k")])?)
+                .filter(on_key.clone().and(on_total.clone()))?
+                .build();
+        let expected = crate::LogicalPlanBuilder::from(windowed(
+            grouped_scan().filter(on_key)?,
+            vec![resolved_col("k")],
+        )?)
+        .filter(on_total)?
+        .build();
+        assert_optimized_plan_eq(plan, expected, false)
+    }
+
+    /// A filter stays above a window with no partitions, and one estimated to keep
+    /// most rows stays above any window.
+    #[rstest]
+    #[case::no_partitions(vec![], resolved_col("k").eq(lit(1)))]
+    #[case::keeps_most_rows(vec![resolved_col("k")], resolved_col("k").not_null())]
+    fn filter_stays_above_window(
+        #[case] partition_by: Vec<ExprRef>,
+        #[case] predicate: ExprRef,
+    ) -> DaftResult<()> {
+        let plan = crate::LogicalPlanBuilder::from(windowed(grouped_scan(), partition_by)?)
+            .filter(predicate)?
+            .build();
+        let expected = plan.clone();
+        assert_optimized_plan_eq(plan, expected, false)
+    }
+
+    /// Distinct over whole rows lets any deterministic conjunct below; distinct on
+    /// some columns, only a conjunct on those.
+    #[rstest]
+    #[case::whole_rows(None, resolved_col("v").eq(lit(1)), true)]
+    #[case::on_its_columns(Some(vec![resolved_col("k")]), resolved_col("k").eq(lit(1)), true)]
+    #[case::on_other_columns(Some(vec![resolved_col("k")]), resolved_col("v").eq(lit(1)), false)]
+    #[case::not_deterministic(None, not_known_deterministic(resolved_col("k")), false)]
+    #[case::keeps_most_rows(None, resolved_col("k").not_null(), false)]
+    fn filter_through_distinct(
+        #[case] columns: Option<Vec<ExprRef>>,
+        #[case] predicate: ExprRef,
+        #[case] moves: bool,
+    ) -> DaftResult<()> {
+        let plan = grouped_scan()
+            .distinct(columns.clone())?
+            .filter(predicate.clone())?
+            .build();
+        let expected = if moves {
+            grouped_scan().filter(predicate)?.distinct(columns)?.build()
+        } else {
+            plan.clone()
+        };
+        assert_optimized_plan_eq(plan, expected, false)
     }
 }

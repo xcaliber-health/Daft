@@ -2538,6 +2538,30 @@ impl Expr {
         }
     }
 
+    /// Whether evaluating the expression twice over the same rows is known to give
+    /// the same values both times.
+    ///
+    /// A builtin function marked as not deterministic (a random number, the
+    /// current time, a generated identifier) makes it not so. So does a Python
+    /// function, whose determinism the engine cannot know, a model call, or a
+    /// subquery.
+    #[must_use]
+    pub fn is_deterministic(self: &Arc<Self>) -> bool {
+        !self.exists(|e| match e.as_ref() {
+            Self::ScalarFn(ScalarFn::Builtin(func)) => !func.is_deterministic(),
+            Self::ScalarFn(ScalarFn::Python(_))
+            | Self::Function {
+                func: FunctionExpr::Python(_),
+                ..
+            }
+            | Self::VLLM(_)
+            | Self::Subquery(_)
+            | Self::InSubquery(..)
+            | Self::Exists(_) => true,
+            _ => false,
+        })
+    }
+
     /// Returns the expression as SQL using PostgreSQL's dialect.
     pub fn to_sql(&self) -> Option<String> {
         fn to_sql_inner<W: Write>(expr: &Expr, buffer: &mut W) -> io::Result<()> {

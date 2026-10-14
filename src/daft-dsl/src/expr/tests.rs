@@ -159,3 +159,54 @@ fn clustering_is_covered_by_expression_keys() {
         &[producer, hour, bound(2, "bucket")]
     ));
 }
+
+/// `x + 1 + 1 …`, nested `depth` levels on top of `base`.
+fn chained(base: ExprRef, depth: usize) -> ExprRef {
+    (0..depth).fold(base, |left, _| {
+        Expr::BinaryOp {
+            op: Operator::Plus,
+            left,
+            right: lit(1),
+        }
+        .arced()
+    })
+}
+
+/// How many levels nest below `expr` along its left operands.
+fn left_depth(expr: &ExprRef) -> usize {
+    let mut depth = 0;
+    let mut level = expr;
+    while let Expr::BinaryOp { left, .. } = level.as_ref() {
+        depth += 1;
+        level = left;
+    }
+    depth
+}
+
+#[test]
+fn an_expression_deeper_than_its_threads_stack_drops() {
+    // Far more levels than a 256 KiB stack holds when each level's drop recurses.
+    let depth = 1_000_000;
+    std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || drop(chained(resolved_col("x"), depth)))
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn a_subtree_owned_elsewhere_survives_its_parent_dropping() {
+    let shared = chained(resolved_col("x"), 1_000);
+    let kept = shared.clone();
+
+    std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || drop(chained(shared, 1_000_000)))
+        .unwrap()
+        .join()
+        .unwrap();
+
+    assert_eq!(Arc::strong_count(&kept), 1);
+    assert_eq!(left_depth(&kept), 1_000);
+}

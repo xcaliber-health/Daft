@@ -1964,11 +1964,8 @@ impl SQLPlanner<'_> {
                     .iter()
                     .map(|expr| {
                         let expr = self.plan_expr(expr)?;
-                        // this should always unwrap
-                        // there is no way to have multiple references to the same expr at this point
-                        let expr = Arc::unwrap_or_clone(expr);
-                        match expr {
-                            Expr::Literal(lit) => Ok(lit),
+                        match expr.as_ref() {
+                            Expr::Literal(lit) => Ok(lit.clone()),
                             _ => unsupported_sql_err!("Tuple with non-literal"),
                         }
                     })

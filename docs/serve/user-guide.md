@@ -227,7 +227,9 @@ for batch in reader:
     ...
 ```
 
-- The schema is read first, so an empty result still names its columns and types.
+- The schema is read first. It is the plan's, sent as soon as the server has planned the
+  query and before any of it runs, so an empty result still names its columns and types,
+  and every batch matches it exactly.
 - Columns convert exactly as a local result's do. A reader may ask for a schema of its
   own, and the columns are cast to it.
 - A result is read once: once taken as an Arrow stream, it can't be taken again or
@@ -235,8 +237,10 @@ for batch in reader:
 - A failure partway through ends the stream with its class and message as text, since
   Arrow's interface carries only text. `result.failure` then holds the failure as the
   class it's raised as when iterated (for example `DaftServeError` with its
-  `error_class` and `remote_type`). A failure before any row, such as a request host's
-  refusal, is raised as its class directly.
+  `error_class` and `remote_type`). A failure while planning, such as a request host's
+  refusal, comes before any schema and is raised as its class directly. Anything that
+  ends the query once it's planned (a failure, a cancel, the time limit) comes after the
+  schema.
 
 ---
 
@@ -781,7 +785,8 @@ anyone debugging network-level behavior.
   results come back as a single stream. There's no back-and-forth chatter and no
   separate upload step — any in-memory data your query needs rides along inside
   the request, and only the parts the query actually uses are sent.
-- **Result stream.** Results arrive as a schema, then a series of data batches,
+- **Result stream.** Results arrive as a schema, sent once the query is planned,
+  then a series of data batches,
   then a final summary (row and byte counts, and the plan that ran). If that
   final summary never arrives, the client raises an error rather than pretending
   the truncated result is complete.

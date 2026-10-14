@@ -6,6 +6,7 @@ use super::{
 pub(crate) struct NaiveLeftDeepJoinOrderer {}
 
 impl NaiveLeftDeepJoinOrderer {
+    #[recursive::recursive]
     fn extend_order(
         graph: &JoinGraph,
         current_order: JoinOrderTree,

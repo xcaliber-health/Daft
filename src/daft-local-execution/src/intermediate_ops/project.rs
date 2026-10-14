@@ -43,6 +43,7 @@ fn smallest_batch_size(prev: Option<usize>, next: Option<usize>) -> Option<usize
 }
 
 /// Has interesting compute to display within the name / progress bars
+#[recursive::recursive]
 fn is_interesting(expr: &Arc<Expr>) -> bool {
     match expr.as_ref() {
         Expr::Column(..) => false,

@@ -1,4 +1,5 @@
 pub mod ascii;
+pub mod json;
 pub mod mermaid;
 pub mod table_display;
 pub mod tree;

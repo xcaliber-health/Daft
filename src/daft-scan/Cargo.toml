@@ -27,6 +27,7 @@ futures = {workspace = true}
 indexmap = {workspace = true}
 itertools = {workspace = true}
 pyo3 = {workspace = true, optional = true}
+recursive = {workspace = true}
 serde = {workspace = true}
 serde_json = {workspace = true, optional = true}
 snafu = {workspace = true}

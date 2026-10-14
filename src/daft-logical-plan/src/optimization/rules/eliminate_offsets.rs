@@ -30,6 +30,7 @@ impl OptimizerRule for EliminateOffsets {
 
 impl EliminateOffsets {
     #[allow(clippy::only_used_in_recursion)]
+    #[recursive::recursive]
     fn try_optimize_node(
         &self,
         plan: Arc<LogicalPlan>,

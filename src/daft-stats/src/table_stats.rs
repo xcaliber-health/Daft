@@ -121,6 +121,7 @@ impl TableStatistics {
             .sum()
     }
 
+    #[recursive::recursive]
     pub fn eval_expression(&self, expr: &BoundExpr) -> crate::Result<ColumnRangeStatistics> {
         match expr.as_ref() {
             Expr::Alias(col, _) => self.eval_expression(&BoundExpr::new_unchecked(col.clone())),

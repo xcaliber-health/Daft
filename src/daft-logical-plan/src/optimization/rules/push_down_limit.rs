@@ -42,6 +42,7 @@ impl OptimizerRule for PushDownLimit {
 
 impl PushDownLimit {
     #[allow(clippy::only_used_in_recursion)]
+    #[recursive::recursive]
     fn try_optimize_node(
         &self,
         plan: Arc<LogicalPlan>,

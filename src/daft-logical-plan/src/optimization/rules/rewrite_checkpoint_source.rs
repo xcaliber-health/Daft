@@ -31,6 +31,7 @@ impl RewriteCheckpointSource {
 
 /// Returns `true` if `plan` or any of its descendants is a `Source` with
 /// `checkpoint = Some(_)`.
+#[recursive::recursive]
 fn subtree_contains_checkpoint_source(plan: &LogicalPlan) -> bool {
     if let LogicalPlan::Source(s) = plan
         && s.checkpoint.is_some()
@@ -104,6 +105,7 @@ fn validate_map_only_downstream(plan: &LogicalPlan) -> DaftResult<()> {
         }
     }
 
+    #[recursive::recursive]
     fn walk(plan: &LogicalPlan) -> DaftResult<()> {
         let shuffle_op = op_name(plan);
         if !shuffle_op.is_empty()

@@ -350,6 +350,7 @@ prost = "0.13.5"
 prost-types = "0.13.5"
 rand = "^0.9"
 rayon = "1.11.0"
+recursive = "0.1.1"
 regex = "1.12.2"
 rstest = "0.26.1"
 reqwest = {version = "0.12.19", default-features = false, features = ["json"]}
@@ -361,6 +362,7 @@ smallvec = {version = "1.15.1", features = ["serde", "impl_bincode"]}
 snafu = {version = "0.9.0", features = ["futures"]}
 spark-connect = {path = "src/generated/spark-connect", default-features = false}
 sqlparser = "0.59.0"
+stacker = "0.1.23"
 sysinfo = "0.38.4"
 tango-bench = "0.6.0"
 test-log = "0.2.19"

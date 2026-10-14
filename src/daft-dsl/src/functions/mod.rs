@@ -102,6 +102,7 @@ pub fn function_display(f: &mut Formatter, func: &FunctionExpr, inputs: &[ExprRe
     Ok(())
 }
 
+#[recursive::recursive]
 pub fn function_display_without_formatter(
     func: &FunctionExpr,
     inputs: &[ExprRef],

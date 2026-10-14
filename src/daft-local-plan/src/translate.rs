@@ -26,6 +26,7 @@ pub fn translate(
     translate_helper(plan, &mut source_counter, psets)
 }
 
+#[recursive::recursive]
 fn translate_helper(
     plan: &LogicalPlanRef,
     source_counter: &mut SourceIdCounter,

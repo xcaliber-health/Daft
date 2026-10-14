@@ -532,6 +532,7 @@ impl JoinGraph {
     /// Returns a tuple of the logical plan builder consisting of joins, and a bitmask indicating the plan IDs
     /// that are contained within the current logical plan builder. The bitmask is used for determining join
     /// conditions to use when logical plan builders are joined together.
+    #[recursive::recursive]
     pub(crate) fn build_joins_from_join_order(
         &self,
         join_order: &JoinOrderTree,
@@ -740,6 +741,7 @@ impl JoinGraphBuilder {
     /// Joins that added conditions to `join_conds_to_resolve` will pop them off the stack after they have been resolved.
     /// Combining each of their resolved `left_on` conditions with their respective resolved `right_on` conditions produces
     /// a join edge between the relation used in the left condition and the relation used in the right condition.
+    #[recursive::recursive]
     fn process_node(&mut self, mut plan: &LogicalPlanRef) {
         // Go down the linear chain of Projects and Filters until we hit a join or an unreorderable operator.
         // If we hit a join, we should process all the Projects and Filters that we encountered before the join.

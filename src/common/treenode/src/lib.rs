@@ -121,6 +121,7 @@ pub trait TreeNode: Sized {
     /// TreeNodeVisitor::f_up(ChildNode2)
     /// TreeNodeVisitor::f_up(ParentNode)
     /// ```
+    #[recursive::recursive]
     fn visit<V: TreeNodeVisitor<Node = Self>>(&self, visitor: &mut V) -> Result<TreeNodeRecursion> {
         visitor
             .f_down(self)?
@@ -167,6 +168,7 @@ pub trait TreeNode: Sized {
     /// TreeNodeRewriter::f_up(ChildNode2)
     /// TreeNodeRewriter::f_up(ParentNode)
     /// ```
+    #[recursive::recursive]
     fn rewrite<R: TreeNodeRewriter<Node = Self>>(
         self,
         rewriter: &mut R,
@@ -189,6 +191,7 @@ pub trait TreeNode: Sized {
         &self,
         mut f: F,
     ) -> Result<TreeNodeRecursion> {
+        #[recursive::recursive]
         fn apply_impl<N: TreeNode, F: FnMut(&N) -> Result<TreeNodeRecursion>>(
             node: &N,
             f: &mut F,
@@ -223,6 +226,7 @@ pub trait TreeNode: Sized {
         self,
         mut f: F,
     ) -> Result<Transformed<Self>> {
+        #[recursive::recursive]
         fn transform_down_impl<N: TreeNode, F: FnMut(N) -> Result<Transformed<N>>>(
             node: N,
             f: &mut F,
@@ -255,6 +259,7 @@ pub trait TreeNode: Sized {
         self,
         mut f: F,
     ) -> Result<Transformed<Self>> {
+        #[recursive::recursive]
         fn transform_up_impl<N: TreeNode, F: FnMut(N) -> Result<Transformed<N>>>(
             node: N,
             f: &mut F,
@@ -378,6 +383,7 @@ pub trait TreeNode: Sized {
         mut f_down: FD,
         mut f_up: FU,
     ) -> Result<Transformed<Self>> {
+        #[recursive::recursive]
         fn transform_down_up_impl<
             N: TreeNode,
             FD: FnMut(N) -> Result<Transformed<N>>,
@@ -1914,4 +1920,73 @@ mod tests {
             TreeNodeRecursion::Stop
         )
     );
+
+    /// A chain of `depth` nodes, each holding the next as its only child.
+    fn chain(depth: usize) -> TestTreeNode<usize> {
+        (1..depth).fold(TestTreeNode::new(vec![], 0), |child, data| {
+            TestTreeNode::new(vec![child], data)
+        })
+    }
+
+    /// Takes a chain apart a level at a time: dropping it whole recurses once
+    /// per level, which is not what is under test.
+    fn dismantle(mut node: TestTreeNode<usize>) {
+        while let Some(child) = node.children.pop() {
+            node = child;
+        }
+    }
+
+    struct CountingVisitor(usize);
+
+    impl TreeNodeVisitor for CountingVisitor {
+        type Node = TestTreeNode<usize>;
+
+        fn f_down(&mut self, _node: &Self::Node) -> Result<TreeNodeRecursion> {
+            self.0 += 1;
+            Ok(TreeNodeRecursion::Continue)
+        }
+    }
+
+    struct KeepingRewriter;
+
+    impl TreeNodeRewriter for KeepingRewriter {
+        type Node = TestTreeNode<usize>;
+    }
+
+    #[test]
+    fn every_traversal_of_a_tree_deeper_than_its_threads_stack_completes() {
+        // Far more levels than a 256 KiB stack holds unguarded.
+        let depth = 100_000;
+        let reached = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || -> Result<Vec<usize>> {
+                let tree = chain(depth);
+                let mut applied = 0;
+                tree.apply(|_| {
+                    applied += 1;
+                    Ok(TreeNodeRecursion::Continue)
+                })?;
+                let mut visitor = CountingVisitor(0);
+                tree.visit(&mut visitor)?;
+                let tree = tree.rewrite(&mut KeepingRewriter)?.data;
+                let tree = tree.transform_down(|n| Ok(Transformed::no(n)))?.data;
+                let tree = tree.transform_up(|n| Ok(Transformed::no(n)))?.data;
+                let tree = tree
+                    .transform_down_up(|n| Ok(Transformed::no(n)), |n| Ok(Transformed::no(n)))?
+                    .data;
+                let mut kept = 0;
+                tree.apply(|_| {
+                    kept += 1;
+                    Ok(TreeNodeRecursion::Continue)
+                })?;
+                dismantle(tree);
+                Ok(vec![applied, visitor.0, kept])
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(reached, vec![depth; 3]);
+    }
 }

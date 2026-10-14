@@ -26,6 +26,7 @@ impl PushDownProjection {
         Self {}
     }
 
+    #[recursive::recursive]
     fn try_optimize_project(
         &self,
         projection: &Project,
@@ -727,6 +728,7 @@ impl PushDownProjection {
         }
     }
 
+    #[recursive::recursive]
     fn try_optimize_node(
         &self,
         plan: Arc<LogicalPlan>,

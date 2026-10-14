@@ -35,12 +35,14 @@ use daft_dsl::{
 use daft_functions_list::SeriesListExtension;
 use file_info::FileInfos;
 use futures::{StreamExt, TryStreamExt, future::try_join_all};
+use growing_stack::GrowingStack;
 use num_traits::ToPrimitive;
 pub mod column;
 #[cfg(feature = "python")]
 pub mod ffi;
 mod file_info;
 mod growable;
+mod growing_stack;
 mod ops;
 mod preview;
 mod probeable;
@@ -879,8 +881,21 @@ impl RecordBatch {
             .await
     }
 
+    /// Evaluates `expr` against this batch, recording into `metrics`.
+    ///
+    /// Each level of the expression is polled on a stack grown when it runs
+    /// low, so an expression of any depth evaluates without overflowing the
+    /// thread it runs on.
+    pub fn eval_expression_async_with_metrics<'a>(
+        &'a self,
+        expr: BoundExpr,
+        metrics: &'a mut dyn MetricsCollector,
+    ) -> impl Future<Output = DaftResult<Series>> + Send + 'a {
+        GrowingStack(self.eval_expression_async_level(expr, metrics))
+    }
+
     #[async_recursion::async_recursion]
-    pub async fn eval_expression_async_with_metrics(
+    async fn eval_expression_async_level(
         &self,
         expr: BoundExpr,
         metrics: &mut dyn MetricsCollector,
@@ -1292,6 +1307,7 @@ impl RecordBatch {
         self.eval_expression_internal(expr, metrics)
     }
 
+    #[recursive::recursive]
     fn eval_expression_internal(
         &self,
         expr: &BoundExpr,

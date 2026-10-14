@@ -1,5 +1,6 @@
 [dependencies]
 common-error = {path = "../error", default-features = false}
+recursive = {workspace = true}
 
 [features]
 python = ["common-error/python"]

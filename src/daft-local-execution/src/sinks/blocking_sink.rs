@@ -504,6 +504,7 @@ impl<Op: BlockingSink + 'static> TreeDisplay for BlockingSinkNode<Op> {
         display
     }
 
+    #[recursive::recursive]
     fn repr_json(&self) -> serde_json::Value {
         let children: Vec<serde_json::Value> = self
             .get_children()
@@ -516,8 +517,9 @@ impl<Op: BlockingSink + 'static> TreeDisplay for BlockingSinkNode<Op> {
             "category": "BlockingSink",
             "type": self.op.op_type().to_string(),
             "name": self.name(),
-            "children": children,
         });
+        // Moved in, not copied: a copy would recurse once per level below.
+        json["children"] = serde_json::Value::Array(children);
 
         if let StatsState::Materialized(stats) = &self.plan_stats {
             json["approx_stats"] = serde_json::json!(stats);
@@ -544,6 +546,7 @@ impl<Op: BlockingSink + 'static> PipelineNode for BlockingSinkNode<Op> {
         self.node_info.name.clone()
     }
 
+    #[recursive::recursive]
     fn propagate_morsel_size_requirement(
         &mut self,
         _downstream_requirement: MorselSizeRequirement,
@@ -553,6 +556,7 @@ impl<Op: BlockingSink + 'static> PipelineNode for BlockingSinkNode<Op> {
             .propagate_morsel_size_requirement(default_morsel_size, default_morsel_size);
     }
 
+    #[recursive::recursive]
     fn start(
         self: Box<Self>,
         _maintain_order: bool,

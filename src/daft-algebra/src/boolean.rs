@@ -96,6 +96,7 @@ pub fn to_dnf(expr: ExprRef) -> ExprRef {
 
 /// Push all negations into boolean atoms by applying De Morgan's law + eliminate double negations
 fn apply_de_morgans(expr: ExprRef) -> Transformed<ExprRef> {
+    #[recursive::recursive]
     fn transform_fn(e: ExprRef) -> Transformed<ExprRef> {
         match e.as_ref() {
             Expr::Not(ne) => match ne.as_ref() {

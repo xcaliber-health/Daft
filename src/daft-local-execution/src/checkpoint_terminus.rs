@@ -92,6 +92,7 @@ impl TreeDisplay for CheckpointTerminusNode {
         display
     }
 
+    #[recursive::recursive]
     fn repr_json(&self) -> serde_json::Value {
         let children: Vec<serde_json::Value> = self
             .get_children()
@@ -99,13 +100,15 @@ impl TreeDisplay for CheckpointTerminusNode {
             .map(|child| child.repr_json())
             .collect();
 
-        serde_json::json!({
+        let mut json = serde_json::json!({
             "id": self.node_id(),
             "category": "StreamingSink",
             "type": NodeType::StageCheckpointKeys.to_string(),
             "name": self.name(),
-            "children": children,
-        })
+        });
+        // Moved in, not copied: a copy would recurse once per level below.
+        json["children"] = serde_json::Value::Array(children);
+        json
     }
 
     fn get_children(&self) -> Vec<&dyn TreeDisplay> {
@@ -129,6 +132,7 @@ impl PipelineNode for CheckpointTerminusNode {
         self.node_info.name.clone()
     }
 
+    #[recursive::recursive]
     fn propagate_morsel_size_requirement(
         &mut self,
         downstream_requirement: MorselSizeRequirement,
@@ -139,6 +143,7 @@ impl PipelineNode for CheckpointTerminusNode {
             .propagate_morsel_size_requirement(downstream_requirement, default_requirement);
     }
 
+    #[recursive::recursive]
     fn start(
         self: Box<Self>,
         maintain_order: bool,

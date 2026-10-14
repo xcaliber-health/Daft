@@ -1,10 +1,11 @@
-use std::fmt::Write;
+use std::fmt::{Display, Write};
 
 use itertools::Itertools;
 
 use super::{Expr, ExprRef, Operator};
 
 /// Display for Expr::BinaryOp
+#[recursive::recursive]
 pub fn expr_binary_op_display_without_formatter(
     op: &Operator,
     left: &ExprRef,
@@ -23,6 +24,7 @@ pub fn expr_binary_op_display_without_formatter(
 }
 
 /// Display for Expr::IsIn
+#[recursive::recursive]
 pub fn expr_is_in_display_without_formatter(
     expr: &ExprRef,
     inputs: &[ExprRef],
@@ -40,6 +42,7 @@ pub fn expr_is_in_display_without_formatter(
 }
 
 /// Display for Expr::List
+#[recursive::recursive]
 pub fn expr_list_display_without_formatter(
     items: &[ExprRef],
 ) -> std::result::Result<String, std::fmt::Error> {
@@ -50,4 +53,18 @@ pub fn expr_list_display_without_formatter(
         items.iter().map(|x| x.to_string()).join(", ")
     )?;
     Ok(f)
+}
+
+/// Renders `T` on a stack grown when the current one runs low.
+///
+/// An expression renders each of its children inside its own rendering, so
+/// a deep expression recurses once per level; this keeps that recursion from
+/// overflowing the thread it renders on.
+pub struct GrowingStack<T>(pub T);
+
+impl<T: Display> Display for GrowingStack<T> {
+    #[recursive::recursive]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
 }

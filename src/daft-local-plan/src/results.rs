@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionStats {
     pub query_id: QueryID,
-    pub query_plan: Option<serde_json::Value>,
+    /// The executed plan, rendered as JSON.
+    pub query_plan: Option<Arc<str>>,
     pub nodes: Vec<(Arc<NodeInfo>, StatSnapshot)>,
     /// Files skipped due to `ignore_corrupt_files=True`: (path, reason, partial).
     pub skipped_corrupt_files: Vec<(String, String, bool)>,
@@ -45,7 +46,7 @@ impl ExecutionStats {
         self
     }
 
-    pub fn with_query_plan(mut self, query_plan: serde_json::Value) -> Self {
+    pub fn with_query_plan(mut self, query_plan: Arc<str>) -> Self {
         self.query_plan = Some(query_plan);
         self
     }

@@ -46,6 +46,7 @@ fn is_rewriteable(plan: &LogicalPlan) -> bool {
 }
 
 impl OptimizerRule for EliminateCrossJoin {
+    #[recursive::recursive]
     fn try_optimize(&self, plan: Arc<LogicalPlan>) -> DaftResult<Transformed<Arc<LogicalPlan>>> {
         let schema = plan.schema();
         let mut possible_join_keys = JoinKeySet::new();
@@ -128,6 +129,7 @@ fn rewrite_children(
     plan.map_children(|input| optimizer.try_optimize(input))
 }
 
+#[recursive::recursive]
 fn flatten_join_inputs(
     plan: LogicalPlan,
     possible_join_keys: &mut JoinKeySet,
@@ -166,6 +168,7 @@ fn flatten_join_inputs(
 /// `flatten_join_inputs`
 ///
 /// Must stay in sync with `flatten_join_inputs`
+#[recursive::recursive]
 fn can_flatten_join_inputs(plan: &LogicalPlan) -> bool {
     // can only flatten inner / cross joins
     match plan {
@@ -190,6 +193,7 @@ fn can_flatten_join_inputs(plan: &LogicalPlan) -> bool {
 }
 
 /// Extract join keys from a WHERE clause
+#[recursive::recursive]
 fn extract_possible_join_keys(expr: &Expr, join_keys: &mut JoinKeySet) {
     if let Expr::BinaryOp { left, op, right } = expr {
         match op {
@@ -221,6 +225,7 @@ fn extract_possible_join_keys(expr: &Expr, join_keys: &mut JoinKeySet) {
 /// # Returns
 /// * `Some()` when there are few remaining predicates in filter_expr
 /// * `None` otherwise
+#[recursive::recursive]
 fn remove_join_expressions(expr: ExprRef, join_keys: &JoinKeySet) -> Option<Expr> {
     match Arc::unwrap_or_clone(expr) {
         Expr::BinaryOp {

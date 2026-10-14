@@ -338,6 +338,7 @@ impl<Op: IntermediateOperator + 'static> TreeDisplay for IntermediateNode<Op> {
         display
     }
 
+    #[recursive::recursive]
     fn repr_json(&self) -> serde_json::Value {
         let children: Vec<serde_json::Value> = self
             .get_children()
@@ -350,8 +351,9 @@ impl<Op: IntermediateOperator + 'static> TreeDisplay for IntermediateNode<Op> {
             "category": "Intermediate",
             "type": self.intermediate_op.op_type().to_string(),
             "name": self.name(),
-            "children": children,
         });
+        // Moved in, not copied: a copy would recurse once per level below.
+        json["children"] = serde_json::Value::Array(children);
 
         if let StatsState::Materialized(stats) = &self.plan_stats {
             json["approx_stats"] = serde_json::json!(stats);
@@ -378,6 +380,7 @@ impl<Op: IntermediateOperator + 'static> PipelineNode for IntermediateNode<Op> {
         self.node_info.name.clone()
     }
 
+    #[recursive::recursive]
     fn propagate_morsel_size_requirement(
         &mut self,
         downstream_requirement: MorselSizeRequirement,
@@ -395,6 +398,7 @@ impl<Op: IntermediateOperator + 'static> PipelineNode for IntermediateNode<Op> {
         );
     }
 
+    #[recursive::recursive]
     fn start(
         self: Box<Self>,
         maintain_order: bool,

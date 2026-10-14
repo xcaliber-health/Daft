@@ -32,7 +32,7 @@ use daft_core::{
 };
 use derive_more::Display;
 use itertools::Itertools;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::functions::FunctionExpr;
 use crate::{
@@ -219,15 +219,16 @@ impl std::fmt::Display for Column {
 pub type ExprRef = Arc<Expr>;
 
 #[derive(Display, Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(remote = "Self")]
 #[allow(clippy::large_enum_variant)]
 pub enum Expr {
     #[display("{_0}")]
     Column(Column),
 
-    #[display("{_0} as {_1}")]
+    #[display("{} as {_1}", display::GrowingStack(_0))]
     Alias(ExprRef, Arc<str>),
 
-    #[display("{_0}")]
+    #[display("{}", display::GrowingStack(_0))]
     Agg(AggExpr),
 
     #[display("{}", display::expr_binary_op_display_without_formatter(op, left, right)?)]
@@ -237,7 +238,7 @@ pub enum Expr {
         right: ExprRef,
     },
 
-    #[display("{}", if *_2 { format!("try_cast({} as {})", _0, _1) } else { format!("cast({} as {})", _0, _1) })]
+    #[display("{}", if *_2 { format!("try_cast({} as {})", display::GrowingStack(_0), _1) } else { format!("cast({} as {})", display::GrowingStack(_0), _1) })]
     Cast(ExprRef, DataType, bool),
 
     #[display("{}", function_display_without_formatter(func, inputs)?)]
@@ -247,32 +248,41 @@ pub enum Expr {
     },
 
     // Over represents a window function as it is actually evaluated (since it requires a window spec)
-    #[display("{_0} over {_1}")]
+    #[display("{} over {_1}", display::GrowingStack(_0))]
     Over(WindowExpr, Arc<window::WindowSpec>),
 
     // WindowFunction represents a window function as an expression, this alone cannot be evaluated since
     // it requires a window spec. This variant only exists for constructing window functions in the
     // DataFrame API and should not appear in logical or physical plans. It must be converted to an Over
     // expression with a window spec before evaluation.
-    #[display("window({_0})")]
+    #[display("window({})", display::GrowingStack(_0))]
     WindowFunction(WindowExpr),
 
-    #[display("not({_0})")]
+    #[display("not({})", display::GrowingStack(_0))]
     Not(ExprRef),
 
-    #[display("is_null({_0})")]
+    #[display("is_null({})", display::GrowingStack(_0))]
     IsNull(ExprRef),
 
-    #[display("not_null({_0})")]
+    #[display("not_null({})", display::GrowingStack(_0))]
     NotNull(ExprRef),
 
-    #[display("fill_null({_0}, {_1})")]
+    #[display(
+        "fill_null({}, {})",
+        display::GrowingStack(_0),
+        display::GrowingStack(_1)
+    )]
     FillNull(ExprRef, ExprRef),
 
     #[display("{}", display::expr_is_in_display_without_formatter(_0, _1)?)]
     IsIn(ExprRef, Vec<ExprRef>),
 
-    #[display("{_0} in [{_1},{_2}]")]
+    #[display(
+        "{} in [{},{}]",
+        display::GrowingStack(_0),
+        display::GrowingStack(_1),
+        display::GrowingStack(_2)
+    )]
     Between(ExprRef, ExprRef, ExprRef),
 
     #[display("{}", display::expr_list_display_without_formatter(_0)?)]
@@ -281,20 +291,25 @@ pub enum Expr {
     #[display("lit({_0})")]
     Literal(Literal),
 
-    #[display("if [{predicate}] then [{if_true}] else [{if_false}]")]
+    #[display(
+        "if [{}] then [{}] else [{}]",
+        display::GrowingStack(predicate),
+        display::GrowingStack(if_true),
+        display::GrowingStack(if_false)
+    )]
     IfElse {
         if_true: ExprRef,
         if_false: ExprRef,
         predicate: ExprRef,
     },
 
-    #[display("{_0}")]
+    #[display("{}", display::GrowingStack(_0))]
     ScalarFn(ScalarFn),
 
     #[display("subquery {_0}")]
     Subquery(Subquery),
 
-    #[display("{_0} in {_1}")]
+    #[display("{} in {_1}", display::GrowingStack(_0))]
     InSubquery(ExprRef, Subquery),
 
     #[display("exists {_0}")]
@@ -303,8 +318,25 @@ pub enum Expr {
     #[display("coalesce({})", display::expr_list_display_without_formatter(_0)?)]
     Coalesce(Vec<ExprRef>),
 
-    #[display("vllm({_0})")]
+    #[display("vllm({})", display::GrowingStack(_0))]
     VLLM(VLLMExpr),
+}
+
+// An expression nests one level per operation, and a derived (de)serializer recurses
+// once per level. Each level is (de)serialized on a stack grown when it runs
+// low, so an expression of any depth crosses the wire.
+impl Serialize for Expr {
+    #[recursive::recursive]
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Expr::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Expr {
+    #[recursive::recursive]
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Expr::deserialize(deserializer)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -1548,6 +1580,24 @@ impl Expr {
 
     #[deprecated(since = "TBD", note = "name-referenced columns")]
     pub fn semantic_id(&self, schema: &Schema) -> FieldID {
+        if self.is_leaf() {
+            #[allow(deprecated)]
+            self.semantic_id_of_level(schema)
+        } else {
+            #[allow(deprecated)]
+            self.semantic_id_of_nested(schema)
+        }
+    }
+
+    #[deprecated(since = "TBD", note = "name-referenced columns")]
+    #[recursive::recursive]
+    fn semantic_id_of_nested(&self, schema: &Schema) -> FieldID {
+        #[allow(deprecated)]
+        self.semantic_id_of_level(schema)
+    }
+
+    #[deprecated(since = "TBD", note = "name-referenced columns")]
+    fn semantic_id_of_level(&self, schema: &Schema) -> FieldID {
         match self {
             // Base case - anonymous column reference.
             // Look up the column name in the provided schema and get its field ID.
@@ -1761,6 +1811,7 @@ impl Expr {
         }
     }
 
+    #[recursive::recursive]
     pub fn display_name(&self, schema: &Schema) -> DaftResult<String> {
         match self {
             // Base case - anonymous column reference.
@@ -2104,7 +2155,27 @@ impl Expr {
         }
     }
 
+    /// Whether this expression has no child expressions, so a recursion over
+    /// it ends here and needs no room to go deeper.
+    fn is_leaf(&self) -> bool {
+        matches!(self, Self::Column(_) | Self::Literal(_))
+    }
+
     pub fn to_field(&self, schema: &Schema) -> DaftResult<Field> {
+        if self.is_leaf() {
+            self.to_field_of_level(schema)
+        } else {
+            self.to_field_of_nested(schema)
+        }
+    }
+
+    /// Types a level that has children, on a stack grown when it runs low.
+    #[recursive::recursive]
+    fn to_field_of_nested(&self, schema: &Schema) -> DaftResult<Field> {
+        self.to_field_of_level(schema)
+    }
+
+    fn to_field_of_level(&self, schema: &Schema) -> DaftResult<Field> {
         match self {
             Self::Alias(expr, name) => Ok(Field::new(name.as_ref(), expr.get_type(schema)?)),
             Self::Agg(agg_expr) => agg_expr.to_field(schema),

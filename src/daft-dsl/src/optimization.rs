@@ -16,6 +16,7 @@ pub fn get_required_columns(e: &ExprRef) -> Vec<String> {
     cols
 }
 
+#[recursive::recursive]
 pub fn requires_computation(e: &Expr) -> bool {
     // Returns whether or not this expression runs any computation on the underlying data
     match e {

@@ -482,6 +482,7 @@ fn try_optimize_project(
     recursive_optimize_project(&aliased_projection, plan, 0)
 }
 
+#[recursive::recursive]
 fn recursive_optimize_project(
     projection: &Project,
     plan: Arc<LogicalPlan>,

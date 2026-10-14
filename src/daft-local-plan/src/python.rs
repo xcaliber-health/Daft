@@ -124,10 +124,7 @@ impl PyExecutionStats {
 
     #[getter]
     pub fn query_plan(&self) -> Option<String> {
-        self.inner
-            .query_plan
-            .clone()
-            .map(|plan| serde_json::to_string(&plan).expect("Failed to serialize query plan"))
+        self.inner.query_plan.as_deref().map(str::to_string)
     }
 
     fn encode(&self) -> Vec<u8> {

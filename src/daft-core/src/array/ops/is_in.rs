@@ -1,5 +1,6 @@
-use std::collections::{BTreeSet, HashSet};
+use std::{collections::BTreeSet, sync::Arc};
 
+use arrow::{array::Array, buffer::BooleanBuffer};
 use common_error::DaftResult;
 use common_hashable_float_wrapper::FloatWrapper;
 
@@ -9,21 +10,26 @@ use crate::{
     datatypes::prelude::*,
 };
 
+/// Whether each value of `$self` is one of the non-null values of `$rhs`;
+/// null where `$self` is null.
+///
+/// The membership bits are written straight into a bitmap, one per row, and
+/// the input's validity is reused as the result's, so a row costs one hash
+/// lookup and no per-row allocation.
 macro_rules! collect_to_set_and_check_membership {
     ($self:expr, $rhs:expr) => {{
         let rhs_arrow = $rhs.as_arrow()?;
         let set = rhs_arrow
             .iter()
-            .filter_map(|item| item)
-            .collect::<HashSet<_>>();
+            .flatten()
+            .collect::<hashbrown::HashSet<_>>();
 
         let self_arrow = $self.as_arrow()?;
-        let result = self_arrow
-            .iter()
-            .map(|option| option.map(|value| set.contains(&value)));
-
-        let bools: BooleanArray = result.collect();
-        Ok(bools.rename($self.name()))
+        let members = BooleanBuffer::collect_bool(self_arrow.len(), |row| {
+            set.contains(&self_arrow.value(row))
+        });
+        let mask = arrow::array::BooleanArray::new(members, self_arrow.nulls().cloned());
+        BooleanArray::from_arrow(Field::new($self.name(), DataType::Boolean), Arc::new(mask))
     }};
 }
 

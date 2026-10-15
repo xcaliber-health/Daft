@@ -235,6 +235,8 @@ def set_execution_config(
     parquet_target_filesize: int | None = None,
     parquet_target_row_group_size: int | None = None,
     parquet_page_index: bool | None = None,
+    parquet_footer_cache_bytes: int | None = None,
+    parquet_footer_cache_mutable_files: bool | None = None,
     parquet_inflation_factor: float | None = None,
     csv_target_filesize: int | None = None,
     csv_inflation_factor: float | None = None,
@@ -300,6 +302,13 @@ def set_execution_config(
         parquet_page_index: Whether a filtered Parquet read loads a file's page index, to skip the pages
             the filter's statistics rule out and fetch only the pages holding the rows it keeps. A file
             without a page index is read as before. Defaults to True.
+        parquet_footer_cache_bytes: The most decoded Parquet footer metadata the process keeps between
+            reads, so a read of a file it has read before, while the file is unchanged, fetches no footer.
+            Entries are kept per IO configuration and evicted least recently used first; 0 keeps none.
+            Defaults to 50MB.
+        parquet_footer_cache_mutable_files: Whether footers of files that may be rewritten in place (path
+            and glob reads) are kept too, checked by size and last-modified time. Files a table marks
+            immutable (Iceberg data files) are kept regardless, checked by size. Defaults to False.
         parquet_inflation_factor: Inflation Factor of parquet files (In-Memory-Size / File-Size) ratio. Defaults to 3.0
         csv_target_filesize: Target File Size when writing out CSV Files. Defaults to 512MB
         csv_inflation_factor: Inflation Factor of CSV files (In-Memory-Size / File-Size) ratio. Defaults to 0.5
@@ -357,6 +366,8 @@ def set_execution_config(
             parquet_target_filesize=parquet_target_filesize,
             parquet_target_row_group_size=parquet_target_row_group_size,
             parquet_page_index=parquet_page_index,
+            parquet_footer_cache_bytes=parquet_footer_cache_bytes,
+            parquet_footer_cache_mutable_files=parquet_footer_cache_mutable_files,
             parquet_inflation_factor=parquet_inflation_factor,
             csv_target_filesize=csv_target_filesize,
             csv_inflation_factor=csv_inflation_factor,

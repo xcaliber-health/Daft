@@ -12,7 +12,9 @@ use daft_recordbatch::RecordBatch;
 use futures::{StreamExt, TryFutureExt, TryStreamExt, stream::BoxStream};
 use serde::{Deserialize, Serialize};
 
-use crate::{DaftParquetMetadata, infer_schema_from_daft_metadata};
+use crate::{
+    DaftParquetMetadata, FileVersion, FooterCacheSettings, infer_schema_from_daft_metadata,
+};
 
 /// (path, reason, partial). `partial=true` means some batches were already emitted before
 /// corruption was detected; the file is not fully skipped.
@@ -102,10 +104,14 @@ pub struct ParquetReadOptions {
     pub field_id_mapping: Option<Arc<BTreeMap<i32, Field>>>,
     pub delete_rows: Option<Vec<i64>>,
     pub batch_size: Option<usize>,
-    // TODO(arrow-rs): wire this through to the arrowrs reader to skip redundant footer reads.
-    // The arrowrs reader currently reads its own metadata via ArrowReaderMetadata::load(),
-    // but callers (e.g. scan_task.rs) already have pre-fetched DaftParquetMetadata from planning.
+    /// The file's metadata, already read by the caller. A remote read uses
+    /// it in place of fetching the footer when it covers the whole file.
     pub metadata: Option<Arc<DaftParquetMetadata>>,
+    /// What the caller knows of the file's version. A remote read with it
+    /// asks the store for no size, and may take the footer from the cache.
+    pub file_version: Option<FileVersion>,
+    /// How a remote read may use the process-wide footer cache.
+    pub footer_cache: FooterCacheSettings,
     pub ignore_corrupt_files: bool,
     pub skipped_corrupt_files: SkippedCorruptFilesCollector,
 }
@@ -182,6 +188,8 @@ fn single_opts_for(opts: &ParquetBulkReadOptions, i: usize) -> ParquetReadOption
         delete_rows: per.delete_rows,
         batch_size: opts.batch_size,
         metadata: per.metadata,
+        file_version: None,
+        footer_cache: FooterCacheSettings::default(),
         ignore_corrupt_files: false,
         skipped_corrupt_files: None,
     }

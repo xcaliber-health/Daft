@@ -127,6 +127,7 @@ impl PyDataSourceTask {
                 chunk_spec: None,
                 iceberg_delete_files: None,
                 parquet_metadata: None,
+                version: None,
             },
         };
 
@@ -305,6 +306,7 @@ pub mod pylib {
     use common_error::DaftResult;
     use common_py_serde::impl_bincode_py_state_serialization;
     use daft_dsl::{ExprRef, expr::bound_expr::BoundExpr, python::PyExpr};
+    use daft_parquet::FileVersion;
     use daft_recordbatch::{RecordBatch, python::PyRecordBatch};
     use daft_schema::{python::schema::PySchema, schema::SchemaRef};
     use daft_stats::{PartitionSpec, TableMetadata, TableStatistics};
@@ -729,7 +731,8 @@ pub mod pylib {
             iceberg_delete_files=None,
             pushdowns=None,
             partition_values=None,
-            stats=None
+            stats=None,
+            immutable_file=false
         ))]
         pub fn catalog_scan_task(
             file: String,
@@ -742,6 +745,7 @@ pub mod pylib {
             pushdowns: Option<PyPushdowns>,
             partition_values: Option<PyRecordBatch>,
             stats: Option<PyRecordBatch>,
+            immutable_file: bool,
         ) -> PyResult<Option<Self>> {
             if let Some(ref pvalues) = partition_values
                 && let Some(Some(partition_filters)) =
@@ -786,6 +790,15 @@ pub mod pylib {
                     chunk_spec: None,
                     iceberg_delete_files,
                     parquet_metadata: None,
+                    // A table format that never rewrites a file in place
+                    // names its exact size in its manifest.
+                    version: size_bytes
+                        .filter(|_| immutable_file)
+                        .map(|size| FileVersion {
+                            size,
+                            last_modified: None,
+                            immutable: true,
+                        }),
                 },
             };
 
@@ -983,6 +996,7 @@ pub mod pylib {
                 chunk_spec: None,
                 iceberg_delete_files: None,
                 parquet_metadata: None,
+                version: None,
             },
         };
         let st = ScanTask::new(

@@ -104,6 +104,8 @@ impl PyDaftExecutionConfig {
         parquet_target_filesize=None,
         parquet_target_row_group_size=None,
         parquet_page_index=None,
+        parquet_footer_cache_bytes=None,
+        parquet_footer_cache_mutable_files=None,
         parquet_inflation_factor=None,
         csv_target_filesize=None,
         csv_inflation_factor=None,
@@ -148,6 +150,8 @@ impl PyDaftExecutionConfig {
         parquet_target_filesize: Option<usize>,
         parquet_target_row_group_size: Option<usize>,
         parquet_page_index: Option<bool>,
+        parquet_footer_cache_bytes: Option<usize>,
+        parquet_footer_cache_mutable_files: Option<bool>,
         parquet_inflation_factor: Option<f64>,
         csv_target_filesize: Option<usize>,
         csv_inflation_factor: Option<f64>,
@@ -221,6 +225,12 @@ impl PyDaftExecutionConfig {
         }
         if let Some(parquet_page_index) = parquet_page_index {
             config.parquet_page_index = parquet_page_index;
+        }
+        if let Some(parquet_footer_cache_bytes) = parquet_footer_cache_bytes {
+            config.parquet_footer_cache_bytes = parquet_footer_cache_bytes;
+        }
+        if let Some(parquet_footer_cache_mutable_files) = parquet_footer_cache_mutable_files {
+            config.parquet_footer_cache_mutable_files = parquet_footer_cache_mutable_files;
         }
         if let Some(parquet_inflation_factor) = parquet_inflation_factor {
             config.parquet_inflation_factor = parquet_inflation_factor;
@@ -429,6 +439,16 @@ impl PyDaftExecutionConfig {
     #[getter]
     fn get_parquet_page_index(&self) -> PyResult<bool> {
         Ok(self.config.parquet_page_index)
+    }
+
+    #[getter]
+    fn get_parquet_footer_cache_bytes(&self) -> PyResult<usize> {
+        Ok(self.config.parquet_footer_cache_bytes)
+    }
+
+    #[getter]
+    fn get_parquet_footer_cache_mutable_files(&self) -> PyResult<bool> {
+        Ok(self.config.parquet_footer_cache_mutable_files)
     }
 
     #[getter]

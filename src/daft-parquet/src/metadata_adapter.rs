@@ -24,6 +24,8 @@ pub struct DaftParquetMetadata {
     inner: Arc<ParquetMetaData>,
     /// Maps position `i` in `inner.row_groups()` → original row group index in the file.
     original_indices: Vec<usize>,
+    /// Whether `inner` holds every row group of the file, as its footer does.
+    whole_file: bool,
 }
 
 impl DaftParquetMetadata {
@@ -33,6 +35,7 @@ impl DaftParquetMetadata {
         Self {
             inner: metadata,
             original_indices: (0..n).collect(),
+            whole_file: true,
         }
     }
 
@@ -79,6 +82,7 @@ impl DaftParquetMetadata {
         Self {
             inner: Arc::new(ParquetMetaData::new(new_file_metadata, rgs)),
             original_indices: indices,
+            whole_file: false,
         }
     }
 
@@ -87,13 +91,19 @@ impl DaftParquetMetadata {
         &self.inner
     }
 
+    /// The file's footer as read, or `None` when this metadata keeps only
+    /// some of the file's row groups and so cannot stand in for the footer.
+    pub fn as_whole_file(&self) -> Option<&Arc<ParquetMetaData>> {
+        self.whole_file.then_some(&self.inner)
+    }
+
     /// Convenience accessor for the parquet schema descriptor.
     pub fn schema_descriptor(&self) -> &parquet::schema::types::SchemaDescriptor {
         self.inner.file_metadata().schema_descr()
     }
 }
 
-// Custom Serialize: write footer thrift bytes + original_indices + num_rows
+// Custom Serialize: write footer thrift bytes + original_indices + num_rows + whole_file
 impl Serialize for DaftParquetMetadata {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeTuple;
@@ -109,11 +119,12 @@ impl Serialize for DaftParquetMetadata {
         // (e.g. after clone_with_row_groups with a subset).
         let num_rows = self.inner.file_metadata().num_rows();
 
-        // Serialize as (footer_bytes, original_indices, num_rows)
-        let mut tup = serializer.serialize_tuple(3)?;
+        // Serialize as (footer_bytes, original_indices, num_rows, whole_file)
+        let mut tup = serializer.serialize_tuple(4)?;
         tup.serialize_element(&buf)?;
         tup.serialize_element(&self.original_indices)?;
         tup.serialize_element(&num_rows)?;
+        tup.serialize_element(&self.whole_file)?;
         tup.end()
     }
 }
@@ -121,8 +132,12 @@ impl Serialize for DaftParquetMetadata {
 // Custom Deserialize: parse footer bytes → ParquetMetaData
 impl<'de> Deserialize<'de> for DaftParquetMetadata {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let (footer_bytes, original_indices, num_rows): (Vec<u8>, Vec<usize>, i64) =
-            Deserialize::deserialize(deserializer)?;
+        let (footer_bytes, original_indices, num_rows, whole_file): (
+            Vec<u8>,
+            Vec<usize>,
+            i64,
+            bool,
+        ) = Deserialize::deserialize(deserializer)?;
 
         // The footer format written by ParquetMetaDataWriter is:
         //   [optional col/offset indexes] [thrift FileMetaData] [4-byte LE metadata length] [PAR1]
@@ -163,6 +178,7 @@ impl<'de> Deserialize<'de> for DaftParquetMetadata {
         Ok(Self {
             inner: Arc::new(metadata),
             original_indices,
+            whole_file,
         })
     }
 }
@@ -174,6 +190,7 @@ impl PartialEq for DaftParquetMetadata {
             && self.version() == other.version()
             && self.num_row_groups() == other.num_row_groups()
             && self.original_indices == other.original_indices
+            && self.whole_file == other.whole_file
     }
 }
 
@@ -281,6 +298,22 @@ mod tests {
             bincode::serde::decode_from_slice(&adapter_bytes, config).unwrap();
         assert_eq!(roundtripped.num_rows(), 1000);
         assert_eq!(roundtripped.version(), 2);
+    }
+
+    #[test]
+    fn only_a_whole_files_metadata_stands_in_for_its_footer() {
+        let config = bincode::config::legacy();
+        let whole = DaftParquetMetadata::from_arrowrs(make_test_metadata(1000));
+        let trimmed = whole.clone_with_row_groups(0, RowGroupList::new());
+
+        for (metadata, stands_in) in [(whole, true), (trimmed, false)] {
+            let bytes = bincode::serde::encode_to_vec(&metadata, config).unwrap();
+            let (roundtripped, _): (DaftParquetMetadata, _) =
+                bincode::serde::decode_from_slice(&bytes, config).unwrap();
+
+            assert_eq!(metadata.as_whole_file().is_some(), stands_in);
+            assert_eq!(roundtripped.as_whole_file().is_some(), stands_in);
+        }
     }
 
     #[test]

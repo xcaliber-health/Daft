@@ -7,7 +7,7 @@ use daft_core::{prelude::Utf8Array, series::IntoSeries};
 use daft_csv::CsvParseOptions;
 use daft_dsl::expr::bound_expr::BoundExpr;
 use daft_io::{FileMetadata, FileType, IOClient, IOStatsContext, IOStatsRef, parse_url};
-use daft_parquet::read::ParquetSchemaInferenceOptions;
+use daft_parquet::{DaftParquetMetadata, FileVersion, read::ParquetSchemaInferenceOptions};
 use daft_recordbatch::RecordBatch;
 use daft_schema::{
     dtype::DataType,
@@ -39,7 +39,46 @@ pub struct GlobScanOperator {
     skip_glob: bool,
     // When creating the glob scan operator, we might collect file metadata for the first file during schema inference.
     // Cache this metadata (along with the first filepath) so we can use it to populate the stats for the first scan task.
-    first_metadata: Option<(String, TableMetadata)>,
+    first_metadata: Option<FirstFile>,
+}
+
+/// The file schema inference read, and what it learned of it.
+#[derive(Debug)]
+struct FirstFile {
+    path: String,
+    /// The file's version as listed when its footer was read.
+    version: Option<FileVersion>,
+    table: TableMetadata,
+    /// The footer schema inference read, handed to the file's read so it
+    /// fetches no footer again.
+    footer: Arc<DaftParquetMetadata>,
+}
+
+impl FirstFile {
+    /// The footer to hand a read of `path` at `version`: only when the file
+    /// is listed now as it was when its footer was read, by size and
+    /// last-modified time, so a file rewritten since is read afresh.
+    fn footer_for(
+        &self,
+        path: &str,
+        version: Option<FileVersion>,
+    ) -> Option<Arc<DaftParquetMetadata>> {
+        let unchanged = matches!(
+            (self.version, version),
+            (Some(then), Some(now)) if then.last_modified.is_some() && then == now
+        );
+        (unchanged && path == self.path).then(|| self.footer.clone())
+    }
+}
+
+/// The version a listing gives a file: its size, and its last-modified time
+/// when the store reports one.
+fn listed_version(file: &FileMetadata) -> Option<FileVersion> {
+    file.size.map(|size| FileVersion {
+        size,
+        last_modified: file.last_modified,
+        immutable: false,
+    })
 }
 
 /// Wrapper struct that implements a sync Iterator for a BoxStream
@@ -187,16 +226,15 @@ impl GlobScanOperator {
             )
             .await?;
 
-            let FileMetadata {
-                filepath: first_filepath,
-                ..
-            } = match paths.next().await {
+            let first_listed = match paths.next().await {
                 Some(file_metadata) => file_metadata,
                 None => Err(Error::GlobNoMatch {
                     glob_path: first_glob_path.clone(),
                 }
                 .into()),
             }?;
+            let first_version = listed_version(&first_listed);
+            let first_filepath = first_listed.filepath;
 
             // Infer schema from the candidate file, with minimal behavior: only skip empty JSON files when configured.
             let (inferred_schema, first_metadata, first_filepath) = match file_format_config
@@ -226,8 +264,8 @@ impl GlobScanOperator {
                     )
                     .await;
 
-                    let (schema, metadata, filepath) = match try_infer {
-                        Ok((schema, meta)) => (schema, meta, first_filepath),
+                    let (schema, metadata, filepath, version) = match try_infer {
+                        Ok((schema, meta)) => (schema, meta, first_filepath, first_version),
                         Err(e)
                             if ignore_corrupt_files
                                 && daft_parquet::read::is_parquet_corrupt(&e) =>
@@ -249,7 +287,9 @@ impl GlobScanOperator {
                             .await?;
                             let mut found = None;
                             while let Some(fm) = glob_stream.next().await {
-                                let FileMetadata { filepath, .. } = fm?;
+                                let fm = fm?;
+                                let version = listed_version(&fm);
+                                let filepath = fm.filepath;
                                 if filepath == first_filepath {
                                     continue; // already tried this one
                                 }
@@ -265,7 +305,7 @@ impl GlobScanOperator {
                                 .await
                                 {
                                     Ok((schema, meta)) => {
-                                        found = Some((schema, meta, filepath));
+                                        found = Some((schema, meta, filepath, version));
                                         break;
                                     }
                                     Err(e2) if daft_parquet::read::is_parquet_corrupt(&e2) => {
@@ -277,7 +317,7 @@ impl GlobScanOperator {
                                 }
                             }
                             match found {
-                                Some(triple) => triple,
+                                Some(inferred) => inferred,
                                 None => {
                                     return Err(common_error::DaftError::ComputeError(format!(
                                         "All Parquet files matched by '{}' are corrupt and were skipped (ignore_corrupt_files=true)",
@@ -299,13 +339,15 @@ impl GlobScanOperator {
                             *column_sizes.entry(name).or_insert(0) += bytes;
                         }
                     }
-                    let first_metadata = Some((
-                        filepath.clone(),
-                        TableMetadata {
+                    let first_metadata = Some(FirstFile {
+                        path: filepath.clone(),
+                        version,
+                        table: TableMetadata {
                             length: metadata.num_rows(),
                             column_sizes: (!column_sizes.is_empty()).then_some(column_sizes),
                         },
-                    ));
+                        footer: Arc::new(metadata),
+                    });
                     (schema, first_metadata, filepath)
                 }
                 FileFormatConfig::Csv(CsvSourceConfig {
@@ -677,22 +719,19 @@ impl ScanOperator for GlobScanOperator {
             .iter()
             .map(|partition_spec| partition_spec.clone_field());
         let partition_schema = Schema::new(partition_fields);
-        let (first_filepath, first_metadata) =
-            if let Some((first_filepath, first_metadata)) = &self.first_metadata {
-                (Some(first_filepath), Some(first_metadata))
-            } else {
-                (None, None)
-            };
+        let first_file = self.first_metadata.as_ref();
         // Create one ScanTask per file.
         files
             .enumerate()
             .filter_map(|(idx, f)| {
                 let scan_task_result = (|| {
+                    let listed = f?;
+                    let version = listed_version(&listed);
                     let FileMetadata {
                         filepath: path,
                         size: size_bytes,
                         ..
-                    } = f?;
+                    } = listed;
                     // Create partition values from hive partitions, if any.
                     let mut partition_values = if hive_partitioning {
                         let hive_partitions = parse_hive_partitioning(&path)?;
@@ -738,15 +777,12 @@ impl ScanOperator for GlobScanOperator {
                         .and_then(|rgs| rgs.get(idx).cloned())
                         .flatten();
                     let chunk_spec = row_group.map(ChunkSpec::Parquet);
+                    let footer = first_file.and_then(|first| first.footer_for(&path, version));
                     Ok(Some(ScanTask::new(
                         vec![ScanSource {
-                            metadata: if let Some(first_filepath) = first_filepath
-                                && path == *first_filepath
-                            {
-                                first_metadata.cloned()
-                            } else {
-                                None
-                            },
+                            metadata: first_file
+                                .filter(|first| path == first.path)
+                                .map(|first| first.table.clone()),
                             size_bytes,
                             partition_spec,
                             statistics: None,
@@ -754,7 +790,8 @@ impl ScanOperator for GlobScanOperator {
                                 path,
                                 chunk_spec,
                                 iceberg_delete_files: None,
-                                parquet_metadata: None,
+                                parquet_metadata: footer,
+                                version,
                             },
                         }],
                         source_config.clone(),

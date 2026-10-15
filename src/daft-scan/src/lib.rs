@@ -10,7 +10,7 @@ use std::{
 
 use common_display::DisplayAs;
 use common_error::DaftError;
-use daft_parquet::DaftParquetMetadata;
+use daft_parquet::{DaftParquetMetadata, FileVersion};
 use daft_schema::schema::{Schema, SchemaRef};
 use daft_stats::{PartitionSpec, TableMetadata, TableStatistics};
 use either::Either;
@@ -185,6 +185,10 @@ pub enum ScanSourceKind {
         chunk_spec: Option<ChunkSpec>,
         iceberg_delete_files: Option<Vec<String>>,
         parquet_metadata: Option<Arc<DaftParquetMetadata>>,
+        /// The version of the file this source reads, from its listing or
+        /// its table's manifest; it stays the file's when a split narrows
+        /// `size_bytes` to the split's own bytes.
+        version: Option<FileVersion>,
     },
     Database {
         path: String,
@@ -209,12 +213,14 @@ impl Hash for ScanSource {
                 path,
                 chunk_spec,
                 iceberg_delete_files,
+                version,
                 ..
             } => {
                 0u8.hash(state);
                 path.hash(state);
                 chunk_spec.hash(state);
                 iceberg_delete_files.hash(state);
+                version.hash(state);
             }
             ScanSourceKind::Database { path } => {
                 1u8.hash(state);
@@ -251,6 +257,16 @@ impl ScanSource {
             ScanSourceKind::File {
                 parquet_metadata, ..
             } => parquet_metadata.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The version of the file this source reads, when its listing or its
+    /// table's manifest gave one.
+    #[must_use]
+    pub fn get_file_version(&self) -> Option<FileVersion> {
+        match &self.kind {
+            ScanSourceKind::File { version, .. } => *version,
             _ => None,
         }
     }
@@ -958,6 +974,7 @@ mod test {
                     chunk_spec: None,
                     iceberg_delete_files: None,
                     parquet_metadata: None,
+                    version: None,
                 },
             })
             .collect_vec();
@@ -1112,6 +1129,7 @@ mod test {
                 chunk_spec: None,
                 iceberg_delete_files: None,
                 parquet_metadata: None,
+                version: None,
             },
         }];
 
@@ -1154,6 +1172,7 @@ mod test {
                 chunk_spec: None,
                 iceberg_delete_files: None,
                 parquet_metadata: None,
+                version: None,
             },
         }];
 
@@ -1200,6 +1219,7 @@ mod test {
                 chunk_spec: None,
                 iceberg_delete_files: None,
                 parquet_metadata: None,
+                version: None,
             },
         }];
 
@@ -1244,6 +1264,7 @@ mod test {
                 chunk_spec: None,
                 iceberg_delete_files: None,
                 parquet_metadata: None,
+                version: None,
             },
         }];
 
@@ -1292,6 +1313,7 @@ mod test {
                 chunk_spec: None,
                 iceberg_delete_files: None,
                 parquet_metadata: None,
+                version: None,
             },
         }];
 
@@ -1343,6 +1365,7 @@ mod test {
                 chunk_spec: None,
                 iceberg_delete_files: None,
                 parquet_metadata: None,
+                version: None,
             },
         }];
 
@@ -1393,6 +1416,7 @@ mod test {
                 chunk_spec: None,
                 iceberg_delete_files: None,
                 parquet_metadata: None,
+                version: None,
             },
         }];
 
@@ -1454,6 +1478,7 @@ mod test {
                 chunk_spec: None,
                 iceberg_delete_files: None,
                 parquet_metadata: None,
+                version: None,
             },
         }];
 
@@ -1569,6 +1594,7 @@ mod test {
                 chunk_spec: None,
                 iceberg_delete_files: None,
                 parquet_metadata: None,
+                version: None,
             },
         }];
 

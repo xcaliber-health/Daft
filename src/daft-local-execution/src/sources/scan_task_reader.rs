@@ -33,6 +33,7 @@ pub(crate) async fn read_scan_task(
     chunk_size: usize,
     skipped_corrupt_files: SkippedCorruptFilesCollector,
     row_group_filter: Option<&ExprRef>,
+    parquet_page_index: bool,
 ) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
     match scan_task.source_config.as_ref() {
         SourceConfig::File(ffc) => match ffc {
@@ -49,6 +50,7 @@ pub(crate) async fn read_scan_task(
                     chunk_size,
                     skipped_corrupt_files,
                     row_group_filter,
+                    parquet_page_index,
                 )
                 .await
             }
@@ -106,6 +108,7 @@ async fn read_parquet(
     chunk_size: usize,
     skipped_corrupt_files: SkippedCorruptFilesCollector,
     row_group_filter: Option<&ExprRef>,
+    page_index: bool,
 ) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
     let source = scan_task.sources.first().unwrap();
 
@@ -132,6 +135,7 @@ async fn read_parquet(
         row_groups,
         predicate: scan_task.pushdowns.filters.clone(),
         row_group_filter: row_group_filter.cloned(),
+        page_index,
         schema_infer: ParquetSchemaInferenceOptions::new(Some(cfg.coerce_int96_timestamp_unit)),
         field_id_mapping: cfg.field_id_mapping.clone(),
         delete_rows: delete_map.as_ref().and_then(|m| m.get(url).cloned()),

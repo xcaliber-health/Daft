@@ -1,5 +1,6 @@
 pub(crate) mod chunk_source;
 mod field_reader;
+mod page_index;
 mod rg_processor;
 mod util;
 
@@ -66,7 +67,8 @@ async fn open_chunk_source(
 ) -> crate::Result<(ChunkSourceBuilder, ArrowReaderMetadata)> {
     match source {
         ParquetSource::Local { path } => {
-            let (file, file_len, arrow_metadata) = open_local_file(path).await?;
+            let page_index = opts.page_index && opts.predicate.is_some();
+            let (file, file_len, arrow_metadata) = open_local_file(path, page_index).await?;
             let cs = LocalChunkSource {
                 path: Arc::from(*path),
                 file,
@@ -333,6 +335,15 @@ impl Prefilter {
     }
 }
 
+/// The compressed bytes of row group `rg_idx`'s columns that a read fetches.
+fn read_bytes(metadata: &ParquetMetaData, rg_idx: usize, columns: &[usize]) -> u64 {
+    let row_group = metadata.row_group(rg_idx);
+    field_reader::leaves_for_top_fields(metadata, columns)
+        .into_iter()
+        .map(|leaf| u64::try_from(row_group.column(leaf).compressed_size()).unwrap_or(0))
+        .sum()
+}
+
 /// Shared per-file state for an RG-decoding task. One `Arc<RgTaskCtx>` is
 /// cloned per RG task — replaces the previous fistful-of-Arcs cloning ritual.
 ///
@@ -349,6 +360,9 @@ pub(super) struct RgTaskCtx {
     /// The pushed predicate, when each row group filters before decoding its
     /// other columns.
     pub(super) prefilter: Option<Prefilter>,
+    /// The row groups of which the read fetches only the pages it needs,
+    /// rather than whole column chunks.
+    pub(super) page_fetched: HashSet<usize>,
     /// The most rows the read returns, if limited: a row group stops
     /// filtering once it has kept that many.
     pub(super) num_rows: Option<usize>,
@@ -518,13 +532,34 @@ pub async fn stream_parquet(
         );
     }
 
-    // Now spawn the byte-range fetches (remote) — pruned set only.
-    let chunk_source = Arc::new(cs_builder.build(prepared.parquet_metadata.clone(), &rg_indices));
-
     // Each row group filters in its own task: the predicate's columns are
     // decoded in parallel across row groups, as the others are.
     let base_selections = build_base_selections(&prepared.parquet_metadata, &rg_indices, opts);
     let prefilter = Prefilter::of(opts, &plan, &prepared.arrow_schema)?;
+    // With a page index, a filtered read fetches only the pages it needs of a
+    // row group large enough for that to pay, once its kept rows are known;
+    // the rest are fetched ahead whole, as without one.
+    let page_fetched: HashSet<usize> =
+        if prefilter.is_some() && prepared.parquet_metadata.offset_index().is_some() {
+            rg_indices
+                .iter()
+                .copied()
+                .filter(|&rg_idx| {
+                    read_bytes(&prepared.parquet_metadata, rg_idx, &plan.read_col_indices)
+                        > page_index::PAGE_FETCH_MIN_BYTES
+                })
+                .collect()
+        } else {
+            HashSet::new()
+        };
+    let prefetched: Vec<usize> = rg_indices
+        .iter()
+        .copied()
+        .filter(|rg_idx| !page_fetched.contains(rg_idx))
+        .collect();
+
+    // Now spawn the byte-range fetches (remote) — pruned set only.
+    let chunk_source = Arc::new(cs_builder.build(prepared.parquet_metadata.clone(), &prefetched));
 
     let return_schema = plan.return_daft_schema.clone();
     let ctx = Arc::new(RgTaskCtx {
@@ -535,6 +570,7 @@ pub async fn stream_parquet(
         plan,
         predicate: opts.predicate.clone(),
         prefilter,
+        page_fetched,
         num_rows: opts.num_rows,
         chunk_size,
     });

@@ -8,7 +8,7 @@ use parquet::{
     arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions},
     errors::Result as ParquetResult,
     file::{
-        metadata::ParquetMetaData,
+        metadata::{PageIndexPolicy, ParquetMetaData},
         reader::{ChunkReader, Length},
     },
 };
@@ -18,6 +18,11 @@ use crate::{
     ParquetMetadataSnafu, ReaderInternalSnafu,
     metadata::apply_field_ids_to_arrowrs_parquet_metadata, read::ParquetReadOptions, task_err,
 };
+
+/// The largest gap between two page ranges fetched as one request. Smaller
+/// than the whole-chunk coalescing gap: merging page ranges across a wide gap
+/// fetches back the very bytes skipping the pages saves.
+const PAGE_COALESCE_GAP: u64 = 64 * 1024;
 
 fn coalesce_ranges(mut leaf_ranges: Vec<LeafRange>, max_gap: u64) -> Vec<RangeGroup> {
     leaf_ranges.sort_by_key(|r| r.start);
@@ -68,6 +73,7 @@ async fn drive_group(slot: &GroupSlot, path: &str) -> GroupResult {
 
 pub(super) async fn open_local_file(
     path: &str,
+    page_index: bool,
 ) -> crate::Result<(Arc<std::fs::File>, u64, ArrowReaderMetadata)> {
     let path_owned = path.to_string();
     let path_for_join = path.to_string();
@@ -84,12 +90,16 @@ pub(super) async fn open_local_file(
                     source: e,
                 })?
                 .len();
-            let meta =
-                ArrowReaderMetadata::load(&file, ArrowReaderOptions::new()).with_context(|_| {
-                    ParquetMetadataSnafu {
-                        path: path_owned.clone(),
-                    }
-                })?;
+            let options = ArrowReaderOptions::new().with_page_index_policy(if page_index {
+                PageIndexPolicy::Optional
+            } else {
+                PageIndexPolicy::Skip
+            });
+            let meta = ArrowReaderMetadata::load(&file, options).with_context(|_| {
+                ParquetMetadataSnafu {
+                    path: path_owned.clone(),
+                }
+            })?;
             crate::Result::Ok((Arc::new(file), file_len, meta))
         })
         .await
@@ -103,7 +113,7 @@ pub(super) async fn prepare_remote_chunk_source(
     opts: &ParquetReadOptions,
 ) -> crate::Result<(ChunkSourceBuilder, ArrowReaderMetadata)> {
     let (parquet_metadata_res, file_size_res) = Box::pin(futures::future::join(
-        crate::metadata::read_parquet_metadata(
+        crate::metadata::read_parquet_metadata_and_tail(
             uri,
             None,
             io_client.clone(),
@@ -114,7 +124,7 @@ pub(super) async fn prepare_remote_chunk_source(
         io_client.single_url_get_size(uri.to_string(), io_stats.clone()),
     ))
     .await;
-    let mut parquet_metadata = parquet_metadata_res?;
+    let (mut parquet_metadata, tail) = parquet_metadata_res?;
     let file_size = file_size_res?;
 
     // Apply Iceberg field-id mapping before filtering by column name —
@@ -152,6 +162,38 @@ pub(super) async fn prepare_remote_chunk_source(
             .collect(),
     };
 
+    // A filtered read fetches the page index, one range beside the footer, so
+    // it can skip pages; a plain read never needs it.
+    if opts.page_index
+        && opts.predicate.is_some()
+        && super::page_index::worth_reading(&parquet_metadata, &active_col_indices)
+        && let Some(range) = super::page_index::index_range(&parquet_metadata)
+    {
+        // The footer read usually reaches back over the index, which sits just
+        // before the footer; fetch it only when it does not.
+        let tail_start = (file_size as u64).saturating_sub(tail.len() as u64);
+        let index = if range.start >= tail_start {
+            OffsetBytes::whole(tail_start, tail, file_size as u64)
+        } else {
+            let got = io_client
+                .single_url_get(
+                    uri.to_string(),
+                    Some(daft_io::range::GetRange::Bounded(
+                        range.start as usize..range.end as usize,
+                    )),
+                    io_stats.clone(),
+                )
+                .await?;
+            OffsetBytes::whole(range.start, got.bytes().await?, file_size as u64)
+        };
+        parquet_metadata = Arc::new(
+            super::page_index::with_page_index(Arc::unwrap_or_clone(parquet_metadata), &index)
+                .with_context(|_| ParquetMetadataSnafu {
+                    path: uri.to_string(),
+                })?,
+        );
+    }
+
     let path: Arc<str> = Arc::from(uri);
     let meta = ArrowReaderMetadata::try_new(parquet_metadata, ArrowReaderOptions::new())
         .with_context(|_| ParquetMetadataSnafu {
@@ -181,14 +223,53 @@ struct RangeGroup {
     members: Vec<LeafRange>,
 }
 
-/// `ChunkReader` windowed over a single column chunk's bytes. Reports the
-/// file's total length but translates absolute offsets to local-buffer offsets,
-/// so `SerializedPageReader` works without holding the whole file in memory.
+/// `ChunkReader` over the fetched bytes of one column chunk: the whole chunk,
+/// or only the byte ranges of the pages a read needs. Reports the file's total
+/// length but translates absolute offsets to the fetched bytes, so
+/// `SerializedPageReader` works without holding the whole file in memory. A
+/// read outside the fetched ranges is an error, never a silent gap.
 #[derive(Clone)]
 pub(crate) struct OffsetBytes {
-    base: u64,
     file_len: u64,
-    bytes: Bytes,
+    /// Fetched byte ranges, as (absolute start, bytes), sorted and disjoint.
+    segments: Arc<[(u64, Bytes)]>,
+}
+
+impl OffsetBytes {
+    /// The bytes of a whole range starting at absolute offset `base`.
+    pub(crate) fn whole(base: u64, bytes: Bytes, file_len: u64) -> Self {
+        Self {
+            file_len,
+            segments: Arc::from([(base, bytes)]),
+        }
+    }
+
+    /// The bytes of several ranges, as (absolute start, bytes), in any order.
+    pub(crate) fn sparse(mut segments: Vec<(u64, Bytes)>, file_len: u64) -> Self {
+        segments.sort_by_key(|(start, _)| *start);
+        Self {
+            file_len,
+            segments: segments.into(),
+        }
+    }
+
+    /// The fetched segment holding absolute offset `start`, and `start`'s
+    /// offset within it.
+    fn segment_at(&self, start: u64, call: &str) -> ParquetResult<(&Bytes, usize)> {
+        let found = self
+            .segments
+            .partition_point(|(base, _)| *base <= start)
+            .checked_sub(1)
+            .map(|index| &self.segments[index]);
+        match found {
+            Some((base, bytes)) if start - base <= bytes.len() as u64 => {
+                Ok((bytes, (start - base) as usize))
+            }
+            _ => Err(parquet::errors::ParquetError::General(format!(
+                "OffsetBytes::{call}: offset {start} lies outside the fetched ranges"
+            ))),
+        }
+    }
 }
 
 impl Length for OffsetBytes {
@@ -201,43 +282,22 @@ impl ChunkReader for OffsetBytes {
     type T = bytes::buf::Reader<Bytes>;
 
     fn get_read(&self, start: u64) -> ParquetResult<Self::T> {
-        let local = start.checked_sub(self.base).ok_or_else(|| {
-            parquet::errors::ParquetError::General(format!(
-                "OffsetBytes::get_read: start {} < base {}",
-                start, self.base
-            ))
-        })? as usize;
-        if local > self.bytes.len() {
-            return Err(parquet::errors::ParquetError::General(format!(
-                "OffsetBytes::get_read: start {} past chunk end (local {} > len {})",
-                start,
-                local,
-                self.bytes.len()
-            )));
-        }
         use bytes::Buf;
-        Ok(self.bytes.slice(local..).reader())
+        let (bytes, local) = self.segment_at(start, "get_read")?;
+        Ok(bytes.slice(local..).reader())
     }
 
     fn get_bytes(&self, start: u64, length: usize) -> ParquetResult<Bytes> {
-        let local = start.checked_sub(self.base).ok_or_else(|| {
-            parquet::errors::ParquetError::General(format!(
-                "OffsetBytes::get_bytes: start {} < base {}",
-                start, self.base
-            ))
-        })? as usize;
+        let (bytes, local) = self.segment_at(start, "get_bytes")?;
         let end = local.checked_add(length).ok_or_else(|| {
             parquet::errors::ParquetError::General("OffsetBytes::get_bytes: offset overflow".into())
         })?;
-        if end > self.bytes.len() {
+        if end > bytes.len() {
             return Err(parquet::errors::ParquetError::General(format!(
-                "OffsetBytes::get_bytes: range {}..{} past chunk end (len {})",
-                local,
-                end,
-                self.bytes.len()
+                "OffsetBytes::get_bytes: range {start}+{length} runs past its fetched range"
             )));
         }
-        Ok(self.bytes.slice(local..end))
+        Ok(bytes.slice(local..end))
     }
 }
 
@@ -334,6 +394,8 @@ impl ChunkSourceBuilder {
 
     /// Finalize the chunk source. For `Remote`, this is when byte-range fetches
     /// for `rg_indices` are spawned — call only after predicate-based pruning.
+    /// A row group left out is fetched only as asked, through
+    /// [`ChunkSource::read_ranges`].
     pub(super) fn build(
         self,
         parquet_metadata: Arc<ParquetMetaData>,
@@ -412,6 +474,58 @@ impl ChunkSource {
         }
     }
 
+    /// Fetches only `wanted`'s byte ranges, as (leaf, absolute ranges), and
+    /// returns each leaf's bytes, which hold those ranges and nothing else.
+    ///
+    /// Ranges nearer than [`PAGE_COALESCE_GAP`] are fetched together.
+    pub(super) async fn read_ranges(
+        &self,
+        wanted: Vec<(usize, Vec<std::ops::Range<u64>>)>,
+    ) -> crate::Result<HashMap<usize, OffsetBytes>> {
+        let leaf_ranges: Vec<LeafRange> = wanted
+            .iter()
+            .flat_map(|(leaf, ranges)| {
+                ranges.iter().map(|range| LeafRange {
+                    leaf: *leaf,
+                    start: range.start,
+                    len: range.end - range.start,
+                })
+            })
+            .collect();
+        let groups = coalesce_ranges(leaf_ranges, PAGE_COALESCE_GAP);
+        let spans: Vec<std::ops::Range<u64>> =
+            groups.iter().map(|group| group.start..group.end).collect();
+        let fetched = match self {
+            Self::Local(s) => {
+                let s = s.clone();
+                let path = s.path.clone();
+                get_io_runtime(true)
+                    .spawn_blocking(move || s.read_spans_sync(&spans))
+                    .await
+                    .map_err(task_err(path.to_string()))??
+            }
+            Self::Remote(s) => s.read_spans(&spans).await?,
+        };
+        let file_len = match self {
+            Self::Local(s) => s.file_len,
+            Self::Remote(s) => s.file_len,
+        };
+        let mut segments: HashMap<usize, Vec<(u64, Bytes)>> = HashMap::with_capacity(wanted.len());
+        for (group, bytes) in groups.into_iter().zip(fetched) {
+            for LeafRange { leaf, start, len } in group.members {
+                let local = (start - group.start) as usize;
+                segments
+                    .entry(leaf)
+                    .or_default()
+                    .push((start, bytes.slice(local..local + len as usize)));
+            }
+        }
+        Ok(segments
+            .into_iter()
+            .map(|(leaf, segments)| (leaf, OffsetBytes::sparse(segments, file_len)))
+            .collect())
+    }
+
     /// One per RG, called by the decoder dispatch. Lets each `ChunkSource`
     /// variant choose its own access pattern without leaking the dispatch into
     /// callers:
@@ -488,6 +602,52 @@ compile_error!(
 impl LocalChunkSource {
     const MAX_COALESCE_GAP: u64 = 64 * 1024;
 
+    /// Reads each absolute byte span of the file.
+    fn read_spans_sync(&self, spans: &[std::ops::Range<u64>]) -> crate::Result<Vec<Bytes>> {
+        spans
+            .iter()
+            .map(|span| {
+                let mut buf = vec![0u8; (span.end - span.start) as usize];
+                #[cfg(unix)]
+                let read = {
+                    use std::os::unix::fs::FileExt;
+                    self.file.read_exact_at(&mut buf, span.start)
+                };
+                #[cfg(windows)]
+                let read = {
+                    use std::os::windows::fs::FileExt;
+                    let mut filled = 0usize;
+                    let mut result = Ok(());
+                    while filled < buf.len() {
+                        match self.file.seek_read(&mut buf[filled..], span.start + filled as u64) {
+                            Ok(0) => {
+                                result = Err(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "short read of a page range",
+                                ));
+                                break;
+                            }
+                            Ok(read) => filled += read,
+                            Err(e) => {
+                                result = Err(e);
+                                break;
+                            }
+                        }
+                    }
+                    result
+                };
+                read.map_err(|e| crate::Error::LocalIO {
+                    path: self.path.to_string(),
+                    source: std::io::Error::new(
+                        e.kind(),
+                        format!("pread of page range {}..{}: {e}", span.start, span.end),
+                    ),
+                })?;
+                Ok(Bytes::from(buf))
+            })
+            .collect()
+    }
+
     fn read_rg_chunks_sync(
         &self,
         rg_idx: usize,
@@ -555,14 +715,7 @@ impl LocalChunkSource {
                 let local_start = (start - group_start) as usize;
                 let local_end = local_start + len as usize;
                 let slice = group_bytes.slice(local_start..local_end);
-                out.insert(
-                    leaf,
-                    OffsetBytes {
-                        base: start,
-                        file_len: self.file_len,
-                        bytes: slice,
-                    },
-                );
+                out.insert(leaf, OffsetBytes::whole(start, slice, self.file_len));
             }
         }
         Ok(out)
@@ -614,6 +767,9 @@ pub(crate) struct RemoteChunkSource {
     path: Arc<str>,
     rgs: HashMap<usize, RgState>,
     file_len: u64,
+    uri: String,
+    io_client: Arc<daft_io::IOClient>,
+    io_stats: Option<daft_io::IOStatsRef>,
 }
 
 impl RemoteChunkSource {
@@ -706,7 +862,33 @@ impl RemoteChunkSource {
             path,
             rgs,
             file_len,
+            uri,
+            io_client,
+            io_stats,
         }
+    }
+
+    /// Fetches each absolute byte span of the object, concurrently.
+    async fn read_spans(&self, spans: &[std::ops::Range<u64>]) -> crate::Result<Vec<Bytes>> {
+        let io_runtime = get_io_runtime(true);
+        let fetches = spans.iter().map(|span| {
+            let io_client = self.io_client.clone();
+            let io_stats = self.io_stats.clone();
+            let uri = self.uri.clone();
+            let range = span.start as usize..span.end as usize;
+            io_runtime.spawn(async move {
+                let got = io_client
+                    .single_url_get(uri, Some(daft_io::range::GetRange::Bounded(range)), io_stats)
+                    .await?;
+                crate::Result::Ok(got.bytes().await?)
+            })
+        });
+        let path = self.path.to_string();
+        futures::future::join_all(fetches)
+            .await
+            .into_iter()
+            .map(|joined| joined.map_err(task_err(path.clone()))?)
+            .collect()
     }
 
     fn coalesce_and_split(leaf_ranges: Vec<LeafRange>) -> Vec<RangeGroup> {
@@ -814,13 +996,43 @@ impl RemoteChunkSource {
             let slice = bytes.slice(local_start..local_end);
             out.insert(
                 leaf,
-                OffsetBytes {
-                    base: loc.leaf_start,
-                    file_len: self.file_len,
-                    bytes: slice,
-                },
+                OffsetBytes::whole(loc.leaf_start, slice, self.file_len),
             );
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use parquet::file::reader::ChunkReader;
+
+    use super::OffsetBytes;
+
+    fn pages() -> OffsetBytes {
+        OffsetBytes::sparse(
+            vec![
+                (500, Bytes::from_static(b"second")),
+                (100, Bytes::from_static(b"first")),
+            ],
+            1_000,
+        )
+    }
+
+    #[test]
+    fn sparse_bytes_read_within_each_fetched_range() {
+        let bytes = pages();
+        assert_eq!(bytes.get_bytes(100, 5).unwrap(), Bytes::from_static(b"first"));
+        assert_eq!(bytes.get_bytes(502, 4).unwrap(), Bytes::from_static(b"cond"));
+        assert_eq!(parquet::file::reader::Length::len(&bytes), 1_000);
+    }
+
+    #[test]
+    fn sparse_bytes_refuse_a_read_outside_the_fetched_ranges() {
+        let bytes = pages();
+        for (start, length) in [(50, 1), (200, 1), (103, 5), (900, 1)] {
+            assert!(bytes.get_bytes(start, length).is_err(), "{start}+{length}");
+        }
     }
 }

@@ -137,6 +137,9 @@ pub struct DaftExecutionConfig {
     pub num_preview_rows: usize,
     pub parquet_target_filesize: usize,
     pub parquet_target_row_group_size: usize,
+    /// Whether a filtered Parquet read loads a file's page index, to skip the
+    /// pages the filter rules out and fetch only the pages holding kept rows.
+    pub parquet_page_index: bool,
     pub parquet_inflation_factor: f64,
     pub csv_target_filesize: usize,
     pub csv_inflation_factor: f64,
@@ -189,6 +192,7 @@ impl Default for DaftExecutionConfig {
             num_preview_rows: 8,
             parquet_target_filesize: 512 * 1024 * 1024, // 512MB
             parquet_target_row_group_size: 128 * 1024 * 1024, // 128MB
+            parquet_page_index: true,
             parquet_inflation_factor: 3.0,
             csv_target_filesize: 512 * 1024 * 1024, // 512MB
             csv_inflation_factor: 0.5,

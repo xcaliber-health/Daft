@@ -20,9 +20,9 @@ use tokio::sync::mpsc;
 
 use super::{
     Prefilter, RgTaskCtx,
-    page_index::{page_ranges, rows_not_ruled_out},
     chunk_source::{ChunkSource, RgReader},
     field_reader::{decode_one_streaming, leaves_for_top_fields},
+    page_index::{page_ranges, rows_not_ruled_out},
     util::{
         eval_predicate_mask, filter_arrays_by_mask, project_to_schema, record_batch_from_arrow,
         schema_from_indices, truncate_mask_to_n_trues,
@@ -284,7 +284,11 @@ async fn prefilter_row_group(
         fetched(&kept).saturating_mul(2) <= fetched(&read)
     };
     if selection_skips_pages
-        || selection_pays(runs, total - mask.true_count(), data_bytes_per_row(ctx, rg_idx))
+        || selection_pays(
+            runs,
+            total - mask.true_count(),
+            data_bytes_per_row(ctx, rg_idx),
+        )
     {
         Ok(RowGroupDecode {
             selection: Some(kept),

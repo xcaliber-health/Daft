@@ -398,9 +398,13 @@ mod tests {
     async fn cascade_writes_whole_files_for_the_tail_of_a_batch() {
         // The tail a merge emits is a slice; its size must not be the parent's.
         let rows: Vec<Option<i64>> = (0..20_000).map(Some).collect();
-        let strings: Vec<Option<String>> = rows.iter().map(|v| v.map(|v| format!("row-{v:08}"))).collect();
+        let strings: Vec<Option<String>> = rows
+            .iter()
+            .map(|v| v.map(|v| format!("row-{v:08}")))
+            .collect();
         let make = |values: &[Option<i64>], text: &[Option<String>]| {
-            let v = Int64Array::from_iter(Field::new("v", DataType::Int64), values.iter().copied()).into_series();
+            let v = Int64Array::from_iter(Field::new("v", DataType::Int64), values.iter().copied())
+                .into_series();
             let s = Utf8Array::from_iter("s", text.iter().map(|t| t.as_deref())).into_series();
             RecordBatch::from_nonempty_columns(vec![v, s]).unwrap()
         };
@@ -411,10 +415,15 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let spill = spill_ctx(&dir);
-        let reduced = reduce_to_two(runs, &ordering(false, false), &spill).await.unwrap();
+        let reduced = reduce_to_two(runs, &ordering(false, false), &spill)
+            .await
+            .unwrap();
         assert_eq!(reduced.len(), 2);
         let files = walkdir(dir.path());
-        assert_eq!(files, 1, "one merged run of 20000 short rows fits one spill file");
+        assert_eq!(
+            files, 1,
+            "one merged run of 20000 short rows fits one spill file"
+        );
     }
 
     fn walkdir(path: &std::path::Path) -> usize {

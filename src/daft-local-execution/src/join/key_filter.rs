@@ -31,9 +31,8 @@ use daft_dsl::{
 };
 use daft_local_plan::{
     Concat, Dedup, Filter, HashAggregate, IntoBatches, LocalPhysicalPlan, LocalPhysicalPlanRef,
-    PhysicalScan, Project,
-    Sort, SourceId, WindowPartitionAndDynamicFrame, WindowPartitionAndOrderBy,
-    WindowPartitionOnly,
+    PhysicalScan, Project, Sort, SourceId, WindowPartitionAndDynamicFrame,
+    WindowPartitionAndOrderBy, WindowPartitionOnly,
 };
 use daft_logical_plan::{JoinType, stats::StatsState};
 use daft_micropartition::MicroPartition;
@@ -97,7 +96,9 @@ impl KeyValues {
         let max = Literal::try_from_single_value_series(&present.max(None)?)?;
         let members = if present.size_bytes() <= max_member_bytes {
             let hashes = present.hash(None)?;
-            Some(Arc::new(KeyHashes(hashes.as_arrow()?.values().iter().copied().collect())))
+            Some(Arc::new(KeyHashes(
+                hashes.as_arrow()?.values().iter().copied().collect(),
+            )))
         } else {
             None
         };
@@ -184,8 +185,9 @@ impl RowTest {
                 let keys = batch.get_column(batch.schema.get_index(column)?);
                 let hashes = keys.hash(None)?;
                 let hashes = hashes.as_arrow()?.values();
-                let mut passes =
-                    BooleanBuffer::collect_bool(hashes.len(), |row| members.0.contains(&hashes[row]));
+                let mut passes = BooleanBuffer::collect_bool(hashes.len(), |row| {
+                    members.0.contains(&hashes[row])
+                });
                 if let Some(nulls) = keys.nulls() {
                     passes = &passes & nulls.inner();
                 }
@@ -291,7 +293,10 @@ impl KeyFilterBridge {
 
     /// Publishes an input's filter; `None` when the build side offers none.
     pub(crate) fn publish(&self, input_id: InputId, filter: Option<Arc<KeyFilter>>) {
-        let mut slots = self.slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let consumers = slots.consumers;
         let claimed = match slots.by_input.remove(&input_id) {
             Some(Slot::Awaited(waiting)) => {
@@ -318,7 +323,10 @@ impl KeyFilterBridge {
     /// side stopped without publishing one.
     pub(crate) async fn wait(&self, input_id: InputId) -> Option<Arc<KeyFilter>> {
         let receiver = {
-            let mut slots = self.slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut slots = self
+                .slots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let closed = slots.closed;
             match slots.by_input.entry(input_id) {
                 Entry::Occupied(mut entry) => match entry.get_mut() {
@@ -349,7 +357,10 @@ impl KeyFilterBridge {
 
     /// Marks the build side stopped, releasing every scan still waiting.
     pub(crate) fn close(&self) {
-        let mut slots = self.slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         slots.closed = true;
         slots
             .by_input
@@ -391,8 +402,8 @@ impl KeyFilterPublisher {
             keys.and_then(|keys| {
                 KeyFilter::from_build_keys(&keys, self.max_values, self.max_member_bytes)
             })
-                .inspect_err(|error| log::debug!("no key filter for this join: {error}"))
-                .ok()
+            .inspect_err(|error| log::debug!("no key filter for this join: {error}"))
+            .ok()
         });
         self.bridge.publish(input_id, filter.map(Arc::new));
     }
@@ -515,10 +526,13 @@ fn passed_through(
     column: usize,
 ) -> Option<usize> {
     let name = &plan.schema().fields().get(column)?.name;
-    exprs
-        .iter()
-        .filter_map(column_read_by)
-        .find(|index| input.schema().fields().get(*index).is_some_and(|field| &field.name == name))
+    exprs.iter().filter_map(column_read_by).find(|index| {
+        input
+            .schema()
+            .fields()
+            .get(*index)
+            .is_some_and(|field| &field.name == name)
+    })
 }
 
 /// A Parquet scan column a join key can restrict.
@@ -574,7 +588,9 @@ fn scans_reached(plan: &LocalPhysicalPlan, column: usize, spares_state: bool) ->
                 _ => Vec::new(),
             }
         }
-        LocalPhysicalPlan::Project(Project { input, projection, .. }) => projection
+        LocalPhysicalPlan::Project(Project {
+            input, projection, ..
+        }) => projection
             .get(column)
             .and_then(column_read_by)
             .map(|column| scans_reached(input, column, spares_state))
@@ -594,13 +610,15 @@ fn scans_reached(plan: &LocalPhysicalPlan, column: usize, spares_state: bool) ->
                 .map(|column| scans_reached(input, column, true))
                 .unwrap_or_default()
         }
-        LocalPhysicalPlan::HashAggregate(HashAggregate { input, group_by, .. }) => {
-            passed_through(plan, input, group_by, column)
-                .map(|column| scans_reached(input, column, true))
-                .unwrap_or_default()
-        }
+        LocalPhysicalPlan::HashAggregate(HashAggregate {
+            input, group_by, ..
+        }) => passed_through(plan, input, group_by, column)
+            .map(|column| scans_reached(input, column, true))
+            .unwrap_or_default(),
         LocalPhysicalPlan::WindowPartitionOnly(WindowPartitionOnly {
-            input, partition_by, ..
+            input,
+            partition_by,
+            ..
         })
         | LocalPhysicalPlan::WindowPartitionAndOrderBy(WindowPartitionAndOrderBy {
             input,
@@ -735,7 +753,10 @@ impl RowKeyFilter {
             passes = &passes & &test.passes(column, batch)?;
         }
         let mask = arrow::array::BooleanArray::new(passes, None);
-        Ok(BooleanArray::from_arrow(Field::new("mask", DataType::Boolean), Arc::new(mask))?.into_series())
+        Ok(
+            BooleanArray::from_arrow(Field::new("mask", DataType::Boolean), Arc::new(mask))?
+                .into_series(),
+        )
     }
 }
 
@@ -749,7 +770,8 @@ mod tests {
     const MEMBER_BYTES: usize = 1 << 20;
 
     fn ints(values: &[Option<i64>]) -> Series {
-        Int64Array::from_iter(Field::new("k", DataType::Int64), values.iter().copied()).into_series()
+        Int64Array::from_iter(Field::new("k", DataType::Int64), values.iter().copied())
+            .into_series()
     }
 
     fn batch(values: &[Option<i64>]) -> RecordBatch {
@@ -788,7 +810,10 @@ mod tests {
         let mut values = values.unwrap();
         values.sort_by_key(|value| value.to_string());
         assert_eq!((min, max), (Literal::Int64(3), Literal::Int64(7)));
-        assert_eq!(values, vec![Literal::Int64(3), Literal::Int64(5), Literal::Int64(7)]);
+        assert_eq!(
+            values,
+            vec![Literal::Int64(3), Literal::Int64(5), Literal::Int64(7)]
+        );
     }
 
     #[test]
@@ -803,7 +828,10 @@ mod tests {
     #[test]
     fn a_build_side_of_only_null_keys_matches_nothing() {
         for keys in [ints(&[None, None]), ints(&[])] {
-            assert_eq!(KeyValues::of(&keys, 10, MEMBER_BYTES).unwrap(), KeyValues::Nothing);
+            assert_eq!(
+                KeyValues::of(&keys, 10, MEMBER_BYTES).unwrap(),
+                KeyValues::Nothing
+            );
             assert_eq!(
                 KeyFilter::from_build_keys(&[keys], 10, MEMBER_BYTES)
                     .unwrap()
@@ -825,7 +853,8 @@ mod tests {
 
     #[test]
     fn listed_keys_prune_by_range_and_values() {
-        let KeyRestriction::Within { prune, .. } = restriction(&[Some(2), Some(9)], 10, MEMBER_BYTES)
+        let KeyRestriction::Within { prune, .. } =
+            restriction(&[Some(2), Some(9)], 10, MEMBER_BYTES)
         else {
             panic!("keys were present");
         };
@@ -835,7 +864,9 @@ mod tests {
             .gt_eq(lit(2i64))
             .and(column.clone().lt_eq(lit(9i64)));
         let candidates = [
-            range.clone().and(column.clone().is_in(vec![lit(2i64), lit(9i64)])),
+            range
+                .clone()
+                .and(column.clone().is_in(vec![lit(2i64), lit(9i64)])),
             range.and(column.is_in(vec![lit(9i64), lit(2i64)])),
         ];
         assert!(candidates.contains(&prune));
@@ -843,8 +874,10 @@ mod tests {
 
     #[test]
     fn hashed_keys_pass_only_rows_holding_a_build_key() {
-        let KeyRestriction::Within { rows: (column, test), .. } =
-            restriction(&[Some(2), Some(9)], 10, MEMBER_BYTES)
+        let KeyRestriction::Within {
+            rows: (column, test),
+            ..
+        } = restriction(&[Some(2), Some(9)], 10, MEMBER_BYTES)
         else {
             panic!("keys were present");
         };
@@ -858,8 +891,10 @@ mod tests {
 
     #[test]
     fn keys_too_large_to_hash_pass_rows_within_their_range() {
-        let KeyRestriction::Within { prune, rows: (_, test) } =
-            restriction(&[Some(2), Some(9), Some(4)], 2, 0)
+        let KeyRestriction::Within {
+            prune,
+            rows: (_, test),
+        } = restriction(&[Some(2), Some(9), Some(4)], 2, 0)
         else {
             panic!("keys were present");
         };
@@ -915,7 +950,8 @@ mod tests {
     #[tokio::test]
     async fn every_consumer_takes_a_published_filter_once() {
         let bridge = Arc::new(KeyFilterBridge::new(2));
-        let filter = Arc::new(KeyFilter::from_build_keys(&[ints(&[Some(1)])], 10, MEMBER_BYTES).unwrap());
+        let filter =
+            Arc::new(KeyFilter::from_build_keys(&[ints(&[Some(1)])], 10, MEMBER_BYTES).unwrap());
         let early = tokio::spawn({
             let bridge = bridge.clone();
             async move { bridge.wait(0).await }

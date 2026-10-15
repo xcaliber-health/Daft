@@ -67,9 +67,7 @@ def _sums(rows: str) -> DataFrame:
     return daft.read_parquet(rows).groupby("k").agg(col("v").sum().alias("total"))
 
 
-def _collected(
-    frame: Callable[[], DataFrame], *, filtered: bool
-) -> tuple[list[tuple[object, ...]], ScanReads]:
+def _collected(frame: Callable[[], DataFrame], *, filtered: bool) -> tuple[list[tuple[object, ...]], ScanReads]:
     """Runs a newly built frame, so no earlier run's result is reused."""
     reads = ScanReads()
     with daft.execution_config_ctx(enable_join_key_filters=filtered):
@@ -117,9 +115,7 @@ def test_the_answer_is_the_joins_own(rows: str, shape: Shape, keys: list[int | N
 
 @pytest.mark.parametrize("shape", SHAPES.values(), ids=SHAPES.keys())
 def test_an_empty_build_side_answers_nothing(rows: str, shape: Shape) -> None:
-    filtered, _ = _collected(
-        lambda: shape(rows, daft.from_pydict({"k": pa.array([], pa.int64())})), filtered=True
-    )
+    filtered, _ = _collected(lambda: shape(rows, daft.from_pydict({"k": pa.array([], pa.int64())})), filtered=True)
 
     assert filtered == []
 
@@ -128,9 +124,7 @@ GROUPED = {name: shape for name, shape in SHAPES.items() if "grouping" in name}
 DIRECT = {name: shape for name, shape in SHAPES.items() if "grouping" not in name}
 
 
-@pytest.mark.skipif(
-    get_tests_daft_runner_name() != "native", reason="the filter is planned by the native runner"
-)
+@pytest.mark.skipif(get_tests_daft_runner_name() != "native", reason="the filter is planned by the native runner")
 @pytest.mark.parametrize("shape", GROUPED.values(), ids=GROUPED.keys())
 def test_below_a_grouping_the_scan_emits_only_rows_the_keys_match(rows: str, shape: Shape) -> None:
     def frame() -> DataFrame:
@@ -143,9 +137,7 @@ def test_below_a_grouping_the_scan_emits_only_rows_the_keys_match(rows: str, sha
     assert filtered.rows_read == 3 * ROWS_PER_GROUP
 
 
-@pytest.mark.skipif(
-    get_tests_daft_runner_name() != "native", reason="the filter is planned by the native runner"
-)
+@pytest.mark.skipif(get_tests_daft_runner_name() != "native", reason="the filter is planned by the native runner")
 @pytest.mark.parametrize("shape", DIRECT.values(), ids=DIRECT.keys())
 def test_directly_below_a_join_the_scan_skips_row_groups_no_key_is_in(tmp_path: Path, shape: Shape) -> None:
     rows = _write(tmp_path / "rows", [group for group in range(GROUPS) for _ in range(ROWS_PER_GROUP)])
@@ -159,9 +151,7 @@ def test_directly_below_a_join_the_scan_skips_row_groups_no_key_is_in(tmp_path: 
     assert filtered.rows_read == ROW_GROUP_ROWS
 
 
-@pytest.mark.skipif(
-    get_tests_daft_runner_name() != "native", reason="the filter is planned by the native runner"
-)
+@pytest.mark.skipif(get_tests_daft_runner_name() != "native", reason="the filter is planned by the native runner")
 def test_more_keys_than_the_listing_limit_still_filter_rows(rows: str) -> None:
     def frame() -> DataFrame:
         return _sums(rows).join(daft.from_pydict({"k": list(range(100, 110))}), on="k", how="semi")
@@ -174,14 +164,13 @@ def test_more_keys_than_the_listing_limit_still_filter_rows(rows: str) -> None:
     assert reads.rows_read == 10 * ROWS_PER_GROUP
 
 
-@pytest.mark.skipif(
-    get_tests_daft_runner_name() != "native", reason="the filter is planned by the native runner"
-)
+@pytest.mark.skipif(get_tests_daft_runner_name() != "native", reason="the filter is planned by the native runner")
 def test_files_whose_partition_no_key_matches_are_skipped(tmp_path: Path) -> None:
     path = tmp_path / "partitioned"
     daft.from_pydict({"k": [group for group in range(10) for _ in range(5)], "v": list(range(50))}).write_parquet(
         str(path), partition_cols=["k"]
     )
+
     def frame() -> DataFrame:
         return daft.read_parquet(f"{path}/**/*.parquet", hive_partitioning=True).join(
             daft.from_pydict({"k": [3, 4]}), on="k", how="semi"
@@ -194,9 +183,7 @@ def test_files_whose_partition_no_key_matches_are_skipped(tmp_path: Path) -> Non
     assert reads.rows_read == 10
 
 
-@pytest.mark.skipif(
-    get_tests_daft_runner_name() != "native", reason="the filter is planned by the native runner"
-)
+@pytest.mark.skipif(get_tests_daft_runner_name() != "native", reason="the filter is planned by the native runner")
 @pytest.mark.parametrize(
     "shape",
     [
@@ -213,9 +200,7 @@ def test_files_whose_partition_no_key_matches_are_skipped(tmp_path: Path) -> Non
             id="a limit below the join, whose rows the filter would change",
         ),
         pytest.param(
-            lambda rows, keys: daft.read_parquet(rows)
-            .with_column("k", col("k") + 1)
-            .join(keys, on="k", how="semi"),
+            lambda rows, keys: daft.read_parquet(rows).with_column("k", col("k") + 1).join(keys, on="k", how="semi"),
             id="a key computed above the scan",
         ),
     ],
@@ -229,4 +214,3 @@ def test_a_join_the_keys_cannot_restrict_reads_every_row(rows: str, shape: Shape
 
     assert filtered == unfiltered
     assert reads.rows_read >= 10_000
-

@@ -24,6 +24,7 @@ from daft.io.iceberg._metadata import (
     convert_iceberg_schema,
     convert_iceberg_transform,
 )
+from daft.io.iceberg._metadata_io import MetadataFileIO, metadata_file_io
 from daft.io.iceberg.schema_field_id_mapping_visitor import SchemaFieldIdMappingVisitor, attach_name_mapping
 from daft.io.scan import ScanOperator, make_partition_field
 from daft.logical.schema import Field, Schema
@@ -200,6 +201,10 @@ class IcebergScanOperator(ScanOperator):
         # Regular scan without count pushdown
         yield from self._create_regular_scan_tasks(pushdowns)
 
+    def _metadata_io(self) -> MetadataFileIO:
+        """The file IO planning reads the table's metadata files through."""
+        return metadata_file_io(self._iceberg_table.io, self._storage_config.io_config)
+
     def _create_regular_scan_tasks(self, pushdowns: PyPushdowns) -> Iterator[ScanTask]:
         """Create regular scan tasks without count pushdown."""
         limit = pushdowns.limit
@@ -211,11 +216,15 @@ class IcebergScanOperator(ScanOperator):
             self._iceberg_table.schema(),
         )
 
-        iceberg_tasks = self._iceberg_table.scan(
-            row_filter=row_filter,
-            limit=limit,
-            snapshot_id=self._snapshot_id,
-        ).plan_files()
+        iceberg_tasks = (
+            self._iceberg_table.scan(
+                row_filter=row_filter,
+                limit=limit,
+                snapshot_id=self._snapshot_id,
+            )
+            .update(io=self._metadata_io())
+            .plan_files()
+        )
 
         should_limit_files = limit is not None and pushdowns.filters is None and pushdowns.partition_filters is None
 
@@ -279,7 +288,11 @@ class IcebergScanOperator(ScanOperator):
     def _create_count_scan_task(self, pushdowns: PyPushdowns, field_name: str) -> Iterator[ScanTask]:
         """Create count pushdown scan task using Iceberg metadata."""
         try:
-            iceberg_tasks = self._iceberg_table.scan(limit=None, snapshot_id=self._snapshot_id).plan_files()
+            iceberg_tasks = (
+                self._iceberg_table.scan(limit=None, snapshot_id=self._snapshot_id)
+                .update(io=self._metadata_io())
+                .plan_files()
+            )
             total_count = 0
 
             # Aggregate row counts from all data files
@@ -337,7 +350,7 @@ class IcebergScanOperator(ScanOperator):
             return any(
                 manifest.content == ManifestContent.DELETES
                 and (manifest.has_added_files() or manifest.has_existing_files())
-                for manifest in snapshot.manifests(self._iceberg_table.io)
+                for manifest in snapshot.manifests(self._metadata_io())
             )
         except Exception as e:
             logger.warning(

@@ -2664,6 +2664,7 @@ class PyDaftExecutionConfig:
         parquet_page_index: bool | None = None,
         parquet_footer_cache_bytes: int | None = None,
         parquet_footer_cache_mutable_files: bool | None = None,
+        iceberg_metadata_cache_bytes: int | None = None,
         parquet_inflation_factor: float | None = None,
         csv_target_filesize: int | None = None,
         csv_inflation_factor: float | None = None,
@@ -2727,6 +2728,8 @@ class PyDaftExecutionConfig:
     def parquet_footer_cache_bytes(self) -> int: ...
     @property
     def parquet_footer_cache_mutable_files(self) -> bool: ...
+    @property
+    def iceberg_metadata_cache_bytes(self) -> int: ...
     @property
     def parquet_inflation_factor(self) -> float: ...
     @property
@@ -2928,6 +2931,12 @@ def io_put(
     multithreaded_io: bool | None = None,
     io_config: IOConfig | None = None,
 ) -> None: ...
+def io_get(
+    path: str,
+    multithreaded_io: bool | None = None,
+    io_config: IOConfig | None = None,
+) -> bytes:
+    """Read the whole object at ``path`` in one request, without asking its size first."""
 
 class SystemInfo:
     """Accessor for system information."""

@@ -106,6 +106,7 @@ impl PyDaftExecutionConfig {
         parquet_page_index=None,
         parquet_footer_cache_bytes=None,
         parquet_footer_cache_mutable_files=None,
+        iceberg_metadata_cache_bytes=None,
         parquet_inflation_factor=None,
         csv_target_filesize=None,
         csv_inflation_factor=None,
@@ -152,6 +153,7 @@ impl PyDaftExecutionConfig {
         parquet_page_index: Option<bool>,
         parquet_footer_cache_bytes: Option<usize>,
         parquet_footer_cache_mutable_files: Option<bool>,
+        iceberg_metadata_cache_bytes: Option<usize>,
         parquet_inflation_factor: Option<f64>,
         csv_target_filesize: Option<usize>,
         csv_inflation_factor: Option<f64>,
@@ -231,6 +233,9 @@ impl PyDaftExecutionConfig {
         }
         if let Some(parquet_footer_cache_mutable_files) = parquet_footer_cache_mutable_files {
             config.parquet_footer_cache_mutable_files = parquet_footer_cache_mutable_files;
+        }
+        if let Some(iceberg_metadata_cache_bytes) = iceberg_metadata_cache_bytes {
+            config.iceberg_metadata_cache_bytes = iceberg_metadata_cache_bytes;
         }
         if let Some(parquet_inflation_factor) = parquet_inflation_factor {
             config.parquet_inflation_factor = parquet_inflation_factor;
@@ -449,6 +454,11 @@ impl PyDaftExecutionConfig {
     #[getter]
     fn get_parquet_footer_cache_mutable_files(&self) -> PyResult<bool> {
         Ok(self.config.parquet_footer_cache_mutable_files)
+    }
+
+    #[getter]
+    fn get_iceberg_metadata_cache_bytes(&self) -> PyResult<usize> {
+        Ok(self.config.iceberg_metadata_cache_bytes)
     }
 
     #[getter]

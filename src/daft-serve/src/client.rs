@@ -106,11 +106,30 @@ pub fn referenced_pset_keys(plan: &LogicalPlan) -> Vec<String> {
     keys
 }
 
+/// Bytes the server may send on one call before its reader takes them.
+///
+/// This bounds what a result left unread holds in this process. It is set
+/// explicitly, at the transport's own default, so the bound is stated here
+/// rather than inherited.
+const CALL_WINDOW_BYTES: u32 = 2 * 1024 * 1024;
+
+/// Bytes the server may send across all calls on the connection before their
+/// readers take them: the largest window the protocol allows.
+///
+/// The connection's window is returned only as each call's data is read, so
+/// at any smaller size, results held unread would together fill it and stop
+/// every other call, the next one's schema included. At this size, only each
+/// call's own window bounds what it holds, as when a connection's window is
+/// returned on receipt.
+const CONNECTION_WINDOW_BYTES: u32 = (1 << 31) - 1;
+
 /// Connection to one serving endpoint.
 ///
 /// Cloning is cheap and every clone shares the one underlying connection, which
 /// multiplexes calls: concurrent calls each take their own clone and proceed
-/// independently, so a call waiting on the server never holds up another.
+/// independently, so a call waiting on the server never holds up another. A
+/// result left unread holds at most [`CALL_WINDOW_BYTES`] of it, and never the
+/// connection.
 #[derive(Clone)]
 pub struct ServeClient {
     inner: FlightServiceClient<Channel>,
@@ -125,7 +144,9 @@ impl ServeClient {
     /// Returns an error if the address is invalid or unreachable.
     pub async fn connect(address: &str, token: Option<String>) -> ServeResult<Self> {
         let endpoint = Endpoint::from_shared(address.to_string())
-            .map_err(|e| ServeError::InvalidEnvelope(format!("invalid address: {e}")))?;
+            .map_err(|e| ServeError::InvalidEnvelope(format!("invalid address: {e}")))?
+            .initial_stream_window_size(CALL_WINDOW_BYTES)
+            .initial_connection_window_size(CONNECTION_WINDOW_BYTES);
         let channel = endpoint.connect().await.map_err(|e| {
             ServeError::Execution(DaftError::External(
                 format!("failed to connect to {address}: {e}").into(),

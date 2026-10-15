@@ -5,7 +5,10 @@ mod py {
     use common_error::DaftResult;
     use common_runtime::get_io_runtime;
     use futures::TryStreamExt;
-    use pyo3::{prelude::*, types::PyDict};
+    use pyo3::{
+        prelude::*,
+        types::{PyBytes, PyDict},
+    };
 
     use crate::{get_io_client, parse_url, s3_like, stats::IOStatsContext};
 
@@ -134,11 +137,43 @@ mod py {
         Ok(())
     }
 
+    /// Reads the whole object at `path` in one request, without asking its
+    /// size first.
+    ///
+    /// # Errors
+    /// Returns an error when the object cannot be read.
+    #[pyfunction(signature = (
+        path,
+        multithreaded_io=None,
+        io_config=None
+    ))]
+    fn io_get(
+        py: Python,
+        path: String,
+        multithreaded_io: Option<bool>,
+        io_config: Option<common_io_config::python::IOConfig>,
+    ) -> PyResult<Py<PyBytes>> {
+        let multithreaded_io = multithreaded_io.unwrap_or(true);
+        let io_stats = IOStatsContext::new(format!("io_get for {path}"));
+        let bytes: DaftResult<bytes::Bytes> = py.detach(|| {
+            let io_client = get_io_client(
+                multithreaded_io,
+                io_config.unwrap_or_default().config.into(),
+            )?;
+            get_io_runtime(multithreaded_io).block_within_async_context(async move {
+                let got = io_client.single_url_get(path, None, Some(io_stats)).await?;
+                Ok(got.bytes().await?)
+            })?
+        });
+        Ok(PyBytes::new(py, &bytes?).unbind())
+    }
+
     pub fn register_modules(parent: &Bound<PyModule>) -> PyResult<()> {
         common_io_config::python::register_modules(parent)?;
         parent.add_function(wrap_pyfunction!(io_glob, parent)?)?;
         parent.add_function(wrap_pyfunction!(s3_config_from_env, parent)?)?;
         parent.add_function(wrap_pyfunction!(io_put, parent)?)?;
+        parent.add_function(wrap_pyfunction!(io_get, parent)?)?;
         Ok(())
     }
 }

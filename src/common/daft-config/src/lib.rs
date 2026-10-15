@@ -147,6 +147,9 @@ pub struct DaftExecutionConfig {
     /// reads) are kept too, checked by size and last-modified time. Files a
     /// table marks immutable (Iceberg data files) are kept regardless, by size.
     pub parquet_footer_cache_mutable_files: bool,
+    /// The most bytes of a lakehouse table's metadata files (manifest lists
+    /// and manifests) the process keeps between reads; 0 keeps none.
+    pub iceberg_metadata_cache_bytes: usize,
     pub parquet_inflation_factor: f64,
     pub csv_target_filesize: usize,
     pub csv_inflation_factor: f64,
@@ -202,6 +205,7 @@ impl Default for DaftExecutionConfig {
             parquet_page_index: true,
             parquet_footer_cache_bytes: 50 * 1024 * 1024, // 50MB
             parquet_footer_cache_mutable_files: false,
+            iceberg_metadata_cache_bytes: 100 * 1024 * 1024, // 100MB
             parquet_inflation_factor: 3.0,
             csv_target_filesize: 512 * 1024 * 1024, // 512MB
             csv_inflation_factor: 0.5,

@@ -169,20 +169,21 @@ def _json_safe(v: PartitionValue) -> str | int | float | bool | None:
     return str(v)
 
 
-def snapshot_has_equality_deletes(table: PyIcebergTable, snapshot_id: int | None) -> bool:
+def snapshot_has_equality_deletes(table: PyIcebergTable, snapshot_id: int | None, file_io: FileIO) -> bool:
     """Return whether the snapshot's delete manifests hold an equality delete.
 
     Only delete manifests are opened, so a table without deletes costs nothing.
+    Metadata files are read through ``file_io``.
     """
     from pyiceberg.manifest import DataFileContent, ManifestContent
 
     snapshot = table.current_snapshot() if snapshot_id is None else table.snapshot_by_id(snapshot_id)
     if snapshot is None or table.metadata.format_version < 2:
         return False
-    for manifest in snapshot.manifests(table.io):
+    for manifest in snapshot.manifests(file_io):
         if manifest.content != ManifestContent.DELETES:
             continue
-        for entry in manifest.fetch_manifest_entry(table.io, discard_deleted=True):
+        for entry in manifest.fetch_manifest_entry(file_io, discard_deleted=True):
             if entry.data_file.content == DataFileContent.EQUALITY_DELETES:
                 return True
     return False

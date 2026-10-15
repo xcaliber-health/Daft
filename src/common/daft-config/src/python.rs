@@ -97,6 +97,8 @@ impl PyDaftExecutionConfig {
         parquet_split_row_groups_max_files=None,
         broadcast_join_size_bytes_threshold=None,
         hash_join_partition_size_leniency=None,
+        enable_join_key_filters=None,
+        join_key_filter_max_values=None,
         sample_size_for_sort=None,
         num_preview_rows=None,
         parquet_target_filesize=None,
@@ -138,6 +140,8 @@ impl PyDaftExecutionConfig {
         parquet_split_row_groups_max_files: Option<usize>,
         broadcast_join_size_bytes_threshold: Option<usize>,
         hash_join_partition_size_leniency: Option<f64>,
+        enable_join_key_filters: Option<bool>,
+        join_key_filter_max_values: Option<usize>,
         sample_size_for_sort: Option<usize>,
         num_preview_rows: Option<usize>,
         parquet_target_filesize: Option<usize>,
@@ -194,6 +198,12 @@ impl PyDaftExecutionConfig {
         }
         if let Some(hash_join_partition_size_leniency) = hash_join_partition_size_leniency {
             config.hash_join_partition_size_leniency = hash_join_partition_size_leniency;
+        }
+        if let Some(enable_join_key_filters) = enable_join_key_filters {
+            config.enable_join_key_filters = enable_join_key_filters;
+        }
+        if let Some(join_key_filter_max_values) = join_key_filter_max_values {
+            config.join_key_filter_max_values = join_key_filter_max_values;
         }
         if let Some(sample_size_for_sort) = sample_size_for_sort {
             config.sample_size_for_sort = sample_size_for_sort;
@@ -379,6 +389,16 @@ impl PyDaftExecutionConfig {
     #[getter]
     fn get_hash_join_partition_size_leniency(&self) -> PyResult<f64> {
         Ok(self.config.hash_join_partition_size_leniency)
+    }
+
+    #[getter]
+    fn get_enable_join_key_filters(&self) -> PyResult<bool> {
+        Ok(self.config.enable_join_key_filters)
+    }
+
+    #[getter]
+    fn get_join_key_filter_max_values(&self) -> PyResult<usize> {
+        Ok(self.config.join_key_filter_max_values)
     }
 
     #[getter]

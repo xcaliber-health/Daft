@@ -19,7 +19,9 @@ common-resource-request = {path = "../common/resource-request", default-features
 common-runtime = {path = "../common/runtime", default-features = false}
 common-system-info = {path = "../common/system-info", default-features = false}
 common-tracing = {path = "../common/tracing", default-features = false}
+common-treenode = {path = "../common/treenode", default-features = false}
 console = {workspace = true}
+daft-algebra = {path = "../daft-algebra", default-features = false}
 daft-checkpoint = {path = "../daft-checkpoint", default-features = false}
 daft-core = {path = "../daft-core", default-features = false}
 daft-groupby = {path = "../daft-groupby", default-features = false}
@@ -43,6 +45,7 @@ daft-warc = {path = "../daft-warc", default-features = false}
 daft-writers = {path = "../daft-writers", default-features = false}
 uuid = {workspace = true}
 futures = {workspace = true}
+hashbrown = {workspace = true}
 indexmap = {workspace = true}
 indicatif = {workspace = true}
 itertools = {workspace = true}
@@ -75,6 +78,7 @@ python = [
   "common-error/python",
   "common-py-serde/python",
   "common-runtime/python",
+  "common-treenode/python",
   "common-metrics/python",
   "daft-core/python",
   "daft-context/python",

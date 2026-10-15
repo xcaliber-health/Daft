@@ -7,6 +7,7 @@ pub mod index_bitmap;
 pub mod inner_join;
 pub mod join_node;
 pub mod join_operator;
+pub(crate) mod key_filter;
 pub mod left_right_join;
 pub mod outer_join;
 pub mod probe;

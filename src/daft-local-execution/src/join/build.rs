@@ -13,7 +13,7 @@ use tokio::sync::oneshot;
 use crate::{
     ExecutionTaskSpawner,
     channel::Receiver,
-    join::{join_operator::JoinOperator, stats::JoinStats},
+    join::{join_operator::JoinOperator, key_filter::KeyFilterPublisher, stats::JoinStats},
     pipeline::{InputId, PipelineEvent, PipelineMessage, next_event},
     resource_manager::SpillBudget,
     runtime_stats::{RuntimeStats, RuntimeStatsManagerHandle},
@@ -361,6 +361,9 @@ pub(crate) struct BuildExecutionContext<Op: JoinOperator> {
     /// partitions reorders output, so it is only allowed when downstream
     /// does not require input order.
     allow_grace: bool,
+    /// Publishes each input's keys to the probe-side scans they filter, when
+    /// any do. Dropped, and so closed, when the build side stops.
+    key_filter: Option<KeyFilterPublisher>,
 }
 
 impl<Op: JoinOperator + 'static> BuildExecutionContext<Op> {
@@ -386,6 +389,23 @@ impl<Op: JoinOperator + 'static> BuildExecutionContext<Op> {
             node_info,
             spill,
             allow_grace,
+            key_filter: None,
+        }
+    }
+
+    /// Publishes each finished input's keys through `publisher`.
+    pub(crate) fn with_key_filter(mut self, publisher: Option<KeyFilterPublisher>) -> Self {
+        self.key_filter = publisher;
+        self
+    }
+
+    /// Publishes an input's key filter, if this join's keys filter a scan.
+    fn publish_key_filter(&self, input_id: InputId, finalized: Option<&Op::FinalizedBuildState>) {
+        if let Some(publisher) = &self.key_filter {
+            publisher.publish(
+                input_id,
+                finalized.and_then(|state| self.op.build_key_columns(state)),
+            );
         }
     }
 
@@ -408,7 +428,9 @@ impl<Op: JoinOperator + 'static> BuildExecutionContext<Op> {
         };
         match accum {
             BuildAccum::Resident(state) => {
-                if let Ok(finalized) = self.op.finalize_build(state) {
+                let finalized = self.op.finalize_build(state).ok();
+                self.publish_key_filter(input_id, finalized.as_ref());
+                if let Some(finalized) = finalized {
                     self.build_state_bridge.send_finalized_build_state(
                         input_id,
                         AccountedBuildState {
@@ -419,6 +441,8 @@ impl<Op: JoinOperator + 'static> BuildExecutionContext<Op> {
                 }
             }
             BuildAccum::Grace(writers) => {
+                // A build side too large for memory is too large to filter by.
+                self.publish_key_filter(input_id, None);
                 let Some(spill) = self.spill.clone() else {
                     return Err(common_error::DaftError::InternalError(
                         "partitioned join active but spilling is not configured".to_string(),
@@ -449,6 +473,16 @@ impl<Op: JoinOperator + 'static> BuildExecutionContext<Op> {
         &self,
         receiver: Receiver<PipelineMessage>,
     ) -> DaftResult<()> {
+        let result = self.build_inputs(receiver).await;
+        // Finished or failed, the build side publishes nothing more: release
+        // any scan still waiting for its keys.
+        if let Some(publisher) = &self.key_filter {
+            publisher.close();
+        }
+        result
+    }
+
+    async fn build_inputs(&self, receiver: Receiver<PipelineMessage>) -> DaftResult<()> {
         let mut receiver = receiver;
         let mut inputs: HashMap<InputId, PerBuildInput<Op>> = HashMap::new();
         let mut tasks: OrderingAwareJoinSet<BuildTaskResult<Op>> = OrderingAwareJoinSet::new(false);

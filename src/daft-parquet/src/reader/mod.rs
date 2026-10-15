@@ -587,6 +587,13 @@ pub async fn stream_parquet(
     )?;
     let plan = resolve_column_plan(&prepared, opts)?;
 
+    // Row groups are pruned by the predicate and by the prune-only filter
+    // together; only the predicate goes on to filter rows.
+    let prune_predicate = match (&opts.predicate, &opts.row_group_filter) {
+        (Some(predicate), Some(filter)) => Some(predicate.clone().and(filter.clone())),
+        (predicate, filter) => predicate.as_ref().or(filter.as_ref()).cloned(),
+    };
+
     // Single RG-level pruning pass: user row_groups + positional (start_offset,
     // num_rows) + predicate stats. Must run before `cs_builder.build`, which is
     // what spawns remote byte fetches.
@@ -595,7 +602,7 @@ pub async fn stream_parquet(
         opts.row_groups.as_deref(),
         opts.start_offset.unwrap_or(0),
         opts.num_rows,
-        opts.predicate.as_ref(),
+        prune_predicate.as_ref(),
         &plan.read_daft_schema,
         source.label(),
     )?;
@@ -603,7 +610,7 @@ pub async fn stream_parquet(
     // Bloom-filter pruning: drop row groups whose per-column filters prove an
     // equality/membership predicate cannot match. Additive on top of the stats
     // pruning above; reads filter bitsets via `cs_builder` before fetches spawn.
-    let rg_indices = match opts.predicate.as_ref() {
+    let rg_indices = match prune_predicate.as_ref() {
         Some(predicate) => {
             let probes = crate::bloom::extract_bloom_probes(predicate);
             crate::bloom::prune_row_groups_by_bloom(

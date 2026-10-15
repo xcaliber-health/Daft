@@ -48,6 +48,7 @@ use crate::{
     },
     join::{
         AsofJoinOperator, CrossJoinOperator, HashJoinOperator, JoinNode, SortMergeJoinOperator,
+        key_filter::{ScanKeyFilter, plan_key_filter},
     },
     sinks::{
         aggregate::AggregateSink,
@@ -277,6 +278,9 @@ pub struct BuilderContext {
         )>,
     >,
     pub skipped_corrupt_files: std::sync::Arc<std::sync::Mutex<Vec<(String, String, bool)>>>,
+    /// Join-key filters planned by a hash join for the scans on its probe
+    /// side, held by scan source until that scan becomes a pipeline node.
+    scan_key_filters: std::cell::RefCell<HashMap<SourceId, Vec<ScanKeyFilter>>>,
 }
 
 impl BuilderContext {
@@ -298,7 +302,25 @@ impl BuilderContext {
             shuffle_server,
             checkpoint: std::cell::RefCell::new(None),
             skipped_corrupt_files: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            scan_key_filters: std::cell::RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Holds `filter` for the scan of `source` until that scan is built.
+    fn add_scan_key_filter(&self, source: SourceId, filter: ScanKeyFilter) {
+        self.scan_key_filters
+            .borrow_mut()
+            .entry(source)
+            .or_default()
+            .push(filter);
+    }
+
+    /// Takes the join-key filters planned for the scan of `source`.
+    fn take_scan_key_filters(&self, source: SourceId) -> Vec<ScanKeyFilter> {
+        self.scan_key_filters
+            .borrow_mut()
+            .remove(&source)
+            .unwrap_or_default()
     }
 
     pub fn shuffle_server(&self) -> Option<(Arc<ShuffleFlightServer>, String)> {
@@ -463,7 +485,8 @@ fn physical_plan_to_pipeline(
                 schema.clone(),
                 cfg,
                 Some(ctx.skipped_corrupt_files.clone()),
-            );
+            )
+            .with_key_filters(ctx.take_scan_key_filters(*source_id));
             SourceNode::new(
                 Box::new(scan_task_source),
                 stats_state.clone(),
@@ -1251,6 +1274,26 @@ fn physical_plan_to_pipeline(
                 }
                 let key_schema = Arc::new(Schema::new(build_key_fields));
 
+                // Planned before the children become pipelines, so each
+                // probe-side scan it filters is built holding its filter.
+                let key_types = key_schema.fields().iter().map(|field| &field.dtype).collect::<Vec<_>>();
+                let key_filter = plan_key_filter(
+                    *join_type,
+                    null_equals_null.as_deref(),
+                    build_child,
+                    probe_child,
+                    build_on,
+                    probe_on,
+                    &key_types,
+                    cfg,
+                )?
+                .map(|planned| {
+                    for (source, filter) in planned.scans {
+                        ctx.add_scan_key_filter(source, filter);
+                    }
+                    planned.publisher
+                });
+
                 let track_indices = if matches!(join_type, JoinType::Anti | JoinType::Semi) {
                     build_on_left
                 } else {
@@ -1282,6 +1325,7 @@ fn physical_plan_to_pipeline(
                     ctx,
                     context,
                 )
+                .with_key_filter(key_filter)
                 .boxed())
             }()
             .with_context(|_| PipelineCreationSnafu {

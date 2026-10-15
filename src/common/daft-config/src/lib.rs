@@ -125,6 +125,13 @@ pub struct DaftExecutionConfig {
     pub max_sources_per_scan_task: usize,
     pub parquet_split_row_groups_max_files: usize,
     pub broadcast_join_size_bytes_threshold: usize,
+    /// Whether a hash join whose build side is small filters the scans on its
+    /// probe side by the keys the build side holds.
+    pub enable_join_key_filters: bool,
+    /// The most build-side rows whose key values a join-key filter lists to
+    /// skip row groups by their bloom filters; above it, row groups are
+    /// skipped by the keys' range alone.
+    pub join_key_filter_max_values: usize,
     pub hash_join_partition_size_leniency: f64,
     pub sample_size_for_sort: usize,
     pub num_preview_rows: usize,
@@ -175,6 +182,8 @@ impl Default for DaftExecutionConfig {
             max_sources_per_scan_task: 10,
             parquet_split_row_groups_max_files: 10,
             broadcast_join_size_bytes_threshold: 10 * 1024 * 1024, // 10 MiB
+            enable_join_key_filters: true,
+            join_key_filter_max_values: 1000,
             hash_join_partition_size_leniency: 0.5,
             sample_size_for_sort: 20,
             num_preview_rows: 8,

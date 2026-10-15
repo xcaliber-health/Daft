@@ -2650,6 +2650,8 @@ class PyDaftExecutionConfig:
         parquet_split_row_groups_max_files: int | None = None,
         broadcast_join_size_bytes_threshold: int | None = None,
         hash_join_partition_size_leniency: float | None = None,
+        enable_join_key_filters: bool | None = None,
+        join_key_filter_max_values: int | None = None,
         sample_size_for_sort: int | None = None,
         num_preview_rows: int | None = None,
         parquet_target_filesize: int | None = None,
@@ -2699,6 +2701,10 @@ class PyDaftExecutionConfig:
     def broadcast_join_size_bytes_threshold(self) -> int: ...
     @property
     def hash_join_partition_size_leniency(self) -> float: ...
+    @property
+    def enable_join_key_filters(self) -> bool: ...
+    @property
+    def join_key_filter_max_values(self) -> int: ...
     @property
     def sample_size_for_sort(self) -> int: ...
     @property

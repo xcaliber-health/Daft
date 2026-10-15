@@ -24,6 +24,10 @@ pub struct TableStatistics {
     schema: SchemaRef,
 }
 
+/// The longest value list a membership test is judged by value against
+/// statistics; a longer one is judged by the range its values span.
+const MAX_LISTED_EQUALITIES: usize = 64;
+
 impl TableStatistics {
     pub fn new(columns: Vec<ColumnRangeStatistics>, schema: SchemaRef) -> Self {
         Self { columns, schema }
@@ -150,6 +154,7 @@ impl TableStatistics {
                     _ => Ok(ColumnRangeStatistics::Missing),
                 }
             }
+            Expr::IsIn(col, items) => self.eval_is_in(col, items),
             Expr::Cast(col, dtype, try_cast) => {
                 let stats = self.eval_expression(&BoundExpr::new_unchecked(col.clone()))?;
                 if *try_cast {
@@ -159,6 +164,34 @@ impl TableStatistics {
                 }
             }
             _ => Ok(ColumnRangeStatistics::Missing),
+        }
+    }
+
+    /// Whether `col` is one of `items`, judged by statistics.
+    ///
+    /// A short list is the disjunction of its equalities, which can rule out a
+    /// range its values straddle. A longer one is judged by the range its
+    /// values span, which costs one comparison whatever its length. Either way
+    /// it is false only where no listed value can lie in the column's range.
+    /// A list holding anything but literals is not judged.
+    fn eval_is_in(&self, col: &ExprRef, items: &[ExprRef]) -> crate::Result<ColumnRangeStatistics> {
+        if !items.iter().all(|item| matches!(item.as_ref(), Expr::Literal(_))) {
+            return Ok(ColumnRangeStatistics::Missing);
+        }
+        let column = self.eval_expression(&BoundExpr::new_unchecked(col.clone()))?;
+        let mut values = items
+            .iter()
+            .map(|item| self.eval_expression(&BoundExpr::new_unchecked(item.clone())));
+        let Some(first) = values.next().transpose()? else {
+            return ColumnRangeStatistics::try_from(Literal::Boolean(false));
+        };
+        if items.len() <= MAX_LISTED_EQUALITIES {
+            values.try_fold(column.equal(&first)?, |any, value| {
+                any.bitor(&column.equal(&value?)?)
+            })
+        } else {
+            let span = values.try_fold(first, |span, value| span.union(&value?))?;
+            column.equal(&span)
         }
     }
 
@@ -251,6 +284,45 @@ mod test {
 
     use super::TableStatistics;
     use crate::{DaftCoreComputeSnafu, column_stats::TruthValue};
+
+    /// The truth of `column a IN values` over statistics of `a` spanning 10..=20.
+    fn is_in(values: &[i64]) -> TruthValue {
+        let table = RecordBatch::from_nonempty_columns(vec![
+            Int64Array::from_slice("a", &[10, 20]).into_series(),
+        ])
+        .unwrap();
+        let expr = BoundExpr::try_new(
+            resolved_col("a").is_in(values.iter().map(|value| lit(*value)).collect()),
+            &table.schema,
+        )
+        .unwrap();
+        TableStatistics::from_table(&table)
+            .eval_expression(&expr)
+            .unwrap()
+            .to_truth_value()
+    }
+
+    #[test]
+    fn a_value_list_is_false_only_where_no_value_can_lie_in_the_range() {
+        let long_straddling: Vec<i64> = (0..100).map(|v| v * 3).collect();
+        let long_outside: Vec<i64> = (30..200).collect();
+        let cases: [(&[i64], TruthValue); 6] = [
+            (&[1, 2], TruthValue::False),
+            (&[15], TruthValue::Maybe),
+            (&[5, 25], TruthValue::False),
+            (&[5, 12], TruthValue::Maybe),
+            (&long_straddling, TruthValue::Maybe),
+            (&long_outside, TruthValue::False),
+        ];
+        for (values, truth) in cases {
+            assert_eq!(is_in(values), truth, "{values:?}");
+        }
+    }
+
+    #[test]
+    fn an_empty_value_list_is_false() {
+        assert_eq!(is_in(&[]), TruthValue::False);
+    }
 
     #[test]
     fn test_equal() -> crate::Result<()> {

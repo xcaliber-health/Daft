@@ -25,53 +25,171 @@ if TYPE_CHECKING:
     from daft.dependencies import pa, pads, pq
 
 
-def get_missing_columns(
-    data_schema: pa.Schema,
-    iceberg_schema: IcebergSchema,
-    *,
-    require_matching_columns: bool = False,
-) -> ExpressionsProjection:
-    """Add null values for columns in the table schema that are missing from the data.
+# The decimal digits every value of an integer type needs, by bit width and sign.
+_INTEGER_DIGITS = {
+    (8, True): 3,
+    (16, True): 5,
+    (32, True): 10,
+    (64, True): 19,
+    (8, False): 3,
+    (16, False): 5,
+    (32, False): 10,
+    (64, False): 20,
+}
+
+
+def _integer_digits(dtype: pa.DataType) -> int:
+    import pyarrow as pa
+
+    return _INTEGER_DIGITS[(dtype.bit_width, pa.types.is_signed_integer(dtype))]
+
+
+def _is_bytes(dtype: pa.DataType) -> bool:
+    import pyarrow as pa
+
+    return pa.types.is_binary(dtype) or pa.types.is_large_binary(dtype) or pa.types.is_fixed_size_binary(dtype)
+
+
+def _is_list(dtype: pa.DataType) -> bool:
+    import pyarrow as pa
+
+    return pa.types.is_list(dtype) or pa.types.is_large_list(dtype) or pa.types.is_fixed_size_list(dtype)
+
+
+def _refusal(written: pa.DataType, column: pa.Field, path: str) -> str | None:
+    """Why values of type ``written`` cannot be written into ``column``, or ``None`` if they can.
+
+    A value is written when the writer keeps it as it is, or refuses it value by
+    value: the same type however stored (bytes into a fixed length, and a list of
+    fixed size into a list, included), an integer or decimal into another, an
+    integer into a decimal that holds every value of its type, an integer into a
+    float or back, a narrower float into a wider one, a time or timestamp of
+    another unit, a zoned timestamp into a zoned column, and a date into a
+    timestamp without a zone. A conversion that would round, parse, format or
+    assume a zone is refused. Nested types follow the same rule, field by field.
+    """
+    import pyarrow as pa
+
+    target = column.type
+    if written.equals(target) or pa.types.is_null(written):
+        return None
+    t = pa.types
+    if (t.is_string(written) or t.is_large_string(written)) and (t.is_string(target) or t.is_large_string(target)):
+        return None
+    if _is_bytes(written) and _is_bytes(target):
+        # Into a fixed length, a value of another length fails the write.
+        return None
+    if t.is_integer(written) and t.is_decimal(target):
+        if target.precision - target.scale >= _integer_digits(written):
+            return None
+        return f"a decimal of precision {target.precision} and scale {target.scale} does not hold every {written}"
+    if t.is_integer(written) and (t.is_integer(target) or t.is_floating(target)):
+        return None
+    if t.is_decimal(written) and t.is_decimal(target):
+        return None
+    if t.is_floating(written) and t.is_integer(target):
+        return None
+    if t.is_floating(written) and t.is_floating(target):
+        if written.bit_width < target.bit_width:
+            return None
+        return "a narrower float rounds the value"
+    if t.is_floating(written) and t.is_decimal(target):
+        return "a decimal from a float rounds the value"
+    if t.is_decimal(written) and t.is_floating(target):
+        return "a float from a decimal rounds the value"
+    if t.is_timestamp(written) and t.is_timestamp(target):
+        if (written.tz is None) == (target.tz is None):
+            return None
+        return "a timestamp's time zone would be assumed or dropped"
+    if t.is_time(written) and t.is_time(target):
+        return None
+    if t.is_date(written) and t.is_timestamp(target):
+        if target.tz is None:
+            return None
+        return "a date names no instant until a time zone is assumed"
+    if t.is_struct(written) and t.is_struct(target):
+        return _struct_refusal(written, target, path)
+    if _is_list(written) and _is_list(target):
+        return _refusal_at(written.value_type, target.value_field, f"{path}.element")
+    if t.is_map(written) and t.is_map(target):
+        return _refusal_at(written.key_type, target.key_field, f"{path}.key") or _refusal_at(
+            written.item_type, target.item_field, f"{path}.value"
+        )
+    return "the writer would have to convert it"
+
+
+def _refusal_at(written: pa.DataType, column: pa.Field, path: str) -> str | None:
+    """The refusal for a nested field, naming the field it is about."""
+    refusal = _refusal(written, column, path)
+    if refusal is None or refusal.startswith("the column "):
+        return refusal
+    return f"the column {path!r} is {written}, which cannot be written into the table's {column.type}: {refusal}"
+
+
+def _struct_refusal(written: pa.StructType, target: pa.StructType, path: str) -> str | None:
+    """Why a struct of ``written`` fields cannot be written into one of ``target`` fields."""
+    targets = {target.field(i).name: target.field(i) for i in range(target.num_fields)}
+    fields = {written.field(i).name: written.field(i).type for i in range(written.num_fields)}
+    extra = sorted(fields.keys() - targets.keys())
+    if extra:
+        return f"the column {path!r} has the fields {extra}, which the table's {path!r} does not have"
+    for name, field in targets.items():
+        if name not in fields:
+            if not field.nullable:
+                return f"the column {path!r} lacks the field {name!r}, which the table requires"
+            continue
+        refusal = _refusal_at(fields[name], field, f"{path}.{name}")
+        if refusal is not None:
+            return refusal
+    return None
+
+
+def planned_columns(data_schema: pa.Schema, iceberg_schema: IcebergSchema) -> ExpressionsProjection:
+    """Checks the data to be written against a table, and returns the columns it lacks.
+
+    Each column of the data must be a column of the table, of a type the writer
+    keeps value by value (see ``_refusal``); each column of the table the data
+    lacks must be optional, and is written as nulls. Checked when the write is
+    planned, from the two schemas, so nothing is computed or written first.
 
     Args:
         data_schema (pa.Schema): Schema of the data about to be written.
         iceberg_schema (IcebergSchema): Schema of the table being written to.
-        require_matching_columns (bool): When true, refuse data that both lacks
-            table columns and carries extra ones. Off by default, since a write may
-            deliberately supply a subset of the table's columns or extra ones the
-            table drops.
 
     Returns:
         ExpressionsProjection: One null literal per table column absent from the
             data, typed to match.
 
     Raises:
-        ValueError: If ``require_matching_columns`` is set and the data both lacks
-            columns the table has and carries columns the table does not; padding
-            one while dropping the other would silently empty a renamed column.
+        ValueError: If the data carries a column the table does not, lacks one the
+            table requires, or holds a column of a type the table's column would
+            have to convert by rounding, parsing, formatting or assuming a zone.
     """
     from pyiceberg.io.pyarrow import schema_to_pyarrow
 
-    iceberg_pyarrow_schema = schema_to_pyarrow(iceberg_schema)
+    table_schema = schema_to_pyarrow(iceberg_schema)
+    targets = {field.name: field for field in table_schema}
 
-    existing_columns = set(data_schema.names)
-    target_columns = set(iceberg_pyarrow_schema.names)
-
-    missing = [name for name in iceberg_pyarrow_schema.names if name not in existing_columns]
-    extra = sorted(existing_columns - target_columns)
-    if require_matching_columns and missing and extra:
+    names = data_schema.names
+    present = set(names)
+    extra = [name for name in names if name not in targets]
+    if extra:
         raise ValueError(
-            "Refusing to write data whose columns do not line up with the table's: "
-            f"{sorted(missing)} would be filled with nulls while {extra} would be dropped. "
-            "The names most likely refer to the same columns, and writing would empty them."
+            f"Refusing to write the columns {extra}, which the table does not have; its columns are "
+            f"{list(targets)}. Select or rename the columns to write."
         )
+    for field in data_schema:
+        refusal = _refusal_at(field.type, targets[field.name], field.name)
+        if refusal is not None:
+            raise ValueError(f"Refusing the write: {refusal}. Cast it to the column's type explicitly.")
+    missing = [field for name, field in targets.items() if name not in present]
+    required = [field.name for field in missing if not field.nullable]
+    if required:
+        raise ValueError(f"Refusing to write data lacking the table's required columns {required}.")
 
-    to_add = [
-        lit(None).alias(name).cast(DataType.from_arrow_type(iceberg_pyarrow_schema.field(name).type))
-        for name in missing
-    ]
-
-    return ExpressionsProjection(to_add)
+    return ExpressionsProjection(
+        [lit(None).alias(field.name).cast(DataType.from_arrow_type(field.type)) for field in missing]
+    )
 
 
 def coerce_pyarrow_table_to_schema(pa_table: pa.Table, schema: pa.Schema) -> pa.Table:

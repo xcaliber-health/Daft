@@ -619,7 +619,10 @@ impl LocalChunkSource {
                     let mut filled = 0usize;
                     let mut result = Ok(());
                     while filled < buf.len() {
-                        match self.file.seek_read(&mut buf[filled..], span.start + filled as u64) {
+                        match self
+                            .file
+                            .seek_read(&mut buf[filled..], span.start + filled as u64)
+                        {
                             Ok(0) => {
                                 result = Err(std::io::Error::new(
                                     std::io::ErrorKind::UnexpectedEof,
@@ -878,7 +881,11 @@ impl RemoteChunkSource {
             let range = span.start as usize..span.end as usize;
             io_runtime.spawn(async move {
                 let got = io_client
-                    .single_url_get(uri, Some(daft_io::range::GetRange::Bounded(range)), io_stats)
+                    .single_url_get(
+                        uri,
+                        Some(daft_io::range::GetRange::Bounded(range)),
+                        io_stats,
+                    )
                     .await?;
                 crate::Result::Ok(got.bytes().await?)
             })
@@ -1023,8 +1030,14 @@ mod tests {
     #[test]
     fn sparse_bytes_read_within_each_fetched_range() {
         let bytes = pages();
-        assert_eq!(bytes.get_bytes(100, 5).unwrap(), Bytes::from_static(b"first"));
-        assert_eq!(bytes.get_bytes(502, 4).unwrap(), Bytes::from_static(b"cond"));
+        assert_eq!(
+            bytes.get_bytes(100, 5).unwrap(),
+            Bytes::from_static(b"first")
+        );
+        assert_eq!(
+            bytes.get_bytes(502, 4).unwrap(),
+            Bytes::from_static(b"cond")
+        );
         assert_eq!(parquet::file::reader::Length::len(&bytes), 1_000);
     }
 

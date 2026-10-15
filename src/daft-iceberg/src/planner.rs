@@ -365,7 +365,11 @@ mod tests {
         c.positional_delete_paths = vec!["/p.parquet".into()];
         c.equality_delete_paths = vec!["/e.parquet".into()];
         let groups = plan_file_groups(vec![c], &o, 0).unwrap();
-        assert_eq!(groups.len(), 1, "one file at the target is rewritten only for its deletes");
+        assert_eq!(
+            groups.len(),
+            1,
+            "one file at the target is rewritten only for its deletes"
+        );
     }
 
     #[test]

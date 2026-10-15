@@ -10,14 +10,14 @@ use common_display::{DisplayAs, DisplayLevel, tree::TreeDisplay};
 use common_error::{DaftError, DaftResult};
 use common_metrics::ops::NodeType;
 use common_runtime::{JoinSet, combine_stream, get_compute_pool_num_threads, get_io_runtime};
+use daft_algebra::boolean::combine_conjunction;
 use daft_core::prelude::{Int64Array, SchemaRef, Utf8Array};
+use daft_dsl::{ExprRef, expr::bound_expr::BoundExpr};
 use daft_io::IOStatsRef;
 use daft_micropartition::MicroPartition;
 use daft_parquet::read::{
     ParquetBulkReadOptions, ParquetSchemaInferenceOptions, read_parquet_bulk,
 };
-use daft_algebra::boolean::combine_conjunction;
-use daft_dsl::{ExprRef, expr::bound_expr::BoundExpr};
 use daft_scan::{FileFormatConfig, Pushdowns, ScanTask, ScanTaskRef, SourceConfig};
 use futures::{FutureExt, Stream, StreamExt};
 use tracing::instrument;
@@ -158,10 +158,7 @@ async fn restrict_by_join_keys(
 
 /// Whether a task's partition value, if the restricted column is one of its
 /// partition columns, satisfies each restriction on it.
-fn partition_admits(
-    task: &ScanTask,
-    restrictions: &[ColumnRestriction<'_>],
-) -> DaftResult<bool> {
+fn partition_admits(task: &ScanTask, restrictions: &[ColumnRestriction<'_>]) -> DaftResult<bool> {
     let Some(spec) = task.partition_spec() else {
         return Ok(true);
     };
@@ -679,13 +676,18 @@ async fn forward_scan_task_stream(
         maintain_order,
         chunk_size,
         skipped_corrupt_files,
-        restriction.as_ref().map(|restriction| &restriction.row_group_filter),
+        restriction
+            .as_ref()
+            .map(|restriction| &restriction.row_group_filter),
         parquet_page_index,
     )
     .await?;
     let mut has_data = false;
     while let Some(result) = stream.next().await {
-        let partition = match restriction.as_ref().and_then(|restriction| restriction.rows.as_ref()) {
+        let partition = match restriction
+            .as_ref()
+            .and_then(|restriction| restriction.rows.as_ref())
+        {
             Some(rows) => rows.apply(result?)?,
             None => result?,
         };
@@ -734,6 +736,7 @@ async fn forward_scan_task_stream(
     Ok(input_id)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_scan_task(
     scan_task: Arc<ScanTask>,
     io_stats: IOStatsRef,

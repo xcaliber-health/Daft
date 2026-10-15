@@ -51,8 +51,12 @@ pub(super) fn index_range(metadata: &ParquetMetaData) -> Option<Range<u64>> {
     for row_group in metadata.row_groups() {
         for column in row_group.columns() {
             let indexes = [
-                column.offset_index_offset().zip(column.offset_index_length()),
-                column.column_index_offset().zip(column.column_index_length()),
+                column
+                    .offset_index_offset()
+                    .zip(column.offset_index_length()),
+                column
+                    .column_index_offset()
+                    .zip(column.column_index_length()),
             ];
             for (offset, length) in indexes.into_iter().flatten() {
                 let (Ok(start), Ok(length)) = (u64::try_from(offset), u64::try_from(length)) else {
@@ -168,8 +172,15 @@ pub(super) fn rows_not_ruled_out(
 /// The leaf of a top-level column that is itself a leaf, not a nested type.
 fn single_leaf(metadata: &ParquetMetaData, column: &str) -> Option<usize> {
     let schema = metadata.file_metadata().schema_descr();
-    let mut leaves = (0..schema.num_columns())
-        .filter(|&leaf| schema.column(leaf).path().parts().first().map(String::as_str) == Some(column));
+    let mut leaves = (0..schema.num_columns()).filter(|&leaf| {
+        schema
+            .column(leaf)
+            .path()
+            .parts()
+            .first()
+            .map(String::as_str)
+            == Some(column)
+    });
     let leaf = leaves.next()?;
     (leaves.next().is_none() && schema.column(leaf).path().parts().len() == 1).then_some(leaf)
 }
@@ -177,7 +188,9 @@ fn single_leaf(metadata: &ParquetMetaData, column: &str) -> Option<usize> {
 /// One page's statistics from the column index, in the form the row-group
 /// statistics take.
 fn page_statistics(index: &ColumnIndexMetaData, page: usize) -> Option<Statistics> {
-    let nulls = index.null_count(page).and_then(|nulls| u64::try_from(nulls).ok());
+    let nulls = index
+        .null_count(page)
+        .and_then(|nulls| u64::try_from(nulls).ok());
     Some(match index {
         ColumnIndexMetaData::NONE => return None,
         ColumnIndexMetaData::BOOLEAN(pages) => Statistics::boolean(
@@ -223,8 +236,12 @@ fn page_statistics(index: &ColumnIndexMetaData, page: usize) -> Option<Statistic
             false,
         ),
         ColumnIndexMetaData::BYTE_ARRAY(pages) => Statistics::byte_array(
-            pages.min_value(page).map(|bytes| ByteArray::from(bytes.to_vec())),
-            pages.max_value(page).map(|bytes| ByteArray::from(bytes.to_vec())),
+            pages
+                .min_value(page)
+                .map(|bytes| ByteArray::from(bytes.to_vec())),
+            pages
+                .max_value(page)
+                .map(|bytes| ByteArray::from(bytes.to_vec())),
             None,
             nulls,
             false,
@@ -252,7 +269,11 @@ pub(super) fn page_ranges(
     leaf: usize,
     selection: &RowSelection,
 ) -> Option<Vec<Range<u64>>> {
-    let pages = &metadata.offset_index()?.get(rg_idx)?.get(leaf)?.page_locations;
+    let pages = &metadata
+        .offset_index()?
+        .get(rg_idx)?
+        .get(leaf)?
+        .page_locations;
     let (start, _) = metadata.row_group(rg_idx).column(leaf).byte_range();
     let mut ranges = Vec::new();
     if let Some(first) = pages.first()
@@ -263,7 +284,6 @@ pub(super) fn page_ranges(
     ranges.extend(selection.scan_ranges(pages));
     Some(ranges)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -417,4 +437,3 @@ mod tests {
         assert_eq!(ranges, expected);
     }
 }
-

@@ -175,7 +175,10 @@ impl TableStatistics {
     /// it is false only where no listed value can lie in the column's range.
     /// A list holding anything but literals is not judged.
     fn eval_is_in(&self, col: &ExprRef, items: &[ExprRef]) -> crate::Result<ColumnRangeStatistics> {
-        if !items.iter().all(|item| matches!(item.as_ref(), Expr::Literal(_))) {
+        if !items
+            .iter()
+            .all(|item| matches!(item.as_ref(), Expr::Literal(_)))
+        {
             return Ok(ColumnRangeStatistics::Missing);
         }
         let column = self.eval_expression(&BoundExpr::new_unchecked(col.clone()))?;

@@ -118,7 +118,8 @@ class DescribingHost(RequestHost, Protocol):
     failure ``plan`` raised itself, or for the server's own failures (capacity,
     time limit, cancellation, draining). It runs off the server's network
     threads, within the query's execution slot and what remains of its time
-    limit, and is abandoned if the query is cancelled.
+    limit, and is abandoned if the query is cancelled. The query's end is
+    reported to subscribers only once it has returned or been abandoned.
 
     What it returns reaches the client as the failure's ``detail``, bounded to
     2 KiB; the failure's class and message are never changed. If it raises,

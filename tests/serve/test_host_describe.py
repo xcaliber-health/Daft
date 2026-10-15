@@ -20,6 +20,8 @@ from daft import col
 from daft.exceptions import DaftCardinalityError, DaftServeError
 from daft.runners.remote_runner import RemoteRunner
 from daft.serve import DescribingHost, ServedRequest, ServeSettings, start_server
+from daft.subscribers import Subscriber
+from daft.subscribers.events import Event, QueryFinished
 
 if TYPE_CHECKING:
     from daft.daft import DaftServeServer
@@ -63,6 +65,30 @@ class Host:
         if self._raises:
             raise RuntimeError("the description could not be made")
         return self._answer
+
+
+class Ended(Subscriber):
+    """Records the queries whose end has been reported."""
+
+    def __init__(self) -> None:
+        self.query_ids: set[str] = set()
+
+    def on_event(self, event: Event) -> None:
+        if isinstance(event, QueryFinished):
+            self.query_ids.add(event.query_id)
+
+
+class EndWatchingHost(Host):
+    """Notes, when asked to describe, whether the query's end was already reported."""
+
+    def __init__(self, ended: Ended) -> None:
+        super().__init__()
+        self._ended = ended
+        self.ended_before_describing: list[bool] = []
+
+    def describe(self, request: ServedRequest, failure: Exception) -> str | None:
+        self.ended_before_describing.append(request.query_id in self._ended.query_ids)
+        return super().describe(request, failure)
 
 
 class PlanningOnlyHost(Host):
@@ -172,6 +198,18 @@ def test_describing_holds_the_querys_slot() -> None:
         failing.join()
 
     assert held == 1
+
+
+def test_the_host_describes_before_the_querys_end_is_reported() -> None:
+    ended = Ended()
+    host = EndWatchingHost(ended)
+    with daft.with_subscriber("describe-order", ended):
+        for server in _serving(host):
+            with pytest.raises(DaftCardinalityError):
+                _run(server, "collapse", "q-order")
+
+    assert host.ended_before_describing == [False]
+    assert "q-order" in ended.query_ids
 
 
 def test_a_host_with_describe_is_a_describing_host() -> None:

@@ -20,7 +20,10 @@
 use std::{
     collections::HashMap,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll, ready},
 };
 
@@ -55,6 +58,9 @@ pub struct Planners {
     pub session: Option<Arc<Py<PyAny>>>,
     /// Registered host planning requests of the kinds it declares.
     pub host: Option<Arc<Py<PyAny>>>,
+    /// Whether the host describes how a frame it planned failed while running,
+    /// read once when the server starts.
+    pub host_describes: bool,
 }
 
 /// Where an admitted query's encoded results go, for its client to read at
@@ -165,6 +171,107 @@ pub struct RequestOrigin {
     pub caller: Option<String>,
 }
 
+/// The request a host is handed: its kind and body, with its query id and caller.
+fn served_request<'py>(
+    py: Python<'py>,
+    kind: &str,
+    body: &[u8],
+    origin: &RequestOrigin,
+) -> PyResult<Bound<'py, PyAny>> {
+    py.import(intern!(py, "daft.serve"))?
+        .getattr(intern!(py, "ServedRequest"))?
+        .call1((
+            kind,
+            pyo3::types::PyBytes::new(py, body),
+            origin.query_id.as_str(),
+            origin.caller.as_deref(),
+        ))
+}
+
+/// A host request kept to hand back to the host that planned it, should its
+/// frame fail while running.
+struct HostRequest {
+    host: Arc<Py<PyAny>>,
+    kind: String,
+    body: Vec<u8>,
+    origin: RequestOrigin,
+}
+
+/// Asks the host that planned a frame to describe how it failed while running,
+/// and attaches its words to the failure as its detail, bounded.
+///
+/// The host is handed the request and the failure as the client will raise it,
+/// on a blocking thread holding a share of the query's slot until it returns.
+/// The class and message are never changed. If the host raises, returns `None`,
+/// runs past `remaining` of the query's time limit, or the query is cancelled
+/// first, the failure is returned as it was; what the host raised is logged by
+/// its type, never sent.
+async fn described(
+    err: ServeError,
+    request: HostRequest,
+    remaining: Option<std::time::Duration>,
+    slot: &AdmissionPermit,
+    cancel: &CancellationToken,
+) -> ServeError {
+    let ServeError::Failed {
+        mut failure,
+        message,
+    } = err
+    else {
+        return err;
+    };
+    let raised = ServeError::Failed {
+        failure: failure.clone(),
+        message: message.clone(),
+    };
+    let query_id = request.origin.query_id.clone();
+    let slot = slot.clone();
+    let describing = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        Python::attach(|py| -> PyResult<Option<String>> {
+            let served = served_request(py, &request.kind, &request.body, &request.origin)?;
+            let failure = crate::python::served_error(raised, Some(&request.origin.query_id));
+            request
+                .host
+                .bind(py)
+                .call_method1(intern!(py, "describe"), (served, failure.value(py)))?
+                .extract()
+        })
+    });
+    let within_limit = async {
+        match remaining {
+            Some(limit) => tokio::time::timeout(limit, describing).await.ok(),
+            None => Some(describing.await),
+        }
+    };
+    let outcome = tokio::select! {
+        () = cancel.cancelled() => None,
+        outcome = within_limit => outcome,
+    };
+    match outcome {
+        Some(Ok(Ok(Some(detail)))) => failure.detail = Some(crate::error::bounded_detail(detail)),
+        Some(Ok(Ok(None))) => {}
+        Some(Ok(Err(raised))) => {
+            let kind = Python::attach(|py| {
+                raised
+                    .get_type(py)
+                    .name()
+                    .map_or_else(|_| "an exception".to_string(), |name| name.to_string())
+            });
+            log::warn!("serve query {query_id}: the request host's describe raised {kind}");
+        }
+        Some(Err(joining)) => {
+            log::warn!(
+                "serve query {query_id}: the request host's describe did not return: {joining}"
+            );
+        }
+        None => log::warn!(
+            "serve query {query_id}: the request host's describe ended with the query, undescribed"
+        ),
+    }
+    ServeError::Failed { failure, message }
+}
+
 /// Extracts the logical plan builder from a frame returned to the server.
 fn frame_builder(frame: &Bound<'_, PyAny>) -> ServeResult<LogicalPlanBuilder> {
     let py = frame.py();
@@ -215,17 +322,7 @@ pub fn payload_to_builder(
                     "this server has no host for request kind `{kind}`"
                 ))
             })?;
-            let served = py
-                .import(intern!(py, "daft.serve"))
-                .and_then(|module| module.getattr(intern!(py, "ServedRequest")))
-                .and_then(|served_request| {
-                    served_request.call1((
-                        kind.as_str(),
-                        pyo3::types::PyBytes::new(py, body),
-                        origin.query_id.as_str(),
-                        origin.caller.as_deref(),
-                    ))
-                })
+            let served = served_request(py, kind, body, origin)
                 .map_err(|e| ServeError::Execution(e.into()))?;
             let dataframe = host
                 .bind(py)
@@ -465,6 +562,22 @@ pub async fn run_query(
         mut lifecycle,
     } = hold;
     let query_id = request.query_id.clone();
+    let host_request = match (&request.payload, &planners.host) {
+        (QueryPayload::Request { kind, body }, Some(host)) if planners.host_describes => {
+            Some(HostRequest {
+                host: host.clone(),
+                kind: kind.clone(),
+                body: body.clone(),
+                origin: RequestOrigin {
+                    query_id: query_id.clone(),
+                    caller: caller.clone(),
+                },
+            })
+        }
+        _ => None,
+    };
+    let frame_running = AtomicBool::new(false);
+    let started = std::time::Instant::now();
     let inner = run_query_inner(
         request,
         planners,
@@ -475,6 +588,7 @@ pub async fn run_query(
             sink: &sink,
             lifecycle: &mut lifecycle,
             slot: &permit,
+            frame_running: &frame_running,
         },
     );
     let result = if bounds.timeout_secs > 0 {
@@ -493,6 +607,27 @@ pub async fn run_query(
         }
     } else {
         inner.await
+    };
+    // A failure of the host's frame while it ran is described before the slot
+    // is freed, within what remains of the query's time limit.
+    let result = match (result, host_request) {
+        (Err(err), Some(request))
+            if frame_running.load(Ordering::Acquire) && !cancel.is_cancelled() =>
+        {
+            let remaining = (bounds.timeout_secs > 0).then(|| {
+                std::time::Duration::from_secs(bounds.timeout_secs)
+                    .saturating_sub(started.elapsed())
+            });
+            Err(described(
+                crate::failure::classify(err),
+                request,
+                remaining,
+                &permit,
+                &cancel,
+            )
+            .await)
+        }
+        (result, _) => result,
     };
     drop(guard);
     drop(permit);
@@ -517,6 +652,9 @@ struct RunningQuery<'a> {
     sink: &'a ResultSink,
     lifecycle: &'a mut QueryLifecycle,
     slot: &'a AdmissionPermit,
+    /// Set once the query's frame has started running, so a failure after it is
+    /// one the frame raised while it ran.
+    frame_running: &'a AtomicBool,
 }
 
 async fn run_query_inner(
@@ -531,6 +669,7 @@ async fn run_query_inner(
         sink,
         lifecycle,
         slot,
+        frame_running,
     } = running;
     let exec_config = resolve_exec_config(&request)?;
     let maintain_order = exec_config.maintain_order;
@@ -641,6 +780,7 @@ async fn run_query_inner(
         maintain_order,
     )?;
 
+    frame_running.store(true, Ordering::Release);
     log::debug!("serve query {query_id}: execution started");
     let mut results = enqueue_future.await?;
     log::debug!("serve query {query_id}: inputs enqueued");

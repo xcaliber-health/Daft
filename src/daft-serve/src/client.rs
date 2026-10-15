@@ -320,6 +320,7 @@ impl QueryResultStream {
         }
         Some(Err(ServeError::Failed {
             failure: Box::new(Failure {
+                detail: None,
                 error_class: "Transport".to_string(),
                 engine: false,
                 retryable: false,

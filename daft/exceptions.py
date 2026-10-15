@@ -64,6 +64,9 @@ class DaftServeError(DaftCoreException):
         remote_types: The names of that type's hierarchy, nearest first.
         fields: Named text fields the raised exception carried in ``served_fields``.
         query_id: The id of the query that failed, when it had one.
+        detail: How the query failed, in the words of the server's request host, when the
+            query was a request its host planned and the host described the failure; otherwise
+            ``None``. Every served failure carries it, an engine class's included.
     """
 
     def __init__(
@@ -77,6 +80,7 @@ class DaftServeError(DaftCoreException):
         remote_types: tuple[str, ...] = (),
         fields: dict[str, str] | None = None,
         query_id: str | None = None,
+        detail: str | None = None,
     ) -> None:
         super().__init__(message)
         self.error_class = error_class
@@ -86,6 +90,7 @@ class DaftServeError(DaftCoreException):
         self.remote_types = remote_types
         self.fields = dict(fields or {})
         self.query_id = query_id
+        self.detail = detail
 
 
 class DaftTransientError(DaftCoreException):

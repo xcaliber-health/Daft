@@ -48,6 +48,7 @@ pub fn of_engine_error(err: &DaftError) -> ServeError {
     }
     ServeError::Failed {
         failure: Box::new(Failure {
+            detail: None,
             error_class: exception_class_name(err).to_string(),
             engine: true,
             retryable: false,
@@ -70,6 +71,7 @@ pub fn of_py_err(py: Python<'_>, err: &PyErr, raised: Raised) -> ServeError {
     let failure = kind_of(py, err, raised).unwrap_or_else(|classifying| {
         log::warn!("could not classify a served failure: {classifying}");
         Failure {
+            detail: None,
             error_class: python_class(raised).to_string(),
             engine: false,
             retryable: false,
@@ -104,6 +106,7 @@ fn kind_of(py: Python<'_>, err: &PyErr, raised: Raised) -> PyResult<Failure> {
     let remote_type: Option<String> = kind.getattr(pyo3::intern!(py, "remote_type"))?.extract()?;
     let Some(remote_type) = remote_type else {
         return Ok(Failure {
+            detail: None,
             error_class,
             engine: true,
             retryable: false,
@@ -117,6 +120,7 @@ fn kind_of(py: Python<'_>, err: &PyErr, raised: Raised) -> PyResult<Failure> {
         .collect();
     fields.sort_unstable();
     Ok(Failure {
+        detail: None,
         error_class,
         engine: false,
         retryable: false,

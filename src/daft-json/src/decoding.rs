@@ -4,8 +4,9 @@ use arrow::{
     array::{
         ArrayRef, OffsetSizeTrait,
         builder::{
-            ArrayBuilder, BooleanBuilder, FixedSizeListBuilder, GenericListBuilder,
-            GenericStringBuilder, NullBuilder, PrimitiveBuilder, StructBuilder,
+            ArrayBuilder, BooleanBuilder, FixedSizeBinaryBuilder, FixedSizeListBuilder,
+            GenericBinaryBuilder, GenericListBuilder, GenericStringBuilder, NullBuilder,
+            PrimitiveBuilder, StructBuilder,
         },
     },
     datatypes::{
@@ -40,8 +41,8 @@ pub fn deserialize_records<'a, A: Borrow<BorrowedValue<'a>>>(
     let fields: Vec<_> = schema.fields().iter().collect();
     let mut builders: IndexMap<&str, Box<dyn ArrayBuilder>> = fields
         .iter()
-        .map(|f| (f.name().as_str(), allocate_array(f, records.len())))
-        .collect();
+        .map(|f| Ok((f.name().as_str(), allocate_array(f, records.len())?)))
+        .collect::<Result<_, ArrowError>>()?;
     for record in records {
         match record.borrow() {
             BorrowedValue::Object(record) => {
@@ -69,8 +70,13 @@ pub fn deserialize_records<'a, A: Borrow<BorrowedValue<'a>>>(
         .collect())
 }
 
-pub fn allocate_array(f: &Field, length: usize) -> Box<dyn ArrayBuilder> {
-    match f.data_type() {
+/// Allocates a builder for a column of `f`'s type, sized for `length` rows.
+///
+/// # Errors
+/// Returns an error for a type JSON is not read as, so that no value of it is
+/// ever decoded.
+pub fn allocate_array(f: &Field, length: usize) -> Result<Box<dyn ArrayBuilder>, ArrowError> {
+    Ok(match f.data_type() {
         DataType::Null => Box::new(NullBuilder::new()),
         DataType::Int8 => Box::new(PrimitiveBuilder::<Int8Type>::with_capacity(length)),
         DataType::Int16 => Box::new(PrimitiveBuilder::<Int16Type>::with_capacity(length)),
@@ -134,9 +140,14 @@ pub fn allocate_array(f: &Field, length: usize) -> Box<dyn ArrayBuilder> {
         DataType::Float64 => Box::new(PrimitiveBuilder::<Float64Type>::with_capacity(length)),
         DataType::Boolean => Box::new(BooleanBuilder::with_capacity(length)),
         DataType::Utf8 => Box::new(GenericStringBuilder::<i32>::with_capacity(length, 1024)),
+        DataType::Binary => Box::new(GenericBinaryBuilder::<i32>::with_capacity(length, 1024)),
+        DataType::LargeBinary => Box::new(GenericBinaryBuilder::<i64>::with_capacity(length, 1024)),
+        DataType::FixedSizeBinary(size) => {
+            Box::new(FixedSizeBinaryBuilder::with_capacity(length, *size))
+        }
         DataType::LargeUtf8 => Box::new(GenericStringBuilder::<i64>::with_capacity(length, 1024)),
         DataType::FixedSizeList(inner, size) => {
-            let inner_builder = allocate_array(inner.as_ref(), length);
+            let inner_builder = allocate_array(inner.as_ref(), length)?;
             Box::new(FixedSizeListBuilder::with_capacity(
                 inner_builder,
                 *size,
@@ -144,22 +155,33 @@ pub fn allocate_array(f: &Field, length: usize) -> Box<dyn ArrayBuilder> {
             ))
         }
         DataType::List(inner) => {
-            let inner_builder = allocate_array(inner.as_ref(), length);
+            let inner_builder = allocate_array(inner.as_ref(), length)?;
             Box::new(
                 GenericListBuilder::<i32, _>::with_capacity(inner_builder, length)
                     .with_field(inner.clone()),
             )
         }
         DataType::LargeList(inner) => {
-            let inner_builder = allocate_array(inner.as_ref(), length);
+            let inner_builder = allocate_array(inner.as_ref(), length)?;
             Box::new(
                 GenericListBuilder::<i64, _>::with_capacity(inner_builder, length)
                     .with_field(inner.clone()),
             )
         }
-        DataType::Struct(fields) => Box::new(StructBuilder::from_fields(fields.clone(), length)),
-        dt => todo!("Dtype not supported: {:?}", dt),
-    }
+        DataType::Struct(fields) => {
+            // The struct's own builder allocates its fields; check each can be read.
+            for field in fields {
+                allocate_array(field, 0)?;
+            }
+            Box::new(StructBuilder::from_fields(fields.clone(), length))
+        }
+        dt => {
+            return Err(ArrowError::NotYetImplemented(format!(
+                "JSON cannot be read as {dt}, the type of the column {:?}",
+                f.name()
+            )));
+        }
+    })
 }
 
 /// Deserialize `rows` by extending them into the given `target`.
@@ -196,21 +218,31 @@ pub fn deserialize_into<'a, A: Borrow<BorrowedValue<'a>>>(
         DataType::Time32(TimeUnit::Millisecond) => {
             deserialize_date_into::<_, Time32MillisecondType>(target, dtype, rows);
         }
-        DataType::Interval(IntervalUnit::DayTime) => {
-            unimplemented!("There is no natural representation of DayTime in JSON.")
-        }
         DataType::Int64 => deserialize_primitive_into::<_, Int64Type>(target, rows),
         DataType::Duration(TimeUnit::Second) => {
-            deserialize_primitive_into::<_, DurationSecondType>(target, rows);
+            deserialize_duration_into::<_, DurationSecondType>(target, 1_000_000_000, rows);
         }
         DataType::Duration(TimeUnit::Millisecond) => {
-            deserialize_primitive_into::<_, DurationMillisecondType>(target, rows);
+            deserialize_duration_into::<_, DurationMillisecondType>(target, 1_000_000, rows);
         }
         DataType::Duration(TimeUnit::Microsecond) => {
-            deserialize_primitive_into::<_, DurationMicrosecondType>(target, rows);
+            deserialize_duration_into::<_, DurationMicrosecondType>(target, 1_000, rows);
         }
         DataType::Duration(TimeUnit::Nanosecond) => {
-            deserialize_primitive_into::<_, DurationNanosecondType>(target, rows);
+            deserialize_duration_into::<_, DurationNanosecondType>(target, 1, rows);
+        }
+        DataType::Binary => generic_deserialize_into::<_, GenericBinaryBuilder<i32>>(
+            target,
+            rows,
+            deserialize_base64_into,
+        ),
+        DataType::LargeBinary => generic_deserialize_into::<_, GenericBinaryBuilder<i64>>(
+            target,
+            rows,
+            deserialize_base64_into,
+        ),
+        DataType::FixedSizeBinary(size) => {
+            deserialize_fixed_base64_into(target, *size, rows);
         }
         DataType::Timestamp(TimeUnit::Second, _) => {
             deserialize_datetime_into::<_, TimestampSecondType>(target, dtype, rows);
@@ -259,11 +291,8 @@ pub fn deserialize_into<'a, A: Borrow<BorrowedValue<'a>>>(
         DataType::Struct(fields) => {
             deserialize_struct_into(target, fields, rows);
         }
-        // TODO(Clark): Add support for decimal type.
-        // TODO(Clark): Add support for binary and large binary types.
-        dt => {
-            todo!("Dtype not supported: {:?}", dt)
-        }
+        // `allocate_array` refuses every other type, so no builder of one exists.
+        dt => unreachable!("no JSON builder is allocated for {dt}"),
     }
 }
 
@@ -318,6 +347,133 @@ fn deserialize_utf8_into<'a, O: OffsetSizeTrait, A: Borrow<BorrowedValue<'a>>>(
             _ => target.append_null(),
         }
     }
+}
+
+/// Appends each row's bytes, decoded from base64 text (RFC 4648, standard
+/// alphabet, padded), as the writer writes them. Anything else reads as null.
+fn deserialize_base64_into<'a, O: OffsetSizeTrait, A: Borrow<BorrowedValue<'a>>>(
+    target: &mut GenericBinaryBuilder<O>,
+    rows: &[A],
+) {
+    for row in rows {
+        match decode_base64(row.borrow()) {
+            Some(bytes) => target.append_value(bytes),
+            None => target.append_null(),
+        }
+    }
+}
+
+/// Appends each row's bytes as [`deserialize_base64_into`] does, into a column of
+/// `size` bytes a value; bytes of another length read as null.
+fn deserialize_fixed_base64_into<'a, A: Borrow<BorrowedValue<'a>>>(
+    target: &mut Box<dyn ArrayBuilder>,
+    size: i32,
+    rows: &[A],
+) {
+    let target = target
+        .as_any_mut()
+        .downcast_mut::<FixedSizeBinaryBuilder>()
+        .unwrap();
+    for row in rows {
+        let fits = decode_base64(row.borrow())
+            .filter(|bytes| i32::try_from(bytes.len()).is_ok_and(|len| len == size));
+        // Appending refuses only bytes of another length, which `fits` excludes.
+        if fits.is_none_or(|bytes| target.append_value(bytes).is_err()) {
+            target.append_null();
+        }
+    }
+}
+
+fn decode_base64(value: &BorrowedValue<'_>) -> Option<Vec<u8>> {
+    use base64::Engine;
+
+    match value {
+        BorrowedValue::String(text) => base64::engine::general_purpose::STANDARD
+            .decode(text.as_bytes())
+            .ok(),
+        _ => None,
+    }
+}
+
+/// Appends each row's duration, a count of the column's unit or ISO 8601 text
+/// (`PT3S`, `-PT1.5S`, `P1DT2H`) as the writer writes it, where `unit_nanos` is
+/// the column's unit in nanoseconds. Text not exact in that unit, or not a
+/// duration, reads as null.
+fn deserialize_duration_into<
+    'a,
+    A: Borrow<BorrowedValue<'a>>,
+    T: ArrowPrimitiveType<Native = i64>,
+>(
+    target: &mut Box<dyn ArrayBuilder>,
+    unit_nanos: i128,
+    rows: &[A],
+) {
+    let target = target
+        .as_any_mut()
+        .downcast_mut::<PrimitiveBuilder<T>>()
+        .unwrap();
+    for row in rows {
+        let value = match row.borrow() {
+            BorrowedValue::String(text) => parse_iso8601_duration(text)
+                .filter(|nanos| nanos % unit_nanos == 0)
+                .and_then(|nanos| i64::try_from(nanos / unit_nanos).ok()),
+            BorrowedValue::Static(StaticNode::I64(v)) => Some(*v),
+            BorrowedValue::Static(StaticNode::U64(v)) => i64::try_from(*v).ok(),
+            BorrowedValue::Static(StaticNode::F64(v)) => NumCast::from(*v),
+            _ => None,
+        };
+        target.append_option(value);
+    }
+}
+
+/// Parses an ISO 8601 duration of days, hours, minutes and seconds into
+/// nanoseconds: `[-]P[nD][T[nH][nM][n[.f]S]]`. Years, months and weeks name no
+/// fixed length, so they are not durations here.
+fn parse_iso8601_duration(text: &str) -> Option<i128> {
+    let (negative, rest) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let rest = rest.strip_prefix('P')?;
+    let (date, time) = match rest.split_once('T') {
+        Some((date, time)) => (date, Some(time)),
+        None => (rest, None),
+    };
+    // A duration names at least one part: zero is `P0D`.
+    if date.is_empty() && time.is_none() {
+        return None;
+    }
+    let mut nanos: i128 = if date.is_empty() {
+        0
+    } else {
+        date.strip_suffix('D')?
+            .parse::<i128>()
+            .ok()?
+            .checked_mul(86_400_000_000_000)?
+    };
+    if let Some(mut time) = time {
+        if time.is_empty() {
+            return None;
+        }
+        for (designator, unit) in [('H', 3_600_000_000_000_i128), ('M', 60_000_000_000)] {
+            if let Some((count, after)) = time.split_once(designator) {
+                nanos = nanos.checked_add(count.parse::<i128>().ok()?.checked_mul(unit)?)?;
+                time = after;
+            }
+        }
+        if !time.is_empty() {
+            let seconds = time.strip_suffix('S')?;
+            let (whole, fraction) = seconds.split_once('.').unwrap_or((seconds, ""));
+            if fraction.len() > 9 || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let fraction_nanos: i128 = format!("{fraction:0<9}").parse().ok()?;
+            nanos = nanos
+                .checked_add(whole.parse::<i128>().ok()?.checked_mul(1_000_000_000)?)?
+                .checked_add(fraction_nanos)?;
+        }
+    }
+    Some(if negative { -nanos } else { nanos })
 }
 
 fn deserialize_boolean_into<'a, A: Borrow<BorrowedValue<'a>>>(
@@ -535,4 +691,33 @@ fn deserialize_struct_into<'a, A: Borrow<BorrowedValue<'a>>>(
         .for_each(|((col_values, field), col_builder)| {
             deserialize_into(col_builder, field.data_type(), col_values.as_slice());
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::parse_iso8601_duration;
+
+    const SECOND: i128 = 1_000_000_000;
+
+    #[rstest]
+    #[case::seconds("PT3S", Some(3 * SECOND))]
+    #[case::fraction("PT1.5S", Some(3 * SECOND / 2))]
+    #[case::nanosecond("PT0.000000001S", Some(1))]
+    #[case::negative("-PT3S", Some(-3 * SECOND))]
+    #[case::zero("P0D", Some(0))]
+    #[case::many_seconds("PT129600S", Some(129_600 * SECOND))]
+    #[case::days_and_hours("P1DT2H", Some(26 * 3_600 * SECOND))]
+    #[case::minutes("PT1M", Some(60 * SECOND))]
+    #[case::every_part("P1DT1H1M1.25S", Some(90_061 * SECOND + SECOND / 4))]
+    #[case::no_designator("3S", None)]
+    #[case::nothing("P", None)]
+    #[case::empty_time("PT", None)]
+    #[case::years("P1Y", None)]
+    #[case::finer_than_nanoseconds("PT1.0000000001S", None)]
+    #[case::not_a_number("PTXS", None)]
+    fn parses_an_iso8601_duration(#[case] text: &str, #[case] nanos: Option<i128>) {
+        assert_eq!(parse_iso8601_duration(text), nanos);
+    }
 }

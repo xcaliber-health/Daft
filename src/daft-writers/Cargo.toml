@@ -3,6 +3,7 @@ arrow-array = {workspace = true}
 arrow-csv = {workspace = true}
 arrow-ipc = {workspace = true}
 arrow-json = {workspace = true}
+base64 = {workspace = true}
 arrow-schema = {workspace = true}
 async-trait = {workspace = true}
 chrono = {workspace = true}

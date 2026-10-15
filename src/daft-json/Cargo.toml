@@ -1,4 +1,5 @@
 [dependencies]
+base64 = {workspace = true}
 arrow = {workspace = true}
 chrono = {workspace = true}
 common-error = {path = "../common/error", default-features = false}

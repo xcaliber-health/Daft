@@ -3160,6 +3160,7 @@ name = "daft-json"
 version = "0.3.0-dev0"
 dependencies = [
  "arrow",
+ "base64 0.22.1",
  "chrono",
  "common-error",
  "common-py-serde",
@@ -3725,6 +3726,7 @@ dependencies = [
  "arrow-json",
  "arrow-schema 59.0.0",
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "chrono-tz",

@@ -157,42 +157,27 @@ def test_roundtrip_nested_struct_with_arrays(tmp_path):
     assert before.to_arrow() == after.to_arrow()
 
 
-def test_throws_error_on_duration_and_binary_types(tmp_path):
-    # TODO(desmond): Binary and Duration types currently produce inconsistent behaviours between our readers and writers.
-    # Our readers expect BINARY to be encoded as plain text, and DURATION to be encoded with i64. Arrow-rs expects BINARY
-    # to be hexadecimal encoded and DURATION to follow the ISO 8601 duration format. Until we reconcile this difference,
-    # opt for throwing an error on encountering these types.
-    duration_data = [
-        datetime.timedelta(days=1),
-        datetime.timedelta(days=2),
-        None,
-    ]
+@pytest.mark.parametrize(
+    ("column", "dtype", "values"),
+    [
+        (
+            "duration",
+            pa.duration("ms"),
+            [datetime.timedelta(days=1), datetime.timedelta(days=2), None],
+        ),
+        ("binary", pa.large_binary(), [b"hello", b"world", None]),
+    ],
+)
+def test_roundtrip_duration_and_binary_types(tmp_path, column, dtype, values):
+    # The writer writes a duration as ISO 8601 text and bytes as base64 text, and
+    # the reader reads each back when given its type.
+    before = daft.from_arrow(pa.table({"id": pa.array(range(3)), column: pa.array(values, type=dtype)}))
+    before = before.concat(before)
+    before.write_json(str(tmp_path))
 
-    pa_duration_type = pa.duration("ms")
+    after = daft.read_json(str(tmp_path), schema={"id": daft.DataType.int64(), column: before.schema()[column].dtype})
 
-    before_duration = daft.from_arrow(
-        pa.table({"id": pa.array(range(3)), "duration": pa.array(duration_data, type=pa_duration_type)})
-    )
-    before_duration = before_duration.concat(before_duration)
-
-    # Test that writing duration types throws NotImplementedError
-    with pytest.raises(
-        daft.exceptions.DaftCoreException,
-        match="Not Yet Implemented: JSON writes are not supported with extension, binary, or duration data types",
-    ):
-        before_duration.write_json(str(tmp_path))
-
-    binary_data = [b"hello", b"world", None]
-    pa_binary_type = pa.large_binary()
-    before_binary = daft.from_arrow(
-        pa.table({"id": pa.array(range(3)), "binary": pa.array(binary_data, type=pa_binary_type)})
-    )
-
-    with pytest.raises(
-        daft.exceptions.DaftCoreException,
-        match="Not Yet Implemented: JSON writes are not supported with extension, binary, or duration data types",
-    ):
-        before_binary.write_json(str(tmp_path))
+    assert before.sort("id").to_arrow() == after.sort("id").to_arrow()
 
 
 def write_ndjson_file(path, data, compression=None):

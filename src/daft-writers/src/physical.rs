@@ -9,7 +9,7 @@ use daft_recordbatch::RecordBatch;
 use crate::{
     AsyncFileWriter, WriterFactory,
     csv_writer::{create_native_csv_writer, native_csv_writer_supported},
-    json_writer::{create_native_json_writer, native_json_writer_supported},
+    json_writer::{column_json_cannot_hold, create_native_json_writer},
     parquet_writer::{create_native_parquet_writer, native_parquet_writer_supported},
 };
 
@@ -87,12 +87,11 @@ impl PhysicalWriterFactory {
     }
 
     fn select_json_writer_type(file_schema: &SchemaRef) -> DaftResult<WriterType> {
-        let native_supported = native_json_writer_supported(file_schema)?;
-        if !native_supported {
-            return Err(DaftError::NotImplemented(
-                "JSON writes are not supported with extension, binary, or duration data types"
-                    .to_string(),
-            ));
+        if let Some(field) = column_json_cannot_hold(file_schema)? {
+            return Err(DaftError::NotImplemented(format!(
+                "JSON cannot hold the column {:?} of type {}; select or convert it before writing",
+                field.name, field.dtype
+            )));
         }
         // There is only a native implementation of the JSON writer. PyArrow does not support JSON writes.
         Ok(WriterType::Native)
@@ -224,13 +223,16 @@ fn create_native_writer(
             )
         }
         FileFormat::Json => {
-            if single_file {
-                return Err(DaftError::NotImplemented(
-                    "`single_file=True` is not yet supported for JSON writes".to_string(),
-                ));
-            }
             let json_option = format_option.map(|opt| opt.to_json()).unwrap_or_default();
-            create_native_json_writer(root_dir, file_idx, partition_values, io_config, json_option)
+            create_native_json_writer(
+                root_dir,
+                file_idx,
+                partition_values,
+                io_config,
+                json_option,
+                single_file,
+                single_file && matches!(write_mode, WriteMode::Overwrite),
+            )
         }
         FileFormat::Csv => {
             let csv_option = format_option.map(|opt| opt.to_csv()).unwrap_or_default();

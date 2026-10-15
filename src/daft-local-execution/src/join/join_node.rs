@@ -16,6 +16,7 @@ use crate::{
     join::{
         build::{BuildExecutionContext, BuildStateBridge},
         join_operator::JoinOperator,
+        key_filter::KeyFilterPublisher,
         probe::ProbeExecutionContext,
     },
     pipeline::{BuilderContext, MorselSizeRequirement, PipelineMessage, PipelineNode},
@@ -33,6 +34,8 @@ pub struct JoinNode<Op: JoinOperator> {
     /// Scratch configuration for partitioned execution under memory
     /// pressure; absent when spilling is disabled.
     spill: Option<Arc<SpillContext>>,
+    /// Publishes the build side's keys to the probe-side scans they filter.
+    key_filter: Option<KeyFilterPublisher>,
 }
 
 impl<Op: JoinOperator + 'static> JoinNode<Op> {
@@ -57,7 +60,15 @@ impl<Op: JoinOperator + 'static> JoinNode<Op> {
             morsel_size_requirement,
             node_info: Arc::new(node_info),
             spill: SpillContext::from_config(cfg).map(Arc::new),
+            key_filter: None,
         }
+    }
+
+    /// Publishes the build side's keys through `publisher` to the probe-side
+    /// scans they filter.
+    pub(crate) fn with_key_filter(mut self, publisher: Option<KeyFilterPublisher>) -> Self {
+        self.key_filter = publisher;
+        self
     }
 
     pub(crate) fn boxed(self) -> Box<dyn PipelineNode> {
@@ -208,7 +219,8 @@ impl<Op: JoinOperator + 'static> PipelineNode for JoinNode<Op> {
             // execution is only allowed when downstream does not require
             // the probe input's order.
             !maintain_order,
-        );
+        )
+        .with_key_filter(self.key_filter);
 
         // Initialize probe side
         let probe_ctx = ProbeExecutionContext::new(

@@ -1,6 +1,7 @@
 use common_error::DaftResult;
 use common_metrics::ops::NodeType;
 use common_runtime::get_compute_pool_num_threads;
+use daft_core::series::Series;
 use daft_dsl::expr::bound_expr::BoundExpr;
 use daft_micropartition::MicroPartition;
 use daft_recordbatch::RecordBatch;
@@ -105,6 +106,19 @@ pub(crate) trait JoinOperator: Send + Sync {
     /// `None` (the default) means the operator's semantics do not permit
     /// hash partitioning.
     fn grace_partition_exprs(&self) -> Option<(&[BoundExpr], &[BoundExpr])> {
+        None
+    }
+
+    /// The build side's join-key columns, in join-key order, once it is
+    /// finalized: what a filter on the probe side's scan is made from.
+    /// `None` (the default) means the operator offers none.
+    ///
+    /// # Errors
+    /// Returns an error if the keys cannot be evaluated over the build side.
+    fn build_key_columns(
+        &self,
+        _state: &Self::FinalizedBuildState,
+    ) -> Option<DaftResult<Vec<Series>>> {
         None
     }
 

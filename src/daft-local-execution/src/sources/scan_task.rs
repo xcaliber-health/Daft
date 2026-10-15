@@ -16,6 +16,8 @@ use daft_micropartition::MicroPartition;
 use daft_parquet::read::{
     ParquetBulkReadOptions, ParquetSchemaInferenceOptions, read_parquet_bulk,
 };
+use daft_algebra::boolean::combine_conjunction;
+use daft_dsl::{ExprRef, expr::bound_expr::BoundExpr};
 use daft_scan::{FileFormatConfig, Pushdowns, ScanTask, ScanTaskRef, SourceConfig};
 use futures::{FutureExt, Stream, StreamExt};
 use tracing::instrument;
@@ -25,6 +27,7 @@ use crate::{
         Receiver, Sender, UnboundedReceiver, UnboundedSender, create_channel,
         create_unbounded_channel,
     },
+    join::key_filter::{KeyRestriction, RowKeyFilter, RowTest, ScanKeyFilter},
     pipeline::{InputId, NodeName, PipelineMessage},
     sources::{
         scan_task_reader,
@@ -74,6 +77,105 @@ async fn split_tasks_by_row_groups(
     out
 }
 
+/// One join key's restriction of a scan column: the column, what prunes by
+/// it, and the row test on it, when the key filters rows.
+type ColumnRestriction<'a> = (&'a str, ExprRef, Option<(String, RowTest)>);
+
+/// What the join keys restricting a scan hand each of an input's tasks.
+struct TaskRestriction {
+    /// Prunes row groups by their statistics and bloom filters.
+    row_group_filter: ExprRef,
+    /// Filters the rows read, until it is seen to keep most of them; absent
+    /// when the join's own probe drops them as cheaply.
+    rows: Option<Arc<RowKeyFilter>>,
+}
+
+/// Restricts an input's scan tasks by the join keys that filter this scan.
+///
+/// Waits for each join's build side to finish first; a join that publishes no
+/// filter restricts nothing. A build side holding no key leaves no task. A
+/// task whose partition value no key matches is dropped whole; the keys on
+/// other columns are handed to every remaining task, to prune its row groups
+/// and filter its rows.
+async fn restrict_by_join_keys(
+    tasks: Vec<ScanTaskRef>,
+    key_filters: &[ScanKeyFilter],
+    input_id: InputId,
+) -> DaftResult<(Vec<ScanTaskRef>, Option<Arc<TaskRestriction>>)> {
+    if tasks.is_empty() || key_filters.is_empty() {
+        return Ok((tasks, None));
+    }
+    let mut restrictions: Vec<ColumnRestriction<'_>> = Vec::with_capacity(key_filters.len());
+    for key_filter in key_filters {
+        match key_filter.restriction(input_id).await {
+            Some(KeyRestriction::Nothing) => return Ok((Vec::new(), None)),
+            Some(KeyRestriction::Within { prune, rows }) => {
+                restrictions.push((
+                    key_filter.column(),
+                    prune,
+                    key_filter.filters_rows().then_some(rows),
+                ));
+            }
+            None => {}
+        }
+    }
+    // Partition and generated columns are decided per task below, or not at
+    // all; only file columns are pruned and filtered while reading.
+    let first = &tasks[0];
+    let read_from_file = |column: &str| {
+        !first
+            .partition_spec()
+            .is_some_and(|spec| spec.keys.schema.has_field(column))
+            && !first
+                .generated_fields
+                .as_ref()
+                .is_some_and(|fields| fields.has_field(column))
+    };
+    let from_file = restrictions
+        .iter()
+        .map(|(column, _, _)| read_from_file(column))
+        .collect::<Vec<_>>();
+    let mut kept = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        if partition_admits(&task, &restrictions)? {
+            kept.push(task);
+        }
+    }
+    let (prunes, rows): (Vec<_>, Vec<_>) = restrictions
+        .into_iter()
+        .zip(from_file)
+        .filter_map(|((_, prune, rows), from_file)| from_file.then_some((prune, rows)))
+        .unzip();
+    let rows = rows.into_iter().flatten().collect::<Vec<_>>();
+    let restriction = combine_conjunction(prunes).map(|row_group_filter| {
+        Arc::new(TaskRestriction {
+            row_group_filter,
+            rows: (!rows.is_empty()).then(|| Arc::new(RowKeyFilter::new(rows))),
+        })
+    });
+    Ok((kept, restriction))
+}
+
+/// Whether a task's partition value, if the restricted column is one of its
+/// partition columns, satisfies each restriction on it.
+fn partition_admits(
+    task: &ScanTask,
+    restrictions: &[ColumnRestriction<'_>],
+) -> DaftResult<bool> {
+    let Some(spec) = task.partition_spec() else {
+        return Ok(true);
+    };
+    for (column, prune, _) in restrictions {
+        if spec.keys.schema.has_field(column) {
+            let bound = BoundExpr::try_new(prune.clone(), &spec.keys.schema)?;
+            if spec.keys.eval_expression(&bound)?.bool()?.get(0) != Some(true) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
 pub struct ScanTaskSource {
     receiver: UnboundedReceiver<(InputId, Vec<ScanTaskRef>)>,
     source_config: Option<Arc<SourceConfig>>,
@@ -82,6 +184,9 @@ pub struct ScanTaskSource {
     num_parallel_tasks: usize,
     row_group_splitting_enabled: bool,
     skipped_corrupt_files: SkippedCorruptFilesCollector,
+    /// Join keys that restrict this scan, each waited for before an input's
+    /// files are opened.
+    key_filters: Arc<Vec<ScanKeyFilter>>,
 }
 
 impl ScanTaskSource {
@@ -107,7 +212,15 @@ impl ScanTaskSource {
             num_parallel_tasks,
             row_group_splitting_enabled: cfg.enable_scan_task_row_group_splitting,
             skipped_corrupt_files,
+            key_filters: Arc::new(Vec::new()),
         }
+    }
+
+    /// Restricts this scan by `key_filters`, each made from a join's build side.
+    #[must_use]
+    pub(crate) fn with_key_filters(mut self, key_filters: Vec<ScanKeyFilter>) -> Self {
+        self.key_filters = Arc::new(key_filters);
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -121,6 +234,7 @@ impl ScanTaskSource {
         schema: SchemaRef,
         maintain_order: bool,
         skipped_corrupt_files: SkippedCorruptFilesCollector,
+        key_filters: Arc<Vec<ScanKeyFilter>>,
     ) -> common_runtime::RuntimeTask<DaftResult<()>> {
         let io_runtime = get_io_runtime(true);
 
@@ -141,7 +255,7 @@ impl ScanTaskSource {
 
         io_runtime.spawn(async move {
             let mut task_set = JoinSet::new();
-            // Store pending tasks: (scan_task, delete_map, input_id)
+            // Store pending tasks: (scan_task, delete_map, input_id, is_last, restriction)
             let mut pending_tasks = VecDeque::new();
             // Track how many scan tasks are pending per input_id (only when !maintain_order)
             let mut input_id_pending_counts: HashMap<InputId, usize> = HashMap::new();
@@ -151,7 +265,7 @@ impl ScanTaskSource {
             while !receiver_exhausted || !pending_tasks.is_empty() || !task_set.is_empty() {
                 // Spawn from pending_tasks if we have capacity
                 while task_set.len() < max_parallel && !pending_tasks.is_empty() {
-                    let (scan_task, delete_map, input_id, is_last) = pending_tasks.pop_front().unwrap();
+                    let (scan_task, delete_map, input_id, is_last, restriction) = pending_tasks.pop_front().unwrap();
                     let sender = match &flattener_state {
                         Some((agg_tx, _)) => {
                             let (stream_tx, stream_rx) = create_channel::<MicroPartition>(1);
@@ -169,13 +283,22 @@ impl ScanTaskSource {
                         sender,
                         input_id,
                         skipped_corrupt_files.clone(),
+                        restriction,
                     ));
                 }
 
                 tokio::select! {
                     recv_result = receiver.recv(), if !receiver_exhausted => {
+                        let recv_result = match recv_result {
+                            Some((input_id, scan_tasks_batch)) => {
+                                let (tasks, restriction) =
+                                    restrict_by_join_keys(scan_tasks_batch, &key_filters, input_id).await?;
+                                Some((input_id, tasks, restriction))
+                            }
+                            None => None,
+                        };
                         match recv_result {
-                            Some((input_id, scan_tasks_batch)) if scan_tasks_batch.is_empty() => {
+                            Some((input_id, scan_tasks_batch, _)) if scan_tasks_batch.is_empty() => {
                                 let empty = MicroPartition::empty(Some(schema.clone()));
                                 match &flattener_state {
                                     Some((agg_tx, _)) => {
@@ -198,7 +321,7 @@ impl ScanTaskSource {
                                     }
                                 }
                             }
-                            Some((input_id, scan_tasks_batch)) => {
+                            Some((input_id, scan_tasks_batch, restriction)) => {
                                 let delete_map =
                                     get_delete_map(&scan_tasks_batch).await?.map(Arc::new);
 
@@ -221,6 +344,7 @@ impl ScanTaskSource {
                                         delete_map.clone(),
                                         input_id,
                                         i == num_tasks - 1,
+                                        restriction.clone(),
                                     ));
                                 }
                             }
@@ -293,6 +417,7 @@ impl Source for ScanTaskSource {
             self.schema.clone(),
             maintain_order,
             self.skipped_corrupt_files.clone(),
+            self.key_filters.clone(),
         );
         let result_stream = output_receiver.into_stream().map(Ok);
         let combined_stream = combine_stream(result_stream, processor_task.map(|x| x?));
@@ -537,6 +662,7 @@ async fn forward_scan_task_stream(
     sender: ScanTaskOutputSender,
     input_id: InputId,
     skipped_corrupt_files: SkippedCorruptFilesCollector,
+    restriction: Option<Arc<TaskRestriction>>,
 ) -> DaftResult<InputId> {
     let schema = scan_task.materialized_schema();
     let mut stream = stream_scan_task(
@@ -546,12 +672,19 @@ async fn forward_scan_task_stream(
         maintain_order,
         chunk_size,
         skipped_corrupt_files,
+        restriction.as_ref().map(|restriction| &restriction.row_group_filter),
     )
     .await?;
     let mut has_data = false;
     while let Some(result) = stream.next().await {
+        let partition = match restriction.as_ref().and_then(|restriction| restriction.rows.as_ref()) {
+            Some(rows) => rows.apply(result?)?,
+            None => result?,
+        };
+        if partition.is_empty() {
+            continue;
+        }
         has_data = true;
-        let partition = result?;
         match &sender {
             ScanTaskOutputSender::Pipeline(s) => {
                 if s.send(PipelineMessage::Morsel {
@@ -600,6 +733,7 @@ async fn stream_scan_task(
     maintain_order: bool,
     chunk_size: usize,
     skipped_corrupt_files: SkippedCorruptFilesCollector,
+    row_group_filter: Option<&ExprRef>,
 ) -> DaftResult<impl Stream<Item = DaftResult<MicroPartition>> + Send> {
     let pushdown_columns = scan_task
         .pushdowns
@@ -656,6 +790,7 @@ async fn stream_scan_task(
         maintain_order,
         chunk_size,
         skipped_corrupt_files,
+        row_group_filter,
     )
     .await?;
 

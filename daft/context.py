@@ -234,6 +234,7 @@ def set_execution_config(
     num_preview_rows: int | None = None,
     parquet_target_filesize: int | None = None,
     parquet_target_row_group_size: int | None = None,
+    parquet_page_index: bool | None = None,
     parquet_inflation_factor: float | None = None,
     csv_target_filesize: int | None = None,
     csv_inflation_factor: float | None = None,
@@ -296,6 +297,9 @@ def set_execution_config(
             Default is 8.
         parquet_target_filesize: Target File Size when writing out Parquet Files. Defaults to 512MB
         parquet_target_row_group_size: Target Row Group Size when writing out Parquet Files. Defaults to 128MB
+        parquet_page_index: Whether a filtered Parquet read loads a file's page index, to skip the pages
+            the filter's statistics rule out and fetch only the pages holding the rows it keeps. A file
+            without a page index is read as before. Defaults to True.
         parquet_inflation_factor: Inflation Factor of parquet files (In-Memory-Size / File-Size) ratio. Defaults to 3.0
         csv_target_filesize: Target File Size when writing out CSV Files. Defaults to 512MB
         csv_inflation_factor: Inflation Factor of CSV files (In-Memory-Size / File-Size) ratio. Defaults to 0.5
@@ -352,6 +356,7 @@ def set_execution_config(
             num_preview_rows=num_preview_rows,
             parquet_target_filesize=parquet_target_filesize,
             parquet_target_row_group_size=parquet_target_row_group_size,
+            parquet_page_index=parquet_page_index,
             parquet_inflation_factor=parquet_inflation_factor,
             csv_target_filesize=csv_target_filesize,
             csv_inflation_factor=csv_inflation_factor,

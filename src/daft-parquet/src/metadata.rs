@@ -363,10 +363,29 @@ pub(crate) fn apply_field_ids_to_arrowrs_parquet_metadata(
     // the renamed parquet type tree, causing arrow-rs to fail with
     // `incompatible arrow schema, expected field named <physical> got <logical>`.
     // Dropping it forces arrow-rs to infer from the renamed parquet types.
-    Ok(Arc::new(ParquetMetaData::new(
-        rebuild_file_metadata(metadata.file_metadata(), new_schema_descr, true),
-        new_row_groups?,
+    Ok(Arc::new(with_page_index_of(
+        &metadata,
+        ParquetMetaData::new(
+            rebuild_file_metadata(metadata.file_metadata(), new_schema_descr, true),
+            new_row_groups?,
+        ),
     )))
+}
+
+/// `rebuilt` with the page index `original` carries, if any: renaming a file's
+/// columns leaves its pages, and their index, where they are.
+fn with_page_index_of(
+    original: &parquet::file::metadata::ParquetMetaData,
+    rebuilt: parquet::file::metadata::ParquetMetaData,
+) -> parquet::file::metadata::ParquetMetaData {
+    if original.offset_index().is_none() && original.column_index().is_none() {
+        return rebuilt;
+    }
+    rebuilt
+        .into_builder()
+        .set_column_index(original.column_index().cloned())
+        .set_offset_index(original.offset_index().cloned())
+        .build()
 }
 
 /// Rebuild a `FileMetaData` with a new schema descriptor (preserving everything else).
@@ -442,9 +461,12 @@ pub(crate) fn strip_string_types_from_parquet_metadata(
         })
         .collect();
 
-    Ok(Arc::new(ParquetMetaData::new(
-        rebuild_file_metadata(metadata.file_metadata(), new_schema_descr, false),
-        new_row_groups?,
+    Ok(Arc::new(with_page_index_of(
+        &metadata,
+        ParquetMetaData::new(
+            rebuild_file_metadata(metadata.file_metadata(), new_schema_descr, false),
+            new_row_groups?,
+        ),
     )))
 }
 
@@ -642,6 +664,29 @@ pub(crate) async fn read_parquet_metadata(
     field_id_mapping: Option<Arc<BTreeMap<i32, Field>>>,
     default_footer_read_size: Option<usize>,
 ) -> super::Result<Arc<parquet::file::metadata::ParquetMetaData>> {
+    read_parquet_metadata_and_tail(
+        uri,
+        file_size,
+        io_client,
+        io_stats,
+        field_id_mapping,
+        default_footer_read_size,
+    )
+    .await
+    .map(|(metadata, _)| metadata)
+}
+
+/// Like [`read_parquet_metadata`], also returning the bytes read from the end
+/// of the file, which hold the footer and often what precedes it, such as the
+/// page index.
+pub(crate) async fn read_parquet_metadata_and_tail(
+    uri: &str,
+    file_size: Option<usize>,
+    io_client: Arc<IOClient>,
+    io_stats: Option<IOStatsRef>,
+    field_id_mapping: Option<Arc<BTreeMap<i32, Field>>>,
+    default_footer_read_size: Option<usize>,
+) -> super::Result<(Arc<parquet::file::metadata::ParquetMetaData>, Bytes)> {
     let (data, remaining) = fetch_parquet_footer_bytes(
         uri,
         file_size,
@@ -650,6 +695,7 @@ pub(crate) async fn read_parquet_metadata(
         default_footer_read_size,
     )
     .await?;
+    let tail = data.clone();
 
     let metadata = get_io_runtime(true)
         .spawn_blocking(move || {
@@ -665,11 +711,12 @@ pub(crate) async fn read_parquet_metadata(
 
     let metadata = Arc::new(metadata);
 
-    if let Some(field_id_mapping) = field_id_mapping {
-        apply_field_ids_to_arrowrs_parquet_metadata(metadata, field_id_mapping.as_ref(), uri)
+    let metadata = if let Some(field_id_mapping) = field_id_mapping {
+        apply_field_ids_to_arrowrs_parquet_metadata(metadata, field_id_mapping.as_ref(), uri)?
     } else {
-        Ok(metadata)
-    }
+        metadata
+    };
+    Ok((metadata, tail))
 }
 
 #[cfg(test)]

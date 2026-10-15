@@ -6,6 +6,7 @@ use snafu::Snafu;
 mod column_range;
 mod table_stats;
 mod utils;
+pub(crate) use column_range::parquet_statistics_to_column_range_statistics;
 pub use table_stats::row_group_metadata_to_table_stats;
 
 #[derive(Debug, Snafu)]

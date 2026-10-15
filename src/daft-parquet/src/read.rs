@@ -94,6 +94,10 @@ pub struct ParquetReadOptions {
     /// filters prove no row satisfies it are skipped, but the rows of the row
     /// groups read are not filtered by it.
     pub row_group_filter: Option<ExprRef>,
+    /// Whether a read with a predicate loads the file's page index, to skip
+    /// the pages its statistics rule out and fetch only the pages holding the
+    /// rows kept.
+    pub page_index: bool,
     pub schema_infer: ParquetSchemaInferenceOptions,
     pub field_id_mapping: Option<Arc<BTreeMap<i32, Field>>>,
     pub delete_rows: Option<Vec<i64>>,
@@ -172,6 +176,7 @@ fn single_opts_for(opts: &ParquetBulkReadOptions, i: usize) -> ParquetReadOption
         row_groups: per.row_groups,
         predicate: opts.predicate.clone(),
         row_group_filter: None,
+        page_index: false,
         schema_infer: opts.schema_infer,
         field_id_mapping: opts.field_id_mapping.clone(),
         delete_rows: per.delete_rows,

@@ -11,13 +11,17 @@ use daft_core::prelude::*;
 use daft_dsl::expr::bound_expr::BoundExpr;
 use daft_recordbatch::RecordBatch;
 use futures::{StreamExt, future::try_join_all, stream::BoxStream};
-use parquet::{arrow::arrow_reader::RowSelection, file::metadata::ParquetMetaData};
+use parquet::{
+    arrow::arrow_reader::{RowSelection, RowSelector},
+    file::metadata::ParquetMetaData,
+};
 use snafu::ResultExt;
 use tokio::sync::mpsc;
 
 use super::{
     Prefilter, RgTaskCtx,
-    chunk_source::ChunkSource,
+    page_index::{page_ranges, rows_not_ruled_out},
+    chunk_source::{ChunkSource, RgReader},
     field_reader::{decode_one_streaming, leaves_for_top_fields},
     util::{
         eval_predicate_mask, filter_arrays_by_mask, project_to_schema, record_batch_from_arrow,
@@ -61,11 +65,29 @@ pub(super) async fn spawn_col_decoders(
     rg_idx: usize,
     chunk_size: usize,
     path: &Arc<str>,
+    fetch_pages: bool,
 ) -> DaftResult<(Vec<ColRx>, JoinSet<DaftResult<()>>)> {
-    // The reader picks its own per-RG access pattern (batched pre-fetch for
-    // local, lazy per-column for remote). See `ChunkSource::open_rg`.
     let all_leaves: Arc<[usize]> = leaves_for_top_fields(metadata.as_ref(), col_indices).into();
-    let rg_reader = chunk_source.clone().open_rg(rg_idx, all_leaves).await?;
+    let rg_reader = if fetch_pages {
+        // Only the pages `selection` reads, and their dictionaries.
+        let wanted = all_leaves
+            .iter()
+            .map(|&leaf| {
+                let ranges = selection
+                    .and_then(|selection| page_ranges(metadata, rg_idx, leaf, selection))
+                    .unwrap_or_else(|| {
+                        let (start, len) = metadata.row_group(rg_idx).column(leaf).byte_range();
+                        std::iter::once(start..start + len).collect()
+                    });
+                (leaf, ranges)
+            })
+            .collect();
+        RgReader::PreFetched(Arc::new(chunk_source.read_ranges(wanted).await?))
+    } else {
+        // The reader picks its own per-RG access pattern (batched pre-fetch for
+        // local, lazy per-column for remote). See `ChunkSource::open_rg`.
+        chunk_source.clone().open_rg(rg_idx, all_leaves).await?
+    };
 
     let compute = get_compute_runtime();
     let mut rxs = Vec::with_capacity(col_indices.len());
@@ -141,19 +163,46 @@ async fn prefilter_row_group(
     base: Option<RowSelection>,
 ) -> DaftResult<RowGroupDecode> {
     let plan = &ctx.plan;
-    let total = base.as_ref().map_or_else(
+    // With a page index, the rows on pages whose statistics rule the
+    // predicate out are known not to be kept, and are never fetched.
+    let fetch_pages = ctx.page_fetched.contains(&rg_idx);
+    let pred_selection = match ctx.predicate.as_ref().filter(|_| fetch_pages) {
+        Some(predicate) => {
+            match rows_not_ruled_out(predicate, &ctx.metadata, rg_idx, &plan.read_daft_schema)? {
+                Some(pages) => Some(match &base {
+                    Some(base) => base.intersection(&pages),
+                    None => pages,
+                }),
+                None => base,
+            }
+        }
+        None => base,
+    };
+    let total = pred_selection.as_ref().map_or_else(
         || ctx.metadata.row_group(rg_idx).num_rows() as usize,
         RowSelection::row_count,
     );
+    if total == 0 {
+        return Ok(RowGroupDecode {
+            selection: pred_selection,
+            filtered_pred: plan
+                .pred_col_indices
+                .iter()
+                .map(|&col_idx| new_empty_array(ctx.arrow_schema.field(col_idx).data_type()))
+                .collect(),
+            mask: None,
+        });
+    }
     let (mut receivers, _decoders) = spawn_col_decoders(
         &plan.pred_col_indices,
         &ctx.chunk_source,
         &ctx.metadata,
         &ctx.arrow_schema,
-        base.as_ref(),
+        pred_selection.as_ref(),
         rg_idx,
         ctx.chunk_size,
         &ctx.path,
+        ctx.page_fetched.contains(&rg_idx),
     )
     .await?;
 
@@ -212,23 +261,39 @@ async fn prefilter_row_group(
         .collect::<DaftResult<Vec<_>>>()?;
 
     let runs = mask.values().set_slices().count();
-    if selection_pays(
-        runs,
-        total - mask.true_count(),
-        data_bytes_per_row(ctx, rg_idx),
-    ) {
-        let kept = RowSelection::from_filters(&[mask]);
+    let kept = RowSelection::from_filters(std::slice::from_ref(&mask));
+    let kept = match &pred_selection {
+        Some(read) => refine_selection(read, &kept),
+        None => kept,
+    };
+    // With a page index, a selection that leaves most of the other columns'
+    // pages unfetched pays for itself whatever its runs.
+    let selection_skips_pages = fetch_pages && {
+        let read = pred_selection
+            .clone()
+            .unwrap_or_else(|| RowSelection::from(vec![RowSelector::select(total)]));
+        let data_leaves = leaves_for_top_fields(ctx.metadata.as_ref(), &plan.data_col_indices);
+        let fetched = |selection: &RowSelection| -> u64 {
+            data_leaves
+                .iter()
+                .filter_map(|&leaf| page_ranges(&ctx.metadata, rg_idx, leaf, selection))
+                .flatten()
+                .map(|range| range.end - range.start)
+                .sum()
+        };
+        fetched(&kept).saturating_mul(2) <= fetched(&read)
+    };
+    if selection_skips_pages
+        || selection_pays(runs, total - mask.true_count(), data_bytes_per_row(ctx, rg_idx))
+    {
         Ok(RowGroupDecode {
-            selection: Some(match &base {
-                Some(base) => refine_selection(base, &kept),
-                None => kept,
-            }),
+            selection: Some(kept),
             filtered_pred,
             mask: None,
         })
     } else {
         Ok(RowGroupDecode {
-            selection: base,
+            selection: pred_selection,
             filtered_pred,
             mask: Some(mask),
         })
@@ -316,6 +381,7 @@ pub(super) async fn process_rg_with_data_cols(
         rg_idx,
         ctx.chunk_size,
         &ctx.path,
+        ctx.page_fetched.contains(&rg_idx),
     )
     .await
     {
@@ -436,6 +502,7 @@ pub(super) async fn process_rg_predicate_only(
         rg_idx,
         ctx.chunk_size,
         &ctx.path,
+        false,
     )
     .await
     {

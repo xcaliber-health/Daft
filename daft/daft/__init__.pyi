@@ -1217,8 +1217,13 @@ class ScanTask:
         pushdowns: PyPushdowns | None,
         partition_values: PyRecordBatch | None,
         stats: PyRecordBatch | None,
+        immutable_file: bool = False,
     ) -> ScanTask | None:
-        """Create a Catalog Scan Task."""
+        """Create a Catalog Scan Task.
+
+        ``immutable_file`` states that the table format never rewrites the file in
+        place, so ``size_bytes`` is its exact length and names its content.
+        """
 
     @staticmethod
     def sql_scan_task(
@@ -2657,6 +2662,8 @@ class PyDaftExecutionConfig:
         parquet_target_filesize: int | None = None,
         parquet_target_row_group_size: int | None = None,
         parquet_page_index: bool | None = None,
+        parquet_footer_cache_bytes: int | None = None,
+        parquet_footer_cache_mutable_files: bool | None = None,
         parquet_inflation_factor: float | None = None,
         csv_target_filesize: int | None = None,
         csv_inflation_factor: float | None = None,
@@ -2716,6 +2723,10 @@ class PyDaftExecutionConfig:
     def parquet_target_row_group_size(self) -> int: ...
     @property
     def parquet_page_index(self) -> bool: ...
+    @property
+    def parquet_footer_cache_bytes(self) -> int: ...
+    @property
+    def parquet_footer_cache_mutable_files(self) -> bool: ...
     @property
     def parquet_inflation_factor(self) -> float: ...
     @property

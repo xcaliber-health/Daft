@@ -1,11 +1,15 @@
 use std::{collections::HashMap, sync::Arc};
 
+use common_daft_config::DaftExecutionConfig;
 use common_error::DaftResult;
 use daft_csv::{CsvConvertOptions, CsvParseOptions, CsvReadOptions};
 use daft_dsl::{AggExpr, Expr, ExprRef};
 use daft_io::{GetRange, IOStatsRef};
 use daft_json::{JsonConvertOptions, JsonParseOptions, JsonReadOptions};
-use daft_parquet::read::{ParquetReadOptions, ParquetSchemaInferenceOptions};
+use daft_parquet::{
+    FooterCacheSettings,
+    read::{ParquetReadOptions, ParquetSchemaInferenceOptions},
+};
 use daft_recordbatch::RecordBatch;
 use daft_scan::{
     ChunkSpec, CsvSourceConfig, FileFormatConfig, JsonSourceConfig, ParquetSourceConfig, ScanTask,
@@ -16,6 +20,27 @@ use daft_warc::WarcConvertOptions;
 use futures::stream::BoxStream;
 
 type SkippedCorruptFilesCollector = Option<Arc<std::sync::Mutex<Vec<(String, String, bool)>>>>;
+
+/// How a scan reads Parquet files, from the engine's settings.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParquetReadSettings {
+    /// Whether filtered reads use a file's page index.
+    pub page_index: bool,
+    /// How reads use the process-wide footer cache.
+    pub footer_cache: FooterCacheSettings,
+}
+
+impl ParquetReadSettings {
+    pub(crate) fn of(cfg: &DaftExecutionConfig) -> Self {
+        Self {
+            page_index: cfg.parquet_page_index,
+            footer_cache: FooterCacheSettings {
+                max_bytes: cfg.parquet_footer_cache_bytes,
+                mutable_files: cfg.parquet_footer_cache_mutable_files,
+            },
+        }
+    }
+}
 
 /// Dispatches a ScanTask to the appropriate reader based on its SourceConfig,
 /// returning a stream of RecordBatches.
@@ -33,7 +58,7 @@ pub(crate) async fn read_scan_task(
     chunk_size: usize,
     skipped_corrupt_files: SkippedCorruptFilesCollector,
     row_group_filter: Option<&ExprRef>,
-    parquet_page_index: bool,
+    parquet: ParquetReadSettings,
 ) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
     match scan_task.source_config.as_ref() {
         SourceConfig::File(ffc) => match ffc {
@@ -50,7 +75,7 @@ pub(crate) async fn read_scan_task(
                     chunk_size,
                     skipped_corrupt_files,
                     row_group_filter,
-                    parquet_page_index,
+                    parquet,
                 )
                 .await
             }
@@ -108,7 +133,7 @@ async fn read_parquet(
     chunk_size: usize,
     skipped_corrupt_files: SkippedCorruptFilesCollector,
     row_group_filter: Option<&ExprRef>,
-    page_index: bool,
+    parquet: ParquetReadSettings,
 ) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
     let source = scan_task.sources.first().unwrap();
 
@@ -135,15 +160,14 @@ async fn read_parquet(
         row_groups,
         predicate: scan_task.pushdowns.filters.clone(),
         row_group_filter: row_group_filter.cloned(),
-        page_index,
+        page_index: parquet.page_index,
         schema_infer: ParquetSchemaInferenceOptions::new(Some(cfg.coerce_int96_timestamp_unit)),
         field_id_mapping: cfg.field_id_mapping.clone(),
         delete_rows: delete_map.as_ref().and_then(|m| m.get(url).cloned()),
         batch_size: cfg.chunk_size.or(Some(chunk_size)),
-        metadata: scan_task
-            .sources
-            .first()
-            .and_then(|s| s.get_parquet_metadata().cloned()),
+        metadata: source.get_parquet_metadata().cloned(),
+        file_version: source.get_file_version(),
+        footer_cache: parquet.footer_cache,
         ignore_corrupt_files: cfg.ignore_corrupt_files,
         skipped_corrupt_files: skipped_corrupt_files.clone(),
         ..Default::default()

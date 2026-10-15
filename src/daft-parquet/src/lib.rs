@@ -2,10 +2,12 @@ use common_error::DaftError;
 use snafu::Snafu;
 
 mod bloom;
+mod footer_cache;
 mod helpers;
 pub mod metadata;
 mod metadata_adapter;
 mod reader;
+pub use footer_cache::{FileVersion, FooterCacheSettings};
 pub use metadata_adapter::{DaftParquetMetadata, DaftRowGroupMetaData, RowGroupList};
 #[cfg(feature = "python")]
 pub mod python;

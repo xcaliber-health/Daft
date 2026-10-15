@@ -272,6 +272,8 @@ class IcebergScanOperator(ScanOperator):
             pushdowns=pushdowns,
             partition_values=pspec._recordbatch if pspec is not None else None,
             stats=None,
+            # A table never rewrites a data file in place: a new file gets a new path.
+            immutable_file=True,
         )
 
     def _create_count_scan_task(self, pushdowns: PyPushdowns, field_name: str) -> Iterator[ScanTask]:

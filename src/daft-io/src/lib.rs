@@ -221,6 +221,13 @@ impl IOClient {
         !self.config.disable_suffix_range
     }
 
+    /// The configuration this client was built with, which decides the
+    /// credentials and endpoints its requests use.
+    #[must_use]
+    pub fn config(&self) -> &Arc<IOConfig> {
+        &self.config
+    }
+
     /// Gets the source (a ObjectSource client object) and a normalized path for the source.
     pub async fn get_source_and_path(
         &self,

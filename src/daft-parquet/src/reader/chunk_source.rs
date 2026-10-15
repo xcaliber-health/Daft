@@ -16,7 +16,10 @@ use snafu::{OptionExt, ResultExt};
 
 use crate::{
     ParquetMetadataSnafu, ReaderInternalSnafu,
-    metadata::apply_field_ids_to_arrowrs_parquet_metadata, read::ParquetReadOptions, task_err,
+    footer_cache::{self, FooterKey},
+    metadata::apply_field_ids_to_arrowrs_parquet_metadata,
+    read::ParquetReadOptions,
+    task_err,
 };
 
 /// The largest gap between two page ranges fetched as one request. Smaller
@@ -106,34 +109,112 @@ pub(super) async fn open_local_file(
         .map_err(task_err(path_for_join))?
 }
 
+/// Where a remote read's footer came from.
+enum FooterSource {
+    /// Handed over by the caller, which read it at planning.
+    Caller,
+    /// Taken from the process-wide footer cache.
+    Cache,
+    /// Fetched now, with the bytes read from the end of the file.
+    Fetched(Bytes),
+}
+
+/// The file's raw footer, where it came from, and the file's size, asking the
+/// store only for what the read does not already know.
+async fn footer_and_size(
+    uri: &str,
+    known: Option<(Arc<ParquetMetaData>, FooterSource)>,
+    known_size: Option<usize>,
+    io_client: &Arc<daft_io::IOClient>,
+    io_stats: Option<&daft_io::IOStatsRef>,
+) -> crate::Result<(Arc<ParquetMetaData>, FooterSource, usize)> {
+    match (known, known_size) {
+        (Some((metadata, source)), Some(size)) => Ok((metadata, source, size)),
+        (Some((metadata, source)), None) => {
+            let size = io_client
+                .single_url_get_size(uri.to_string(), io_stats.cloned())
+                .await?;
+            Ok((metadata, source, size))
+        }
+        (None, Some(size)) => {
+            let (metadata, tail) = crate::metadata::read_parquet_metadata_and_tail(
+                uri,
+                Some(size),
+                io_client.clone(),
+                io_stats.cloned(),
+                None,
+                None,
+            )
+            .await?;
+            Ok((metadata, FooterSource::Fetched(tail), size))
+        }
+        (None, None) => {
+            let (footer, size) = Box::pin(futures::future::join(
+                crate::metadata::read_parquet_metadata_and_tail(
+                    uri,
+                    None,
+                    io_client.clone(),
+                    io_stats.cloned(),
+                    None,
+                    None,
+                ),
+                io_client.single_url_get_size(uri.to_string(), io_stats.cloned()),
+            ))
+            .await;
+            let (metadata, tail) = footer?;
+            Ok((metadata, FooterSource::Fetched(tail), size?))
+        }
+    }
+}
+
+/// `metadata` with the read's field-id mapping applied, if it has one.
+fn mapped(
+    metadata: &Arc<ParquetMetaData>,
+    opts: &ParquetReadOptions,
+    uri: &str,
+) -> crate::Result<Arc<ParquetMetaData>> {
+    match opts.field_id_mapping.as_deref() {
+        Some(mapping) => {
+            apply_field_ids_to_arrowrs_parquet_metadata(metadata.clone(), mapping, uri)
+        }
+        None => Ok(metadata.clone()),
+    }
+}
+
 pub(super) async fn prepare_remote_chunk_source(
     uri: &str,
     io_client: Arc<daft_io::IOClient>,
     io_stats: Option<daft_io::IOStatsRef>,
     opts: &ParquetReadOptions,
 ) -> crate::Result<(ChunkSourceBuilder, ArrowReaderMetadata)> {
-    let (parquet_metadata_res, file_size_res) = Box::pin(futures::future::join(
-        crate::metadata::read_parquet_metadata_and_tail(
-            uri,
-            None,
-            io_client.clone(),
-            io_stats.clone(),
-            None,
-            None,
-        ),
-        io_client.single_url_get_size(uri.to_string(), io_stats.clone()),
-    ))
-    .await;
-    let (mut parquet_metadata, tail) = parquet_metadata_res?;
-    let file_size = file_size_res?;
+    let cache_key = FooterKey::for_read(
+        io_client.config(),
+        uri,
+        opts.file_version,
+        opts.footer_cache,
+    );
+    let known = opts
+        .metadata
+        .as_deref()
+        .and_then(crate::DaftParquetMetadata::as_whole_file)
+        .map(|metadata| (metadata.clone(), FooterSource::Caller))
+        .or_else(|| {
+            cache_key
+                .as_ref()
+                .and_then(footer_cache::get)
+                .map(|metadata| (metadata, FooterSource::Cache))
+        });
+    let known_size = opts
+        .file_version
+        .and_then(|version| usize::try_from(version.size).ok());
+    let (mut raw_metadata, footer_source, file_size) =
+        footer_and_size(uri, known, known_size, &io_client, io_stats.as_ref()).await?;
 
     // Apply Iceberg field-id mapping before filtering by column name —
     // otherwise the prefetch matches pre-rename names against post-rename
-    // user-supplied names and fetches zero leaves.
-    if let Some(mapping) = opts.field_id_mapping.as_deref() {
-        parquet_metadata =
-            apply_field_ids_to_arrowrs_parquet_metadata(parquet_metadata, mapping, uri)?;
-    }
+    // user-supplied names and fetches zero leaves. The cache keeps the raw
+    // footer, since a table's mapping can change while its files do not.
+    let mut parquet_metadata = mapped(&raw_metadata, opts, uri)?;
 
     // Prefetch needs the union of user-requested columns and predicate columns.
     let prefetch_col_names: Option<std::collections::HashSet<String>> =
@@ -163,34 +244,69 @@ pub(super) async fn prepare_remote_chunk_source(
     };
 
     // A filtered read fetches the page index, one range beside the footer, so
-    // it can skip pages; a plain read never needs it.
-    if opts.page_index
+    // it can skip pages; a plain read never needs it. A cached footer may
+    // already hold it.
+    let index_loaded = if opts.page_index
         && opts.predicate.is_some()
+        && raw_metadata.offset_index().is_none()
         && super::page_index::worth_reading(&parquet_metadata, &active_col_indices)
-        && let Some(range) = super::page_index::index_range(&parquet_metadata)
+        && let Some(range) = super::page_index::index_range(&raw_metadata)
     {
         // The footer read usually reaches back over the index, which sits just
         // before the footer; fetch it only when it does not.
-        let tail_start = (file_size as u64).saturating_sub(tail.len() as u64);
-        let index = if range.start >= tail_start {
-            OffsetBytes::whole(tail_start, tail, file_size as u64)
-        } else {
-            let got = io_client
-                .single_url_get(
-                    uri.to_string(),
-                    Some(daft_io::range::GetRange::Bounded(
-                        range.start as usize..range.end as usize,
-                    )),
-                    io_stats.clone(),
-                )
-                .await?;
-            OffsetBytes::whole(range.start, got.bytes().await?, file_size as u64)
+        let tail = match &footer_source {
+            FooterSource::Fetched(tail) => Some(tail),
+            FooterSource::Caller | FooterSource::Cache => None,
         };
-        parquet_metadata = Arc::new(
-            super::page_index::with_page_index(Arc::unwrap_or_clone(parquet_metadata), &index)
+        let tail_start = tail.map(|tail| (file_size as u64).saturating_sub(tail.len() as u64));
+        let index = match (tail, tail_start) {
+            (Some(tail), Some(tail_start)) if range.start >= tail_start => {
+                OffsetBytes::whole(tail_start, tail.clone(), file_size as u64)
+            }
+            _ => {
+                let got = io_client
+                    .single_url_get(
+                        uri.to_string(),
+                        Some(daft_io::range::GetRange::Bounded(
+                            range.start as usize..range.end as usize,
+                        )),
+                        io_stats.clone(),
+                    )
+                    .await?;
+                OffsetBytes::whole(range.start, got.bytes().await?, file_size as u64)
+            }
+        };
+        raw_metadata = Arc::new(
+            super::page_index::with_page_index(Arc::unwrap_or_clone(raw_metadata), &index)
                 .with_context(|_| ParquetMetadataSnafu {
                     path: uri.to_string(),
                 })?,
+        );
+        parquet_metadata = mapped(&raw_metadata, opts, uri)?;
+        true
+    } else {
+        false
+    };
+
+    // Keep what was fetched for the next read of this version of the file;
+    // a footer handed over by the caller is the caller's, not the store's.
+    if let Some(key) = cache_key {
+        let fetched = matches!(footer_source, FooterSource::Fetched(_));
+        let grown = matches!(footer_source, FooterSource::Cache) && index_loaded;
+        if fetched || grown {
+            footer_cache::insert(key, raw_metadata, opts.footer_cache.max_bytes);
+        }
+    }
+
+    // A cached footer may hold a page index a read with the index turned off
+    // must not use.
+    if !opts.page_index && parquet_metadata.offset_index().is_some() {
+        parquet_metadata = Arc::new(
+            Arc::unwrap_or_clone(parquet_metadata)
+                .into_builder()
+                .set_column_index(None)
+                .set_offset_index(None)
+                .build(),
         );
     }
 

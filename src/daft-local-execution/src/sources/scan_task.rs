@@ -30,7 +30,7 @@ use crate::{
     join::key_filter::{KeyRestriction, RowKeyFilter, RowTest, ScanKeyFilter},
     pipeline::{InputId, NodeName, PipelineMessage},
     sources::{
-        scan_task_reader,
+        scan_task_reader::{self, ParquetReadSettings},
         source::{Source, SourceStream, StatsProvider},
     },
 };
@@ -184,8 +184,8 @@ pub struct ScanTaskSource {
     /// Join keys that restrict this scan, each waited for before an input's
     /// files are opened.
     key_filters: Arc<Vec<ScanKeyFilter>>,
-    /// Whether filtered Parquet reads use a file's page index.
-    parquet_page_index: bool,
+    /// How the scan reads Parquet files.
+    parquet: ParquetReadSettings,
 }
 
 impl ScanTaskSource {
@@ -212,7 +212,7 @@ impl ScanTaskSource {
             row_group_splitting_enabled: cfg.enable_scan_task_row_group_splitting,
             skipped_corrupt_files,
             key_filters: Arc::new(Vec::new()),
-            parquet_page_index: cfg.parquet_page_index,
+            parquet: ParquetReadSettings::of(cfg),
         }
     }
 
@@ -235,7 +235,7 @@ impl ScanTaskSource {
         maintain_order: bool,
         skipped_corrupt_files: SkippedCorruptFilesCollector,
         key_filters: Arc<Vec<ScanKeyFilter>>,
-        parquet_page_index: bool,
+        parquet: ParquetReadSettings,
     ) -> common_runtime::RuntimeTask<DaftResult<()>> {
         let io_runtime = get_io_runtime(true);
 
@@ -285,7 +285,7 @@ impl ScanTaskSource {
                         input_id,
                         skipped_corrupt_files.clone(),
                         restriction,
-                        parquet_page_index,
+                        parquet,
                     ));
                 }
 
@@ -420,7 +420,7 @@ impl Source for ScanTaskSource {
             maintain_order,
             self.skipped_corrupt_files.clone(),
             self.key_filters.clone(),
-            self.parquet_page_index,
+            self.parquet,
         );
         let result_stream = output_receiver.into_stream().map(Ok);
         let combined_stream = combine_stream(result_stream, processor_task.map(|x| x?));
@@ -666,7 +666,7 @@ async fn forward_scan_task_stream(
     input_id: InputId,
     skipped_corrupt_files: SkippedCorruptFilesCollector,
     restriction: Option<Arc<TaskRestriction>>,
-    parquet_page_index: bool,
+    parquet: ParquetReadSettings,
 ) -> DaftResult<InputId> {
     let schema = scan_task.materialized_schema();
     let mut stream = stream_scan_task(
@@ -679,7 +679,7 @@ async fn forward_scan_task_stream(
         restriction
             .as_ref()
             .map(|restriction| &restriction.row_group_filter),
-        parquet_page_index,
+        parquet,
     )
     .await?;
     let mut has_data = false;
@@ -745,7 +745,7 @@ async fn stream_scan_task(
     chunk_size: usize,
     skipped_corrupt_files: SkippedCorruptFilesCollector,
     row_group_filter: Option<&ExprRef>,
-    parquet_page_index: bool,
+    parquet: ParquetReadSettings,
 ) -> DaftResult<impl Stream<Item = DaftResult<MicroPartition>> + Send> {
     let pushdown_columns = scan_task
         .pushdowns
@@ -803,7 +803,7 @@ async fn stream_scan_task(
         chunk_size,
         skipped_corrupt_files,
         row_group_filter,
-        parquet_page_index,
+        parquet,
     )
     .await?;
 

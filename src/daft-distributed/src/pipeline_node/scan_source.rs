@@ -344,6 +344,7 @@ mod tests {
                             chunk_spec: None,
                             iceberg_delete_files: None,
                             parquet_metadata: None,
+                            version: None,
                         },
                     }],
                     source_config.clone(),

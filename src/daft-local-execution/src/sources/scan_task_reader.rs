@@ -81,9 +81,9 @@ pub(crate) async fn read_scan_task(
             }
         },
         #[cfg(feature = "python")]
-        SourceConfig::Database(cfg) => read_database(scan_task, cfg).await,
+        SourceConfig::Database(cfg) => Ok(read_database(scan_task, cfg)),
         #[cfg(feature = "python")]
-        SourceConfig::PythonFunction { .. } => read_python_function(scan_task).await,
+        SourceConfig::PythonFunction { .. } => Ok(read_python_function(scan_task)),
     }
 }
 
@@ -303,46 +303,193 @@ async fn read_text(
     .await
 }
 
+/// Batches a blocking source may read ahead of its reader. Enough that a source
+/// and its reader rarely wait on each other batch by batch: handing over one at a
+/// time cost about 3 µs a batch more, measured on small batches.
+#[cfg(any(feature = "python", test))]
+const BATCHES_AHEAD: usize = 4;
+
+/// Reads a source whose reading blocks, such as a call into Python, on a thread
+/// of the blocking pool rather than on a worker of the runtime it is read from.
+///
+/// A source waiting for its next batch would otherwise hold the worker it is
+/// polled on. With every worker held, no other read moves, nor the network
+/// traffic a waiting source may itself be waiting for. `open` and each batch it
+/// yields run on that thread, and the source reads at most [`BATCHES_AHEAD`]
+/// batches ahead of its reader. Once the reader is dropped, reading stops at the
+/// source's next batch. A panic while reading
+/// ends the stream with an error, never as if the source had ended.
+///
+/// Must be called within a Tokio runtime, whose blocking pool is used.
+#[cfg(any(feature = "python", test))]
+fn read_on_blocking_thread<I>(
+    open: impl FnOnce() -> DaftResult<I> + Send + 'static,
+) -> BoxStream<'static, DaftResult<RecordBatch>>
+where
+    I: Iterator<Item = DaftResult<RecordBatch>>,
+{
+    use futures::StreamExt;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(BATCHES_AHEAD);
+    let reading = tokio::task::spawn_blocking(move || {
+        let batches = match open() {
+            Ok(batches) => batches,
+            Err(e) => {
+                // The reader may be gone already, so the error has no one to reach.
+                let _ = tx.blocking_send(Err(e));
+                return;
+            }
+        };
+        for batch in batches {
+            if tx.blocking_send(batch).is_err() {
+                return;
+            }
+        }
+    });
+    // Once the batches end, the thread has returned or panicked: a panic is the
+    // stream's last item.
+    let ending = futures::stream::once(async move {
+        reading.await.err().map(|panicked| {
+            Err(common_error::DaftError::External(
+                format!("reading a source failed: {panicked}").into(),
+            ))
+        })
+    })
+    .filter_map(futures::future::ready);
+    Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx).chain(ending))
+}
+
 #[cfg(feature = "python")]
-async fn read_database(
-    scan_task: &ScanTask,
+fn read_database(
+    scan_task: &Arc<ScanTask>,
     cfg: &daft_scan::DatabaseSourceConfig,
-) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
+) -> BoxStream<'static, DaftResult<RecordBatch>> {
     use pyo3::Python;
     use snafu::ResultExt;
 
     use crate::PyIOSnafu;
 
-    let predicate = scan_task
-        .pushdowns
-        .filters
-        .as_ref()
-        .map(|p| (*p.as_ref()).clone().into());
-    let table: RecordBatch = Python::attach(|py| {
-        daft_micropartition::python::read_sql_into_py_table(
-            py,
-            &cfg.sql,
-            &cfg.conn,
-            predicate.clone(),
-            scan_task.schema.clone().into(),
-            scan_task
-                .pushdowns
-                .columns
-                .as_ref()
-                .map(|cols| cols.as_ref().clone()),
-            scan_task.pushdowns.limit,
-        )
-        .map(|t| t.into())
-        .context(PyIOSnafu)
-    })?;
-    Ok(Box::pin(futures::stream::once(async { Ok(table) })))
+    let scan_task = scan_task.clone();
+    let cfg = cfg.clone();
+    read_on_blocking_thread(move || {
+        let predicate = scan_task
+            .pushdowns
+            .filters
+            .as_ref()
+            .map(|p| (*p.as_ref()).clone().into());
+        let table: RecordBatch = Python::attach(|py| {
+            daft_micropartition::python::read_sql_into_py_table(
+                py,
+                &cfg.sql,
+                &cfg.conn,
+                predicate,
+                scan_task.schema.clone().into(),
+                scan_task
+                    .pushdowns
+                    .columns
+                    .as_ref()
+                    .map(|cols| cols.as_ref().clone()),
+                scan_task.pushdowns.limit,
+            )
+            .map(|t| t.into())
+            .context(PyIOSnafu)
+        })?;
+        Ok(std::iter::once(Ok(table)))
+    })
 }
 
 #[cfg(feature = "python")]
-async fn read_python_function(
-    scan_task: &Arc<ScanTask>,
-) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
-    let iter = daft_micropartition::python::read_pyfunc_into_table_iter(scan_task.clone())?;
-    let stream = futures::stream::iter(iter.map(|r| r.map_err(|e| e.into())));
-    Ok(Box::pin(stream))
+fn read_python_function(scan_task: &Arc<ScanTask>) -> BoxStream<'static, DaftResult<RecordBatch>> {
+    let scan_task = scan_task.clone();
+    read_on_blocking_thread(move || {
+        let batches = daft_micropartition::python::read_pyfunc_into_table_iter(scan_task)?;
+        Ok(batches.map(|batch| batch.map_err(Into::into)))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use common_error::{DaftError, DaftResult};
+    use daft_core::{prelude::Schema, series::Series};
+    use daft_recordbatch::RecordBatch;
+    use futures::StreamExt;
+
+    use super::read_on_blocking_thread;
+
+    /// A batch of no columns whose row count names it.
+    fn batch(rows: usize) -> DaftResult<RecordBatch> {
+        RecordBatch::new_with_size(Schema::empty(), Vec::<Series>::new(), rows)
+    }
+
+    fn rows(read: &[DaftResult<RecordBatch>]) -> Vec<Option<usize>> {
+        read.iter()
+            .map(|batch| batch.as_ref().ok().map(RecordBatch::len))
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn batches_arrive_in_order() {
+        let read: Vec<_> = read_on_blocking_thread(|| Ok((1..=3).map(batch)))
+            .collect()
+            .await;
+
+        assert_eq!(rows(&read), vec![Some(1), Some(2), Some(3)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_source_that_cannot_open_ends_with_its_error() {
+        let read: Vec<_> = read_on_blocking_thread(|| {
+            Err::<std::iter::Empty<_>, _>(DaftError::ValueError("no source".to_string()))
+        })
+        .collect()
+        .await;
+
+        assert_eq!(read.len(), 1);
+        assert!(matches!(&read[0], Err(DaftError::ValueError(m)) if m == "no source"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_panic_while_reading_ends_the_stream_with_an_error() {
+        let read: Vec<_> = read_on_blocking_thread(|| {
+            Ok((1..=3).map(|n| {
+                assert!(n < 3, "the source broke");
+                batch(n)
+            }))
+        })
+        .collect()
+        .await;
+
+        assert_eq!(rows(&read[..2]), vec![Some(1), Some(2)]);
+        assert_eq!(read.len(), 3);
+        assert!(
+            read[2]
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("the source broke"))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn reading_stops_once_the_reader_is_gone() {
+        let taken = Arc::new(AtomicUsize::new(0));
+        let counted = taken.clone();
+        let mut read = read_on_blocking_thread(move || {
+            Ok((1..).map(move |n| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                batch(n)
+            }))
+        });
+
+        assert!(read.next().await.is_some());
+        drop(read);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // One batch was read, the channel holds as many as it may, and one was
+        // being sent when the reader went.
+        assert!(taken.load(Ordering::SeqCst) <= super::BATCHES_AHEAD + 2);
+    }
 }

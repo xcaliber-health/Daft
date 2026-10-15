@@ -108,27 +108,39 @@ class DataSourceTask(ABC):
         """Returns the schema of the record batches produced by this task."""
         ...
 
-    async def read(self) -> AsyncIterator[RecordBatch]:
-        """Yields record batches. Called from an async execution context.
+    def read(self) -> AsyncIterator[RecordBatch] | Iterator[RecordBatch]:
+        """Yields the task's record batches.
+
+        Override it as a plain generator (``def read``) or an asynchronous one
+        (``async def read``). The engine calls it on a thread of its own, held
+        only by this task while it reads, so a plain generator may block, for
+        example waiting on the network for its next batch. An asynchronous one
+        runs on an event loop that every query in the process shares, and must
+        never block: a blocking call there holds every query's results until it
+        returns. It runs at most two batches ahead of the engine, or as many as fit in
+        16 MiB, whichever holds more.
 
         The default implementation delegates to the deprecated
         get_micro_partitions for backwards compatibility.
-        New subclasses should override this method directly.
+
+        Returns:
+            The task's record batches, as an iterator or an asynchronous one.
         """
+        return self._read_micro_partitions()
+
+    def _read_micro_partitions(self) -> Iterator[RecordBatch]:
+        """Yields the record batches of the deprecated ``get_micro_partitions``."""
         try:
             parts = self.get_micro_partitions()
         except NotImplementedError:
-            raise NotImplementedError(
-                f"{type(self).__name__} must implement async def read(self) -> AsyncIterator[RecordBatch]"
-            )
+            raise NotImplementedError(f"{type(self).__name__} must implement read(self)")
         warnings.warn(
-            f"{type(self).__name__}.get_micro_partitions() is deprecated — override 'async def read()' instead.",
+            f"{type(self).__name__}.get_micro_partitions() is deprecated — override 'read()' instead.",
             DeprecationWarning,
             stacklevel=2,
         )
         for mp in parts:
-            for rb in mp.get_record_batches():
-                yield rb
+            yield from mp.get_record_batches()
 
     def get_micro_partitions(self) -> Iterator[MicroPartition]:
         """Deprecated: override read instead."""

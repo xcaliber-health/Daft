@@ -23,7 +23,7 @@ Create a class that inherits from [`DataSource`](../api/io.md#daft.io.source.Dat
 
 === "🐍 Python"
 ```python
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
 from daft.datatype import DataType
@@ -94,7 +94,7 @@ class TextFileDataSourceTask(DataSourceTask):
             ("line", DataType.string()),
         ])
 
-    async def read(self) -> AsyncIterator[RecordBatch]:
+    def read(self) -> Iterator[RecordBatch]:
         """Read the text file and yield RecordBatches.
 
         This method reads the file line by line and creates RecordBatches
@@ -159,6 +159,13 @@ data_source = TextFileDataSource([sample_file])
 
 (Showing first 5 of 5 rows)
 ```
+
+### Reading synchronously or asynchronously
+
+A task's `read` may be a plain generator (`def read`), as above, or an asynchronous one (`async def read`).
+
+- **A plain generator** runs on a thread of its own while its task reads. It may block, for example on a file or while waiting on the network for its next batch, and holds nothing else up while it waits.
+- **An asynchronous generator** runs on an event loop that every query in the process shares, and suits a source that awaits an asynchronous client. It must never block: a blocking call inside it holds every query's results until it returns. It runs at most two batches ahead of the engine, or as many as fit in 16 MiB, whichever holds more.
 
 ### Optional: Declaring Clustering to Skip Shuffles
 

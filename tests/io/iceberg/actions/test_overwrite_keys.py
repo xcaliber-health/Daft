@@ -27,7 +27,7 @@ from pyiceberg.types import LongType, NestedField, StringType
 
 import daft
 from daft import col
-from daft.exceptions import DaftValueError
+from daft.exceptions import DaftFieldNotFoundError, DaftValueError
 from daft.io.iceberg import WriteConflict
 from tests.io.iceberg.actions._helpers import commit_equality_delete_rows, snapshot_count
 
@@ -430,7 +430,7 @@ def test_a_zoned_key_matches_the_same_instant_in_another_zone(local_catalog: Cat
         ),
         pytest.param(
             {"overwrite_keys": daft.from_pydict({"nope": [1]})},
-            ValueError,
+            DaftFieldNotFoundError,
             "not a column of the table",
             id="unknown key",
         ),

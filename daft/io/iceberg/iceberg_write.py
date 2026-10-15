@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from daft import Expression, col, lit
 from daft.datatype import DataType
+from daft.exceptions import DaftSchemaMismatchError
 from daft.expressions.expressions import ExpressionsProjection
 from daft.io.common import _get_schema_from_dict
 from daft.recordbatch import MicroPartition
@@ -161,9 +162,10 @@ def planned_columns(data_schema: pa.Schema, iceberg_schema: IcebergSchema) -> Ex
             data, typed to match.
 
     Raises:
-        ValueError: If the data carries a column the table does not, lacks one the
-            table requires, or holds a column of a type the table's column would
-            have to convert by rounding, parsing, formatting or assuming a zone.
+        DaftSchemaMismatchError: If the data carries a column the table does not,
+            lacks one the table requires, or holds a column of a type the table's
+            column would have to convert by rounding, parsing, formatting or
+            assuming a zone.
     """
     from pyiceberg.io.pyarrow import schema_to_pyarrow
 
@@ -174,18 +176,18 @@ def planned_columns(data_schema: pa.Schema, iceberg_schema: IcebergSchema) -> Ex
     present = set(names)
     extra = [name for name in names if name not in targets]
     if extra:
-        raise ValueError(
+        raise DaftSchemaMismatchError(
             f"Refusing to write the columns {extra}, which the table does not have; its columns are "
             f"{list(targets)}. Select or rename the columns to write."
         )
     for field in data_schema:
         refusal = _refusal_at(field.type, targets[field.name], field.name)
         if refusal is not None:
-            raise ValueError(f"Refusing the write: {refusal}. Cast it to the column's type explicitly.")
+            raise DaftSchemaMismatchError(f"Refusing the write: {refusal}. Cast it to the column's type explicitly.")
     missing = [field for name, field in targets.items() if name not in present]
     required = [field.name for field in missing if not field.nullable]
     if required:
-        raise ValueError(f"Refusing to write data lacking the table's required columns {required}.")
+        raise DaftSchemaMismatchError(f"Refusing to write data lacking the table's required columns {required}.")
 
     return ExpressionsProjection(
         [lit(None).alias(field.name).cast(DataType.from_arrow_type(field.type)) for field in missing]

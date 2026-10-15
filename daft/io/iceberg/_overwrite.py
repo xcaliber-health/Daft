@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, TypeAlias
 
+from daft.exceptions import DaftFieldNotFoundError, DaftTypeError
 from daft.io.iceberg._common import begin_transaction, commit_with_retry
 
 if TYPE_CHECKING:
@@ -200,10 +201,12 @@ def overwrite_by_filter(
 
     Raises:
     ------
+    DaftTypeError
+        When the filter is not boolean.
     ValueError
-        When the filter does not resolve to a boolean over both the table's
-        columns and the new rows' columns, when the isolation level is not
-        recognized, or when a new row does not satisfy the filter.
+        When the filter refers to a column outside both the table's columns
+        and the new rows' columns, when the isolation level is not recognized,
+        or when a new row does not satisfy the filter.
     WriteConflict
         When a commit made since the overwrite was planned overlaps it.
     CommitRetryExhausted
@@ -247,10 +250,12 @@ def overwrite_by_keys(
 
     Raises:
     ------
+    DaftFieldNotFoundError
+        When a key column is not a column of the table and of ``df``.
     ValueError
-        When a key column is not a column of the table and of ``df``, when a key
-        column's type does not compare with the table's, when the isolation
-        level is not recognized, or when a new row's key is not in ``keys``.
+        When a key column's type does not compare with the table's, when the
+        isolation level is not recognized, or when a new row's key is not in
+        ``keys``.
     WriteConflict
         When a commit made since the overwrite was planned overlaps it.
     CommitRetryExhausted
@@ -402,9 +407,9 @@ class _KeyScope(_Scope):
         table_schema = convert_iceberg_schema(table.schema())
         for name in names:
             if name not in table_schema.column_names():
-                raise ValueError(f"the key column {name!r} is not a column of the table")
+                raise DaftFieldNotFoundError(f"the key column {name!r} is not a column of the table")
             if name not in written.column_names():
-                raise ValueError(f"the key column {name!r} is not a column of the written rows")
+                raise DaftFieldNotFoundError(f"the key column {name!r} is not a column of the written rows")
             for side, dtype in (("key set", keys.schema()[name].dtype), ("written rows", written[name].dtype)):
                 if not _comparable(dtype, table_schema[name].dtype):
                     raise ValueError(
@@ -688,7 +693,7 @@ def _require_boolean(expression: Expression, schema: Schema, over: str) -> None:
     except ValueError as exc:
         raise ValueError(f"the overwrite filter {expression} must refer only to {over}: {exc}") from exc
     if field.dtype != DataType.bool():
-        raise ValueError(f"the overwrite filter {expression} must be boolean, got {field.dtype}")
+        raise DaftTypeError(f"the overwrite filter {expression} must be boolean, got {field.dtype}")
 
 
 def _isolation_level(table: PyIcebergTable) -> str:

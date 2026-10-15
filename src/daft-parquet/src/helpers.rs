@@ -1,6 +1,5 @@
 use std::{borrow::Cow, collections::HashSet};
 
-use arrow::array::Array;
 use common_error::DaftResult;
 use daft_core::prelude::*;
 use daft_dsl::{
@@ -122,37 +121,6 @@ pub fn combine_selections(
         (a @ Some(_), None) | (None, a @ Some(_)) => a,
         (None, None) => None,
     }
-}
-
-/// RLE-encode a boolean mask into a `RowSelection`.
-pub fn bool_array_to_row_selection(mask: &arrow::array::BooleanArray) -> RowSelection {
-    let mut selectors = Vec::new();
-    let mut current_select = false;
-    let mut current_count = 0usize;
-    for i in 0..mask.len() {
-        let val = mask.is_valid(i) && mask.value(i);
-        if val == current_select {
-            current_count += 1;
-        } else {
-            if current_count > 0 {
-                selectors.push(if current_select {
-                    RowSelector::select(current_count)
-                } else {
-                    RowSelector::skip(current_count)
-                });
-            }
-            current_select = val;
-            current_count = 1;
-        }
-    }
-    if current_count > 0 {
-        selectors.push(if current_select {
-            RowSelector::select(current_count)
-        } else {
-            RowSelector::skip(current_count)
-        });
-    }
-    selectors.into()
 }
 
 /// Compose a base selection (relative to the full RG) with a predicate

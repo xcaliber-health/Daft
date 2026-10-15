@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use common_error::DaftResult;
 use common_metrics::ops::NodeType;
-use daft_core::prelude::SchemaRef;
+use daft_core::{prelude::SchemaRef, series::Series};
 use daft_dsl::expr::bound_expr::BoundExpr;
 use daft_logical_plan::JoinType;
 use daft_micropartition::MicroPartition;
@@ -76,6 +76,26 @@ impl HashJoinBuildState {
         let pt = self.probe_table_builder.build();
         ProbeState::new(pt, self.tables)
     }
+}
+
+/// Each join key evaluated over every build batch, one column per key.
+fn build_key_columns(tables: &[RecordBatch], build_on: &[BoundExpr]) -> DaftResult<Vec<Series>> {
+    let keys = tables
+        .iter()
+        .map(|table| table.eval_expression_list(build_on))
+        .collect::<DaftResult<Vec<_>>>()?;
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    (0..build_on.len())
+        .map(|key| {
+            let columns = keys
+                .iter()
+                .map(|batch| batch.get_column(key))
+                .collect::<Vec<_>>();
+            Series::concat(&columns)
+        })
+        .collect()
 }
 
 pub(crate) struct HashJoinParams {
@@ -164,6 +184,16 @@ impl JoinOperator for HashJoinOperator {
     fn finalize_build(&self, state: Self::BuildState) -> FinalizeBuildResult<Self> {
         let finalized_probe_state = state.finalize();
         Ok(finalized_probe_state).into()
+    }
+
+    fn build_key_columns(
+        &self,
+        state: &Self::FinalizedBuildState,
+    ) -> Option<DaftResult<Vec<Series>>> {
+        Some(build_key_columns(
+            state.get_record_batches(),
+            &self.params.build_on,
+        ))
     }
 
     fn make_build_state(&self) -> DaftResult<Self::BuildState> {

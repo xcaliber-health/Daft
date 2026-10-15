@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use common_error::DaftResult;
 use daft_csv::{CsvConvertOptions, CsvParseOptions, CsvReadOptions};
-use daft_dsl::{AggExpr, Expr};
+use daft_dsl::{AggExpr, Expr, ExprRef};
 use daft_io::{GetRange, IOStatsRef};
 use daft_json::{JsonConvertOptions, JsonParseOptions, JsonReadOptions};
 use daft_parquet::read::{ParquetReadOptions, ParquetSchemaInferenceOptions};
@@ -32,6 +32,7 @@ pub(crate) async fn read_scan_task(
     maintain_order: bool,
     chunk_size: usize,
     skipped_corrupt_files: SkippedCorruptFilesCollector,
+    row_group_filter: Option<&ExprRef>,
 ) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
     match scan_task.source_config.as_ref() {
         SourceConfig::File(ffc) => match ffc {
@@ -47,6 +48,7 @@ pub(crate) async fn read_scan_task(
                     maintain_order,
                     chunk_size,
                     skipped_corrupt_files,
+                    row_group_filter,
                 )
                 .await
             }
@@ -103,6 +105,7 @@ async fn read_parquet(
     _maintain_order: bool,
     chunk_size: usize,
     skipped_corrupt_files: SkippedCorruptFilesCollector,
+    row_group_filter: Option<&ExprRef>,
 ) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
     let source = scan_task.sources.first().unwrap();
 
@@ -128,6 +131,7 @@ async fn read_parquet(
         num_rows: scan_task.pushdowns.limit,
         row_groups,
         predicate: scan_task.pushdowns.filters.clone(),
+        row_group_filter: row_group_filter.cloned(),
         schema_infer: ParquetSchemaInferenceOptions::new(Some(cfg.coerce_int96_timestamp_unit)),
         field_id_mapping: cfg.field_id_mapping.clone(),
         delete_rows: delete_map.as_ref().and_then(|m| m.get(url).cloned()),

@@ -228,6 +228,8 @@ def set_execution_config(
     broadcast_join_size_bytes_threshold: int | None = None,
     parquet_split_row_groups_max_files: int | None = None,
     hash_join_partition_size_leniency: float | None = None,
+    enable_join_key_filters: bool | None = None,
+    join_key_filter_max_values: int | None = None,
     sample_size_for_sort: int | None = None,
     num_preview_rows: int | None = None,
     parquet_target_filesize: int | None = None,
@@ -280,6 +282,14 @@ def set_execution_config(
         hash_join_partition_size_leniency: If the left side of a hash join is already correctly partitioned and the right side isn't,
             and the ratio between the left and right size is at least this value, then the right side is repartitioned to have an equal
             number of partitions as the left. Defaults to 0.5.
+        enable_join_key_filters: Whether an inner or semi hash join whose build side is estimated within
+            ``broadcast_join_size_bytes_threshold`` filters the Parquet scans on its probe side by the keys
+            its build side holds: a scan waits for the build side, then skips the files and row groups no
+            key matches, and drops the rows no key matches until it sees it keeps most of them. The answer
+            is unchanged. Defaults to True.
+        join_key_filter_max_values: The most build-side rows whose key values such a filter lists to
+            skip row groups by their bloom filters; above it, row groups are skipped by the keys' range
+            alone. Defaults to 1000.
         sample_size_for_sort: number of elements to sample from each partition when running sort,
             Default is 20.
         num_preview_rows: number of rows to when showing a dataframe preview,
@@ -336,6 +346,8 @@ def set_execution_config(
             parquet_split_row_groups_max_files=parquet_split_row_groups_max_files,
             broadcast_join_size_bytes_threshold=broadcast_join_size_bytes_threshold,
             hash_join_partition_size_leniency=hash_join_partition_size_leniency,
+            enable_join_key_filters=enable_join_key_filters,
+            join_key_filter_max_values=join_key_filter_max_values,
             sample_size_for_sort=sample_size_for_sort,
             num_preview_rows=num_preview_rows,
             parquet_target_filesize=parquet_target_filesize,

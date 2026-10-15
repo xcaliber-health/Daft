@@ -24,6 +24,7 @@ from pyiceberg.types import LongType, NestedField, StringType
 
 import daft
 from daft import col, lit
+from daft.exceptions import DaftTypeError
 from daft.io.iceberg import WriteConflict
 from tests.io.iceberg.actions._helpers import (
     commit_equality_delete_rows,
@@ -337,7 +338,7 @@ def test_a_concurrent_commit_that_overlaps_refuses_the_overwrite(
     ("kwargs", "error", "match"),
     [
         pytest.param({"mode": "append"}, ValueError, "requires mode='overwrite'", id="in append mode"),
-        pytest.param({"overwrite_filter": col("v") + 1}, ValueError, "must be boolean", id="not boolean"),
+        pytest.param({"overwrite_filter": col("v") + 1}, DaftTypeError, "must be boolean", id="not boolean"),
         pytest.param({"overwrite_filter": col("missing") == 1}, ValueError, "must refer only to", id="unknown column"),
         pytest.param({"overwrite_filter": "id > 1"}, TypeError, "wrong input type", id="not an expression"),
     ],

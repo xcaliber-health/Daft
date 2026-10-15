@@ -51,6 +51,7 @@ from pyiceberg.types import (
 from pyiceberg.types import NestedField as _NestedField
 
 import daft
+from daft.exceptions import DaftSchemaMismatchError
 from daft.io.writer import IcebergWriter
 from daft.recordbatch.micropartition import MicroPartition
 
@@ -264,7 +265,7 @@ def test_write_overwrite_with_snapshot_properties(simple_local_table):
 def test_a_frame_holding_none_of_the_tables_columns_is_refused(simple_local_table):
     table, _ = simple_local_table
 
-    with pytest.raises(ValueError, match="\\['y'\\], which the table does not have"):
+    with pytest.raises(DaftSchemaMismatchError, match="\\['y'\\], which the table does not have"):
         daft.from_pydict({"y": [1, 2, 3, 4, 5]}).write_iceberg(table)
 
     assert table.refresh().current_snapshot() is None
@@ -273,7 +274,7 @@ def test_a_frame_holding_none_of_the_tables_columns_is_refused(simple_local_tabl
 def test_a_column_the_table_lacks_is_refused_under_every_partitioning(simple_local_table):
     table, _ = simple_local_table
 
-    with pytest.raises(ValueError, match="\\['y'\\], which the table does not have"):
+    with pytest.raises(DaftSchemaMismatchError, match="\\['y'\\], which the table does not have"):
         daft.from_pydict({"x": [1, 2, 3, 4, 5], "y": [6, 7, 8, 9, 10]}).write_iceberg(table)
 
     assert table.refresh().current_snapshot() is None
@@ -827,7 +828,7 @@ def test_a_conversion_that_changes_a_value_is_refused_when_planned(local_catalog
     table = local_catalog.create_table("default.refused", Schema(NestedField(1, "v", column, required=False)))
     frame, computed = _counted_rows(values)
 
-    with pytest.raises(ValueError, match="Refusing the write: .*'v'"):
+    with pytest.raises(DaftSchemaMismatchError, match="Refusing the write: .*'v'"):
         frame.write_iceberg(table)
 
     assert computed == [0]
@@ -887,7 +888,7 @@ def test_a_value_the_column_cannot_hold_is_still_refused_when_written(local_cata
 def test_a_nested_conversion_is_refused_naming_its_field(local_catalog, column, values, named: str) -> None:
     table = local_catalog.create_table("default.nested", Schema(NestedField(1, "v", column, required=False)))
 
-    with pytest.raises(ValueError, match=f"Refusing the write: the column {named}"):
+    with pytest.raises(DaftSchemaMismatchError, match=f"Refusing the write: the column {named}"):
         daft.from_arrow(pa.table({"v": values})).write_iceberg(table)
 
 
@@ -898,7 +899,7 @@ def test_a_required_column_the_data_lacks_is_refused_before_any_row_is_computed(
     )
     frame, computed = _counted_rows(pa.array(list(range(1_000)), pa.int64()))
 
-    with pytest.raises(ValueError, match="required columns \\['kept'\\]"):
+    with pytest.raises(DaftSchemaMismatchError, match="required columns \\['kept'\\]"):
         frame.write_iceberg(table)
 
     assert computed == [0]
@@ -926,7 +927,7 @@ def test_a_column_the_table_lacks_is_refused(local_catalog) -> None:
         Schema(NestedField(1, "v", LongType(), required=False), NestedField(2, "tag", StringType(), required=False)),
     )
 
-    with pytest.raises(ValueError, match="\\['tagg'\\], which the table does not have"):
+    with pytest.raises(DaftSchemaMismatchError, match="\\['tagg'\\], which the table does not have"):
         daft.from_pydict({"v": [1], "tagg": ["a"]}).write_iceberg(table)
 
     assert local_catalog.load_table("default.extra").current_snapshot() is None

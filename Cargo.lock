@@ -2789,6 +2789,7 @@ name = "daft-dsl"
 version = "0.3.0-dev0"
 dependencies = [
  "async-trait",
+ "bincode",
  "common-error",
  "common-hashable-float-wrapper",
  "common-macros",
@@ -2811,6 +2812,7 @@ dependencies = [
  "recursive",
  "rstest",
  "serde",
+ "serde_json",
  "stacker",
  "tokio",
  "typetag",

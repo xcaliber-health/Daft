@@ -10,7 +10,7 @@ use common_error::{DaftError, DaftResult};
 use daft_core::prelude::*;
 use daft_dsl::{
     Column, Expr, ExprRef,
-    expr::{BoundColumn, bound_expr::BoundExpr},
+    expr::{BoundColumn, InList, bound_expr::BoundExpr},
     null_lit, resolved_col,
 };
 use daft_recordbatch::RecordBatch;
@@ -27,6 +27,28 @@ pub struct TableStatistics {
 /// The longest value list a membership test is judged by value against
 /// statistics; a longer one is judged by the range its values span.
 const MAX_LISTED_EQUALITIES: usize = 64;
+
+/// The range a list's values span, taken from its values built once, when
+/// that is the range joining each value's own would give: values of one
+/// ordered type with no nulls. A list with nulls or of floats, whose NaN
+/// orders apart, is left to joining its values one by one.
+fn span_of_built_values(items: &InList) -> Option<ColumnRangeStatistics> {
+    let values = items.literal_values()?;
+    let dtype = values.data_type();
+    if values.null_count() > 0
+        || dtype.is_floating()
+        || dtype.is_null()
+        || !ColumnRangeStatistics::supports_dtype(dtype)
+    {
+        return None;
+    }
+    let lower = values.min(None).ok()?;
+    let upper = values.max(None).ok()?;
+    if lower.data_type() != dtype || upper.data_type() != dtype {
+        return None;
+    }
+    ColumnRangeStatistics::new(Some(lower), Some(upper)).ok()
+}
 
 impl TableStatistics {
     pub fn new(columns: Vec<ColumnRangeStatistics>, schema: SchemaRef) -> Self {
@@ -174,7 +196,7 @@ impl TableStatistics {
     /// values span, which costs one comparison whatever its length. Either way
     /// it is false only where no listed value can lie in the column's range.
     /// A list holding anything but literals is not judged.
-    fn eval_is_in(&self, col: &ExprRef, items: &[ExprRef]) -> crate::Result<ColumnRangeStatistics> {
+    fn eval_is_in(&self, col: &ExprRef, items: &InList) -> crate::Result<ColumnRangeStatistics> {
         if !items
             .iter()
             .all(|item| matches!(item.as_ref(), Expr::Literal(_)))
@@ -182,6 +204,11 @@ impl TableStatistics {
             return Ok(ColumnRangeStatistics::Missing);
         }
         let column = self.eval_expression(&BoundExpr::new_unchecked(col.clone()))?;
+        if items.len() > MAX_LISTED_EQUALITIES
+            && let Some(span) = span_of_built_values(items)
+        {
+            return column.equal(&span);
+        }
         let mut values = items
             .iter()
             .map(|item| self.eval_expression(&BoundExpr::new_unchecked(item.clone())));
@@ -286,7 +313,10 @@ mod test {
     use snafu::ResultExt;
 
     use super::TableStatistics;
-    use crate::{DaftCoreComputeSnafu, column_stats::TruthValue};
+    use crate::{
+        DaftCoreComputeSnafu,
+        column_stats::{ColumnRangeStatistics, TruthValue},
+    };
 
     /// The truth of `column a IN values` over statistics of `a` spanning 10..=20.
     fn is_in(values: &[i64]) -> TruthValue {
@@ -319,6 +349,66 @@ mod test {
         ];
         for (values, truth) in cases {
             assert_eq!(is_in(values), truth, "{values:?}");
+        }
+    }
+
+    /// The truth of `column a IN values` over statistics of `a` spanning
+    /// `lower..=upper`, and the truth of the range joining each value's own.
+    fn is_in_and_joined_span(column: Series, values: Vec<Literal>) -> (TruthValue, TruthValue) {
+        let table = RecordBatch::from_nonempty_columns(vec![column]).unwrap();
+        let stats = TableStatistics::from_table(&table);
+        let items = values.iter().cloned().map(lit).collect::<Vec<_>>();
+        let expr = BoundExpr::try_new(resolved_col("a").is_in(items), &table.schema).unwrap();
+        let judged = stats.eval_expression(&expr).unwrap().to_truth_value();
+
+        let joined = values
+            .into_iter()
+            .map(|value| ColumnRangeStatistics::try_from(value).unwrap())
+            .reduce(|span, value| span.union(&value).unwrap())
+            .unwrap();
+        let column = stats
+            .eval_expression(&BoundExpr::try_new(resolved_col("a"), &table.schema).unwrap())
+            .unwrap();
+        (judged, column.equal(&joined).unwrap().to_truth_value())
+    }
+
+    #[test]
+    fn a_long_value_list_is_judged_as_joining_each_values_range_would() {
+        let ints = |values: std::ops::Range<i64>| values.map(Literal::Int64).collect::<Vec<_>>();
+        let strs = |values: std::ops::Range<i64>| {
+            values
+                .map(|v| Literal::Utf8(format!("k{v:04}")))
+                .collect::<Vec<_>>()
+        };
+        let mut with_null = ints(0..99);
+        with_null.push(Literal::Null);
+        let floats = (0..99)
+            .map(|v| Literal::Float64(f64::from(v)))
+            .collect::<Vec<_>>();
+        let mut floats_with_nan = floats.clone();
+        floats_with_nan.push(Literal::Float64(f64::NAN));
+        let int_column = || Int64Array::from_slice("a", &[10, 20]).into_series();
+        let float_column = || Float64Array::from_slice("a", &[10.0, 20.0]).into_series();
+        let str_column = || Utf8Array::from_slice("a", &["k0010", "k0020"]).into_series();
+        let cases = [
+            ("ints straddling", int_column(), ints(0..100)),
+            ("ints above", int_column(), ints(30..200)),
+            ("ints below", int_column(), ints(-200..0)),
+            (
+                "ints within",
+                int_column(),
+                ints(12..18).into_iter().cycle().take(70).collect(),
+            ),
+            ("ints with a null", int_column(), with_null),
+            ("strings straddling", str_column(), strs(0..100)),
+            ("strings above", str_column(), strs(30..200)),
+            ("floats", float_column(), floats),
+            ("floats with NaN", float_column(), floats_with_nan),
+        ];
+        for (name, column, values) in cases {
+            assert!(values.len() > super::MAX_LISTED_EQUALITIES, "{name}");
+            let (judged, joined) = is_in_and_joined_span(column, values);
+            assert_eq!(judged, joined, "{name}");
         }
     }
 

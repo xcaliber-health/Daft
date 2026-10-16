@@ -1,5 +1,6 @@
 pub mod agg;
 pub mod bound_expr;
+mod in_list;
 pub mod window;
 
 mod display;
@@ -35,6 +36,7 @@ use derive_more::Display;
 use itertools::Itertools;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+pub use self::in_list::InList;
 use super::functions::FunctionExpr;
 use crate::{
     expr::bound_expr::BoundExpr,
@@ -276,7 +278,7 @@ pub enum Expr {
     FillNull(ExprRef, ExprRef),
 
     #[display("{}", display::expr_is_in_display_without_formatter(_0, _1)?)]
-    IsIn(ExprRef, Vec<ExprRef>),
+    IsIn(ExprRef, InList),
 
     #[display(
         "{} in [{},{}]",
@@ -1586,7 +1588,7 @@ impl Expr {
     }
 
     pub fn is_in(self: ExprRef, items: Vec<ExprRef>) -> ExprRef {
-        Self::IsIn(self, items).into()
+        Self::IsIn(self, items.into()).into()
     }
 
     pub fn between(self: ExprRef, lower: ExprRef, upper: ExprRef) -> ExprRef {
@@ -2092,7 +2094,7 @@ impl Expr {
                 );
                 let mut children_iter = children.into_iter();
                 let expr = children_iter.next().expect("Should have 1 child");
-                let items = children_iter.collect();
+                let items = old_children.with_items(children_iter.collect());
 
                 Self::IsIn(expr, items)
             }

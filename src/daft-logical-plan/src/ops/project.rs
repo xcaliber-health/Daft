@@ -373,7 +373,7 @@ fn replace_column_with_semantic_id(
                     Transformed::yes(
                         Expr::IsIn(
                             child.data,
-                            transforms.iter().map(|t| t.data.clone()).collect(),
+                            items.with_items(transforms.iter().map(|t| t.data.clone()).collect()),
                         )
                         .into(),
                     )

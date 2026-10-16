@@ -497,7 +497,10 @@ mod tests {
     }
 
     /// The bytes a local get of `range` returns, and the bytes its read recorded.
-    async fn get_and_count(contents: &[u8], range: Option<crate::range::GetRange>) -> (bytes::Bytes, usize) {
+    async fn get_and_count(
+        contents: &[u8],
+        range: Option<crate::range::GetRange>,
+    ) -> (bytes::Bytes, usize) {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(contents).unwrap();
         file.flush().unwrap();
@@ -521,8 +524,16 @@ mod tests {
         let contents: Vec<u8> = (0..=255u8).cycle().take(100_000).collect();
         let cases = [
             ("whole file", None, &contents[..]),
-            ("a range", Some(crate::range::GetRange::Bounded(1_000..5_000)), &contents[1_000..5_000]),
-            ("a suffix", Some(crate::range::GetRange::Suffix(300)), &contents[100_000 - 300..]),
+            (
+                "a range",
+                Some(crate::range::GetRange::Bounded(1_000..5_000)),
+                &contents[1_000..5_000],
+            ),
+            (
+                "a suffix",
+                Some(crate::range::GetRange::Suffix(300)),
+                &contents[100_000 - 300..],
+            ),
         ];
         for (name, range, expected) in cases {
             let (got, recorded) = get_and_count(&contents, range).await;

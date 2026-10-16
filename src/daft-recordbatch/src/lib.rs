@@ -978,24 +978,35 @@ impl RecordBatch {
                     .into_series()
                     .broadcast(self.len());
                 }
-                let mut evaluated_items = Vec::with_capacity(items.len());
-                for item in items {
-                    evaluated_items.push(
-                        self.eval_expression_async_with_metrics(
-                            BoundExpr::new_unchecked(item.clone()),
-                            metrics,
-                        )
-                        .await?,
-                    );
+                // A list of literals is built once per expression; anything
+                // else is evaluated against this batch.
+                if let Some(values) = items.literal_values() {
+                    self.eval_expression_async_with_metrics(
+                        BoundExpr::new_unchecked(child.clone()),
+                        metrics,
+                    )
+                    .await?
+                    .is_in(values)
+                } else {
+                    let mut evaluated_items = Vec::with_capacity(items.len());
+                    for item in items.iter() {
+                        evaluated_items.push(
+                            self.eval_expression_async_with_metrics(
+                                BoundExpr::new_unchecked(item.clone()),
+                                metrics,
+                            )
+                            .await?,
+                        );
+                    }
+                    let items = evaluated_items.iter().collect::<Vec<&Series>>();
+                    let s = Series::concat(items.as_slice())?;
+                    self.eval_expression_async_with_metrics(
+                        BoundExpr::new_unchecked(child.clone()),
+                        metrics,
+                    )
+                    .await?
+                    .is_in(&s)
                 }
-                let items = evaluated_items.iter().collect::<Vec<&Series>>();
-                let s = Series::concat(items.as_slice())?;
-                self.eval_expression_async_with_metrics(
-                    BoundExpr::new_unchecked(child.clone()),
-                    metrics,
-                )
-                .await?
-                .is_in(&s)
             }
             Expr::List(items) => {
                 let field = expr.inner().to_field(&self.schema)?;
@@ -1364,17 +1375,24 @@ impl RecordBatch {
                     .into_series()
                     .broadcast(self.len());
                 }
-                let mut evaluated_items = Vec::with_capacity(items.len());
-                for i in items {
-                    evaluated_items.push(self.eval_expression_internal(
-                        &BoundExpr::new_unchecked(i.clone()),
-                        metrics,
-                    )?);
+                // A list of literals is built once per expression; anything
+                // else is evaluated against this batch.
+                if let Some(values) = items.literal_values() {
+                    self.eval_expression_internal(&BoundExpr::new_unchecked(child.clone()), metrics)?
+                        .is_in(values)
+                } else {
+                    let mut evaluated_items = Vec::with_capacity(items.len());
+                    for i in items.iter() {
+                        evaluated_items.push(self.eval_expression_internal(
+                            &BoundExpr::new_unchecked(i.clone()),
+                            metrics,
+                        )?);
+                    }
+                    let items_refs = evaluated_items.iter().collect::<Vec<&Series>>();
+                    let s = Series::concat(items_refs.as_slice())?;
+                    self.eval_expression_internal(&BoundExpr::new_unchecked(child.clone()), metrics)?
+                        .is_in(&s)
                 }
-                let items_refs = evaluated_items.iter().collect::<Vec<&Series>>();
-                let s = Series::concat(items_refs.as_slice())?;
-                self.eval_expression_internal(&BoundExpr::new_unchecked(child.clone()), metrics)?
-                    .is_in(&s)
             }
             Expr::List(items) => {
                 let field = expr.inner().to_field(&self.schema)?;
@@ -2109,6 +2127,85 @@ mod test {
         assert_eq!(result.len(), 3);
 
         Ok(())
+    }
+
+    /// The column `a` tested against `items` by evaluating the expression, and
+    /// against the concatenation of each item's own series, as a batch did
+    /// before an IN list's values were built once.
+    fn is_in_both_ways(
+        column: Series,
+        items: Vec<daft_dsl::ExprRef>,
+    ) -> (DaftResult<Series>, DaftResult<Series>) {
+        let table = RecordBatch::from_nonempty_columns(vec![column.clone()]).unwrap();
+        let expr =
+            BoundExpr::try_new(resolved_col("a").is_in(items.clone()), &table.schema).unwrap();
+        let evaluated = table.eval_expression(&expr);
+        let per_item = items
+            .iter()
+            .map(|item| table.eval_expression(&BoundExpr::new_unchecked(item.clone())))
+            .collect::<DaftResult<Vec<_>>>()
+            .and_then(|values| Series::concat(&values.iter().collect::<Vec<_>>()))
+            .and_then(|values| column.is_in(&values));
+        (evaluated, per_item)
+    }
+
+    #[test]
+    fn an_in_list_of_literals_gives_what_evaluating_each_item_does() {
+        use daft_dsl::{lit, null_lit};
+
+        let ints = || {
+            Int64Array::from_iter(
+                Field::new("a", DataType::Int64),
+                [Some(1), Some(2), None, Some(4), Some(2)].into_iter(),
+            )
+            .into_series()
+        };
+        let int32s = || Int32Array::from_vec("a", vec![1, 2, 3, 4]).into_series();
+        let strs = || Utf8Array::from_slice("a", &["x", "y", "z"]).into_series();
+        let floats = || Float64Array::from_vec("a", vec![0.0, -0.0, f64::NAN, 1.5]).into_series();
+        let bools = || BooleanArray::from_slice("a", &[true, false]).into_series();
+        let cases: Vec<(&str, Series, Vec<daft_dsl::ExprRef>)> = vec![
+            (
+                "ints",
+                ints(),
+                vec![lit(2i64), lit(4i64), lit(9i64), lit(2i64)],
+            ),
+            ("one int", ints(), vec![lit(4i64)]),
+            ("a null among ints", ints(), vec![lit(1i64), null_lit()]),
+            (
+                "int32 column, int64 values",
+                int32s(),
+                vec![lit(3i64), lit(1i64)],
+            ),
+            ("strings", strs(), vec![lit("z"), lit("q"), lit("x")]),
+            ("floats", floats(), vec![lit(0.0f64), lit(f64::NAN)]),
+            ("bools", bools(), vec![lit(true)]),
+        ];
+        for (name, column, items) in cases {
+            let (evaluated, per_item) = is_in_both_ways(column, items);
+            assert_eq!(
+                &*evaluated.unwrap().to_arrow().unwrap(),
+                &*per_item.unwrap().to_arrow().unwrap(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_in_list_of_values_of_two_types_is_a_type_error() {
+        use daft_dsl::lit;
+
+        let table = RecordBatch::from_nonempty_columns(vec![
+            Int64Array::from_vec("a", vec![1, 2]).into_series(),
+        ])
+        .unwrap();
+        let result = BoundExpr::try_new(
+            resolved_col("a").is_in(vec![lit(1i64), lit("a")]),
+            &table.schema,
+        )
+        .and_then(|expr| table.eval_expression(&expr));
+
+        assert!(matches!(result, Err(common_error::DaftError::TypeError(_))));
     }
 
     #[test]

@@ -74,9 +74,50 @@ async fn drive_group(slot: &GroupSlot, path: &str) -> GroupResult {
     res
 }
 
+/// A local file read through for its footer, recording each byte read.
+struct CountedFile<'a> {
+    file: &'a std::fs::File,
+    io_stats: Option<daft_io::IOStatsRef>,
+}
+
+impl Length for CountedFile<'_> {
+    fn len(&self) -> u64 {
+        self.file.len()
+    }
+}
+
+impl ChunkReader for CountedFile<'_> {
+    type T = std::io::BufReader<daft_io::CountingReader<std::fs::File>>;
+
+    fn get_read(&self, start: u64) -> ParquetResult<Self::T> {
+        use std::io::Seek;
+        let mut file = self.file.try_clone()?;
+        file.seek(std::io::SeekFrom::Start(start))?;
+        Ok(std::io::BufReader::new(daft_io::CountingReader::new(
+            file,
+            self.io_stats.clone(),
+        )))
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> ParquetResult<Bytes> {
+        let bytes = self.file.get_bytes(start, length)?;
+        mark_bytes_read(self.io_stats.as_ref(), bytes.len());
+        Ok(bytes)
+    }
+}
+
+fn mark_bytes_read(io_stats: Option<&daft_io::IOStatsRef>, bytes: usize) {
+    if let Some(io_stats) = io_stats {
+        io_stats.mark_bytes_read(bytes);
+    }
+}
+
+/// Opens a local Parquet file and loads its footer, recording the bytes the
+/// footer took to read in `io_stats`.
 pub(super) async fn open_local_file(
     path: &str,
     page_index: bool,
+    io_stats: Option<daft_io::IOStatsRef>,
 ) -> crate::Result<(Arc<std::fs::File>, u64, ArrowReaderMetadata)> {
     let path_owned = path.to_string();
     let path_for_join = path.to_string();
@@ -98,7 +139,11 @@ pub(super) async fn open_local_file(
             } else {
                 PageIndexPolicy::Skip
             });
-            let meta = ArrowReaderMetadata::load(&file, options).with_context(|_| {
+            let counted = CountedFile {
+                file: &file,
+                io_stats,
+            };
+            let meta = ArrowReaderMetadata::load(&counted, options).with_context(|_| {
                 ParquetMetadataSnafu {
                     path: path_owned.clone(),
                 }
@@ -460,6 +505,7 @@ impl ChunkSourceBuilder {
         match self {
             Self::Local(s) => {
                 let file = s.file.clone();
+                let io_stats = s.io_stats.clone();
                 get_io_runtime(true)
                     .spawn_blocking(move || -> DaftResult<Bytes> {
                         let mut buf = vec![0u8; len];
@@ -484,6 +530,7 @@ impl ChunkSourceBuilder {
                                 filled += n;
                             }
                         }
+                        mark_bytes_read(io_stats.as_ref(), len);
                         Ok(Bytes::from(buf))
                     })
                     .await?
@@ -562,6 +609,7 @@ impl ChunkSourceBuilder {
                 file: Arc::new(file),
                 file_len,
                 metadata: metadata.clone(),
+                io_stats: None,
             }),
             metadata,
         ))
@@ -707,6 +755,8 @@ pub(crate) struct LocalChunkSource {
     pub(super) file: Arc<std::fs::File>,
     pub(super) file_len: u64,
     pub(super) metadata: Arc<ParquetMetaData>,
+    /// Where the bytes read from the file are recorded.
+    pub(super) io_stats: Option<daft_io::IOStatsRef>,
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -762,6 +812,7 @@ impl LocalChunkSource {
                         format!("pread of page range {}..{}: {e}", span.start, span.end),
                     ),
                 })?;
+                mark_bytes_read(self.io_stats.as_ref(), buf.len());
                 Ok(Bytes::from(buf))
             })
             .collect()
@@ -801,7 +852,7 @@ impl LocalChunkSource {
             {
                 use std::os::unix::fs::FileExt;
                 self.file
-                    .read_at(&mut buf, group_start)
+                    .read_exact_at(&mut buf, group_start)
                     .map_err(|e| crate::Error::LocalIO {
                         path: self.path.to_string(),
                         source: std::io::Error::new(
@@ -829,6 +880,7 @@ impl LocalChunkSource {
                         ),
                     })?;
             }
+            mark_bytes_read(self.io_stats.as_ref(), group_len);
             let group_bytes = Bytes::from(buf);
             for LeafRange { leaf, start, len } in members {
                 let local_start = (start - group_start) as usize;

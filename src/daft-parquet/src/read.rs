@@ -152,7 +152,10 @@ fn make_source<'a>(
         *local_path = daft_io::strip_file_uri_to_path(&fixed_uri)
             .unwrap_or(&fixed_uri)
             .to_string();
-        crate::reader::ParquetSource::Local { path: local_path }
+        crate::reader::ParquetSource::Local {
+            path: local_path,
+            io_stats,
+        }
     } else {
         crate::reader::ParquetSource::Url {
             uri,

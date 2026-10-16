@@ -48,6 +48,7 @@ pub fn read_json_local(
         read_options,
         max_chunks_in_flight,
         None,
+        None,
     )?;
     if tables.is_empty() {
         return Ok(RecordBatch::empty(Some(schema_hint)));
@@ -55,6 +56,10 @@ pub fn read_json_local(
     tables_concat(tables)
 }
 
+/// Reads a local, uncompressed JSON file, or a byte range of it, into tables.
+///
+/// The file is memory-mapped, and the bytes of the range mapped are recorded
+/// in `io_stats` as read.
 pub fn read_json_local_into_tables_with_range(
     uri: &str,
     convert_options: Option<JsonConvertOptions>,
@@ -62,6 +67,7 @@ pub fn read_json_local_into_tables_with_range(
     read_options: Option<JsonReadOptions>,
     max_chunks_in_flight: Option<usize>,
     range: Option<daft_io::GetRange>,
+    io_stats: Option<daft_io::IOStatsRef>,
 ) -> DaftResult<Vec<RecordBatch>> {
     let uri = daft_io::strip_file_uri_to_path(uri).unwrap_or(uri);
     let file = std::fs::File::open(uri)?;
@@ -78,6 +84,9 @@ pub fn read_json_local_into_tables_with_range(
     } else {
         full_bytes
     };
+    if let Some(io_stats) = &io_stats {
+        io_stats.mark_bytes_read(bytes.len());
+    }
 
     if parse_options.as_ref().is_some_and(|p| p.skip_empty_files) && bytes.is_empty() {
         return Ok(Vec::new());

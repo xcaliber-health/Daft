@@ -42,6 +42,7 @@ use crate::{
 pub enum ParquetSource<'a> {
     Local {
         path: &'a str,
+        io_stats: Option<daft_io::IOStatsRef>,
     },
     Url {
         uri: &'a str,
@@ -53,7 +54,7 @@ pub enum ParquetSource<'a> {
 impl ParquetSource<'_> {
     fn label(&self) -> &str {
         match self {
-            Self::Local { path } => path,
+            Self::Local { path, .. } => path,
             Self::Url { uri, .. } => uri,
         }
     }
@@ -66,14 +67,16 @@ async fn open_chunk_source(
     opts: &ParquetReadOptions,
 ) -> crate::Result<(ChunkSourceBuilder, ArrowReaderMetadata)> {
     match source {
-        ParquetSource::Local { path } => {
+        ParquetSource::Local { path, io_stats } => {
             let page_index = opts.page_index && opts.predicate.is_some();
-            let (file, file_len, arrow_metadata) = open_local_file(path, page_index).await?;
+            let (file, file_len, arrow_metadata) =
+                open_local_file(path, page_index, io_stats.clone()).await?;
             let cs = LocalChunkSource {
                 path: Arc::from(*path),
                 file,
                 file_len,
                 metadata: arrow_metadata.metadata().clone(),
+                io_stats: io_stats.clone(),
             };
             Ok((ChunkSourceBuilder::Local(cs), arrow_metadata))
         }

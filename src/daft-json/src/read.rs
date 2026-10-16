@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::SeekFrom, num::NonZeroUsize, sync::Arc};
+use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
 
 use common_error::{DaftError, DaftResult};
 use common_runtime::get_io_runtime;
@@ -17,8 +17,7 @@ use snafu::{
     futures::{TryFutureExt, try_future::Context},
 };
 use tokio::{
-    fs::File,
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader},
     task::JoinHandle,
 };
 use tokio_util::io::StreamReader;
@@ -156,6 +155,7 @@ async fn read_json_single_into_tables(
             read_options,
             max_chunks_in_flight,
             None,
+            io_stats,
         );
     }
 
@@ -313,6 +313,7 @@ pub async fn stream_json(
             read_options,
             max_chunks_in_flight,
             range,
+            io_stats,
         )?;
         return Ok(Box::pin(futures::stream::iter(tables.into_iter().map(Ok))));
     }
@@ -448,16 +449,8 @@ async fn read_json_single_into_stream(
                             .or_else(|| opt.chunk_size.map(|cs| (64 * cs).min(256 * 1024 * 1024)))
                     })
                     .unwrap_or(256 * 1024);
-                let mut local_file = File::open(file.path).await?;
-                let reader: Box<dyn AsyncBufRead + Unpin + Send> = match file.range {
-                    Some(range) => {
-                        let length = range.end.saturating_sub(range.start);
-                        local_file.seek(SeekFrom::Start(range.start as u64)).await?;
-                        let limited = local_file.take(length as u64);
-                        Box::new(BufReader::with_capacity(buffer_size, limited))
-                    }
-                    None => Box::new(BufReader::with_capacity(buffer_size, local_file)),
-                };
+                let reader: Box<dyn AsyncBufRead + Unpin + Send> =
+                    Box::new(BufReader::with_capacity(buffer_size, file.open().await?));
                 (
                     reader,
                     buffer_size,

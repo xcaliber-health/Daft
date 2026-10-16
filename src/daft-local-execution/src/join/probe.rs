@@ -18,7 +18,7 @@ use crate::{
         join_operator::{JoinOperator, ProbeOutput},
         stats::JoinStats,
     },
-    pipeline::{InputId, PipelineEvent, PipelineMessage, next_event},
+    pipeline::{InputId, PipelineEvent, PipelineMessage, next_event_gated},
     runtime_stats::{RuntimeStats, RuntimeStatsManagerHandle},
     spill::{RunWriter, SpillContext, SpilledRun},
 };
@@ -58,6 +58,8 @@ struct GraceProbe {
 struct PerProbeInput<Op: JoinOperator> {
     states: Vec<Op::ProbeState>,
     buffer: RowBasedBuffer,
+    /// Whether the build side's result for this input has arrived.
+    build_ready: bool,
     flushed: bool,
     runtime_stats: Arc<JoinStats>,
     max_concurrency: usize,
@@ -73,6 +75,7 @@ impl<Op: JoinOperator + 'static> PerProbeInput<Op> {
         Self {
             states: Vec::new(),
             buffer: RowBasedBuffer::new(lower, upper),
+            build_ready: false,
             flushed: false,
             runtime_stats,
             max_concurrency,
@@ -130,6 +133,22 @@ impl<Op: JoinOperator + 'static> PerProbeInput<Op> {
             }
         }
         Ok(())
+    }
+
+    /// Rows buffered for this input that only a pending task can release:
+    /// the build side's result it waits for, or the partition append that
+    /// holds its writers. Zero once the input can take its rows on.
+    fn rows_awaiting_task(&self) -> usize {
+        let awaiting = !self.build_ready
+            || self
+                .grace
+                .as_ref()
+                .is_some_and(|grace| grace.writers.is_none());
+        if awaiting {
+            self.buffer.total_rows()
+        } else {
+            0
+        }
     }
 
     fn all_states_idle(&self) -> bool {
@@ -403,19 +422,37 @@ impl<Op: JoinOperator + 'static> ProbeExecutionContext<Op> {
     ) -> DaftResult<()> {
         let mut receiver = receiver;
         let max_concurrency = self.op.max_probe_concurrency();
+        // While inputs wait for their build side, the probe holds at most one
+        // morsel per probe worker for them: what the workers take on as soon
+        // as the build lands. Past that it stops reading its input, rather
+        // than buffering the whole probe side. Each held row belongs to an
+        // input with a task pending (the build's result, or a partition
+        // append), so input is refused only while some task will finish and
+        // release rows.
+        let (_, morsel_upper_bound) = self
+            .op
+            .morsel_size_requirement()
+            .unwrap_or_default()
+            .values();
+        let held_rows_limit = morsel_upper_bound.get().saturating_mul(max_concurrency);
         let mut inputs: HashMap<InputId, PerProbeInput<Op>> = HashMap::new();
         let mut tasks: OrderingAwareJoinSet<TaskResult<Op>> =
             OrderingAwareJoinSet::new(self.maintain_order);
         let mut child_closed = false;
 
-        while let Some(event) = next_event(
-            &mut tasks,
-            max_concurrency,
-            &mut receiver,
-            &mut child_closed,
-        )
-        .await?
-        {
+        loop {
+            let held_rows: usize = inputs.values().map(PerProbeInput::rows_awaiting_task).sum();
+            let Some(event) = next_event_gated(
+                &mut tasks,
+                max_concurrency,
+                &mut receiver,
+                &mut child_closed,
+                held_rows < held_rows_limit,
+            )
+            .await?
+            else {
+                break;
+            };
             match event {
                 PipelineEvent::TaskCompleted(TaskOutput::Completed) => {}
                 PipelineEvent::TaskCompleted(TaskOutput::BuildStateReady {
@@ -423,6 +460,7 @@ impl<Op: JoinOperator + 'static> ProbeExecutionContext<Op> {
                     finalized,
                 }) => {
                     let per_input = inputs.get_mut(&input_id).unwrap();
+                    per_input.build_ready = true;
                     match finalized.build {
                         FinalizedBuild::Resident(state) => {
                             per_input.states = (0..max_concurrency)

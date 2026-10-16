@@ -115,11 +115,32 @@ pub(crate) async fn next_event<TaskResult: Send + 'static>(
     receiver: &mut crate::channel::Receiver<PipelineMessage>,
     input_closed: &mut bool,
 ) -> DaftResult<Option<PipelineEvent<TaskResult>>> {
+    next_event_gated(task_set, max_concurrency, receiver, input_closed, true).await
+}
+
+/// [`next_event`] for a caller that can also refuse input for now.
+///
+/// With `accept_input` false nothing is received, however few tasks run, and
+/// only a finished task is yielded. A caller refuses input only while a task
+/// is pending whose completion lets it accept again; refusing with no task
+/// pending would wait forever, so it is an error.
+pub(crate) async fn next_event_gated<TaskResult: Send + 'static>(
+    task_set: &mut common_runtime::OrderingAwareJoinSet<DaftResult<TaskResult>>,
+    max_concurrency: usize,
+    receiver: &mut crate::channel::Receiver<PipelineMessage>,
+    input_closed: &mut bool,
+    accept_input: bool,
+) -> DaftResult<Option<PipelineEvent<TaskResult>>> {
     if *input_closed && task_set.is_empty() {
         return Ok(None);
     }
+    if !accept_input && task_set.is_empty() {
+        return Err(common_error::DaftError::InternalError(
+            "input refused with no task pending to make room for it".to_string(),
+        ));
+    }
     tokio::select! {
-        msg = receiver.recv(), if task_set.len() < max_concurrency && !*input_closed => {
+        msg = receiver.recv(), if accept_input && task_set.len() < max_concurrency && !*input_closed => {
             match msg {
                 Some(PipelineMessage::Morsel { input_id, partition }) => {
                     Ok(Some(PipelineEvent::Morsel { input_id, partition }))
@@ -1854,4 +1875,73 @@ fn physical_plan_to_pipeline(
     };
 
     Ok(pipeline_node)
+}
+
+#[cfg(test)]
+mod tests {
+    use common_runtime::OrderingAwareJoinSet;
+
+    use super::{PipelineEvent, PipelineMessage, next_event_gated};
+    use crate::channel::create_channel;
+
+    type Tasks = OrderingAwareJoinSet<common_error::DaftResult<u8>>;
+
+    #[tokio::test]
+    async fn refused_input_waits_in_the_channel_while_a_task_finishes() {
+        let (tx, mut rx) = create_channel(1);
+        tx.send(PipelineMessage::Flush(7)).await.unwrap();
+        let mut tasks = Tasks::new(false);
+        tasks.spawn(async { Ok(1) });
+        let mut closed = false;
+
+        let event = next_event_gated(&mut tasks, 4, &mut rx, &mut closed, false)
+            .await
+            .unwrap();
+
+        assert!(matches!(event, Some(PipelineEvent::TaskCompleted(1))));
+        assert!(matches!(rx.recv().await, Some(PipelineMessage::Flush(7))));
+    }
+
+    #[tokio::test]
+    async fn refusing_input_with_no_task_pending_is_an_error() {
+        let (_tx, mut rx) = create_channel::<PipelineMessage>(1);
+        let mut tasks = Tasks::new(false);
+        let mut closed = false;
+
+        let result = next_event_gated(&mut tasks, 4, &mut rx, &mut closed, false).await;
+
+        assert!(matches!(
+            result,
+            Err(common_error::DaftError::InternalError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepted_input_is_received_below_the_task_limit() {
+        let (tx, mut rx) = create_channel(1);
+        tx.send(PipelineMessage::Flush(3)).await.unwrap();
+        let mut tasks = Tasks::new(false);
+        let mut closed = false;
+
+        let event = next_event_gated(&mut tasks, 4, &mut rx, &mut closed, true)
+            .await
+            .unwrap();
+
+        assert!(matches!(event, Some(PipelineEvent::Flush(3))));
+    }
+
+    #[tokio::test]
+    async fn a_closed_input_with_no_task_pending_ends_whether_or_not_input_is_accepted() {
+        for accept_input in [true, false] {
+            let (_, mut rx) = create_channel::<PipelineMessage>(1);
+            let mut tasks = Tasks::new(false);
+            let mut closed = true;
+
+            let event = next_event_gated(&mut tasks, 4, &mut rx, &mut closed, accept_input)
+                .await
+                .unwrap();
+
+            assert!(event.is_none());
+        }
+    }
 }

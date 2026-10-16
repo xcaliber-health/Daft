@@ -56,56 +56,121 @@ pub(crate) struct AccountedBuildState<Op: JoinOperator> {
     pub(crate) budget: Option<SpillBudget>,
 }
 
-pub(crate) enum FinalizedBuildStateReceiver<Op: JoinOperator> {
-    Receiver(oneshot::Receiver<AccountedBuildState<Op>>),
-    Ready(AccountedBuildState<Op>),
+/// What a probe input gets when it subscribes to its build state: the state
+/// itself if it was already sent, or a receiver that yields it, or ends
+/// without it if the build side stops first.
+pub(crate) enum Subscription<T> {
+    Receiver(oneshot::Receiver<T>),
+    Ready(T),
 }
 
+pub(crate) type FinalizedBuildStateReceiver<Op> = Subscription<AccountedBuildState<Op>>;
+
+/// Hands each input's finalized build side to the probe side waiting for it.
+///
+/// Once the build side stops, finished or failed, the bridge is closed: a
+/// probe input still waiting, or subscribing later, for a build state that was
+/// never sent sees its receiver end at once instead of waiting for a build
+/// that will not come.
 pub(crate) struct BuildStateBridge<Op: JoinOperator> {
-    channels: Mutex<HashMap<InputId, BuildStateSlot<AccountedBuildState<Op>>>>,
+    slots: Mutex<BridgeSlots<AccountedBuildState<Op>>>,
 }
 
 impl<Op: JoinOperator> BuildStateBridge<Op> {
     pub(crate) fn new() -> Self {
         Self {
-            channels: Mutex::new(HashMap::new()),
+            slots: Mutex::new(BridgeSlots::new()),
         }
     }
 
+    fn slots(&self) -> std::sync::MutexGuard<'_, BridgeSlots<AccountedBuildState<Op>>> {
+        self.slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Hands `input_id`'s finalized build state to its probe input, or
+    /// returns the error finalizing it failed with, so the query reports
+    /// that error instead of the probe input waiting for a state.
     pub(crate) fn send_finalized_build_state(
         &self,
         input_id: InputId,
-        finalized: AccountedBuildState<Op>,
-    ) {
-        let mut channels = self.channels.lock().unwrap();
-        if let Some(slot) = channels.remove(&input_id) {
-            if let BuildStateSlot::Sender(tx) = slot {
-                let _ = tx.send(finalized);
-            }
-        } else {
-            channels.insert(input_id, BuildStateSlot::Ready(finalized));
-        }
+        finalized: DaftResult<AccountedBuildState<Op>>,
+    ) -> DaftResult<()> {
+        self.slots().send(input_id, finalized)
     }
 
     pub(crate) fn subscribe(&self, input_id: InputId) -> FinalizedBuildStateReceiver<Op> {
-        let mut channels = self.channels.lock().unwrap();
-        let (tx, rx) = oneshot::channel();
-        match channels.entry(input_id) {
-            Entry::Vacant(e) => {
-                e.insert(BuildStateSlot::Sender(tx));
-                FinalizedBuildStateReceiver::Receiver(rx)
+        self.slots().subscribe(input_id)
+    }
+
+    /// Marks the build side stopped; see [`BridgeSlots::close`].
+    pub(crate) fn close(&self) {
+        self.slots().close();
+    }
+}
+
+/// The build states of a join's inputs, each sent once by the build side and
+/// taken once by the probe side, in either order.
+struct BridgeSlots<T> {
+    by_input: HashMap<InputId, BuildStateSlot<T>>,
+    closed: bool,
+}
+
+impl<T> BridgeSlots<T> {
+    fn new() -> Self {
+        Self {
+            by_input: HashMap::new(),
+            closed: false,
+        }
+    }
+
+    /// Hands `input_id`'s state to its probe input, waiting or not yet
+    /// subscribed. A failed state is not handed over: its error is returned.
+    fn send(&mut self, input_id: InputId, state: DaftResult<T>) -> DaftResult<()> {
+        let state = state?;
+        match self.by_input.remove(&input_id) {
+            Some(BuildStateSlot::Sender(tx)) => {
+                // A probe input that stopped waiting has no use for it.
+                let _ = tx.send(state);
             }
-            Entry::Occupied(e) => {
-                let slot = e.remove();
-                match slot {
-                    BuildStateSlot::Ready(v) => FinalizedBuildStateReceiver::Ready(v),
-                    BuildStateSlot::Sender(_) => {
-                        channels.insert(input_id, BuildStateSlot::Sender(tx));
-                        FinalizedBuildStateReceiver::Receiver(rx)
-                    }
-                }
+            Some(BuildStateSlot::Ready(_)) | None => {
+                self.by_input.insert(input_id, BuildStateSlot::Ready(state));
             }
         }
+        Ok(())
+    }
+
+    fn subscribe(&mut self, input_id: InputId) -> Subscription<T> {
+        let (tx, rx) = oneshot::channel();
+        match self.by_input.remove(&input_id) {
+            Some(BuildStateSlot::Ready(state)) => Subscription::Ready(state),
+            // A stopped build side sends nothing more: `tx` drops here, so
+            // `rx` ends at once.
+            None if self.closed => Subscription::Receiver(rx),
+            Some(BuildStateSlot::Sender(_)) | None => {
+                self.by_input.insert(input_id, BuildStateSlot::Sender(tx));
+                Subscription::Receiver(rx)
+            }
+        }
+    }
+
+    /// Marks the build side stopped. Every probe input still waiting for a
+    /// state is released, its receiver ending without one; states already
+    /// sent stay available to their probe inputs.
+    fn close(&mut self) {
+        self.closed = true;
+        self.by_input
+            .retain(|_, slot| matches!(slot, BuildStateSlot::Ready(_)));
+    }
+}
+
+/// Closes a build state bridge when dropped, however the build side stops.
+struct CloseOnDrop<'a, Op: JoinOperator>(&'a BuildStateBridge<Op>);
+
+impl<Op: JoinOperator> Drop for CloseOnDrop<'_, Op> {
+    fn drop(&mut self) {
+        self.0.close();
     }
 }
 
@@ -428,17 +493,15 @@ impl<Op: JoinOperator + 'static> BuildExecutionContext<Op> {
         };
         match accum {
             BuildAccum::Resident(state) => {
-                let finalized = self.op.finalize_build(state).ok();
-                self.publish_key_filter(input_id, finalized.as_ref());
-                if let Some(finalized) = finalized {
-                    self.build_state_bridge.send_finalized_build_state(
-                        input_id,
-                        AccountedBuildState {
-                            build: FinalizedBuild::Resident(finalized),
-                            budget: per_input.budget,
-                        },
-                    );
-                }
+                let finalized = self.op.finalize_build(state);
+                self.publish_key_filter(input_id, finalized.as_ref().ok());
+                self.build_state_bridge.send_finalized_build_state(
+                    input_id,
+                    finalized.map(|finalized| AccountedBuildState {
+                        build: FinalizedBuild::Resident(finalized),
+                        budget: per_input.budget,
+                    }),
+                )?;
             }
             BuildAccum::Grace(writers) => {
                 // A build side too large for memory is too large to filter by.
@@ -457,11 +520,11 @@ impl<Op: JoinOperator + 'static> BuildExecutionContext<Op> {
                     }
                     bridge.send_finalized_build_state(
                         input_id,
-                        AccountedBuildState {
+                        Ok(AccountedBuildState {
                             build: FinalizedBuild::Grace(GraceBuild { partitions, spill }),
                             budget,
-                        },
-                    );
+                        }),
+                    )?;
                     Ok(BuildTaskOutput::Finalized)
                 });
             }
@@ -473,9 +536,11 @@ impl<Op: JoinOperator + 'static> BuildExecutionContext<Op> {
         &self,
         receiver: Receiver<PipelineMessage>,
     ) -> DaftResult<()> {
+        // Finished, failed or aborted, the build side sends nothing more:
+        // release any probe input still waiting for its build state.
+        let _closes_bridge = CloseOnDrop(&self.build_state_bridge);
         let result = self.build_inputs(receiver).await;
-        // Finished or failed, the build side publishes nothing more: release
-        // any scan still waiting for its keys.
+        // Likewise any scan still waiting for its keys.
         if let Some(publisher) = &self.key_filter {
             publisher.close();
         }
@@ -604,5 +669,83 @@ impl<Op: JoinOperator + 'static> BuildExecutionContext<Op> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use common_error::DaftError;
+
+    use super::{BridgeSlots, Subscription};
+
+    fn received(subscription: Subscription<u32>) -> tokio::sync::oneshot::Receiver<u32> {
+        match subscription {
+            Subscription::Receiver(rx) => rx,
+            Subscription::Ready(state) => panic!("expected to wait, got {state}"),
+        }
+    }
+
+    #[test]
+    fn a_state_sent_before_its_probe_subscribes_is_ready() {
+        let mut slots = BridgeSlots::new();
+
+        slots.send(1, Ok(10)).unwrap();
+
+        assert!(matches!(slots.subscribe(1), Subscription::Ready(10)));
+    }
+
+    #[tokio::test]
+    async fn a_state_sent_after_its_probe_subscribes_is_received() {
+        let mut slots = BridgeSlots::new();
+        let rx = received(slots.subscribe(1));
+
+        slots.send(1, Ok(10)).unwrap();
+
+        assert_eq!(rx.await.unwrap(), 10);
+    }
+
+    #[tokio::test]
+    async fn closing_releases_a_probe_waiting_for_a_state_never_sent() {
+        let mut slots = BridgeSlots::<u32>::new();
+        let rx = received(slots.subscribe(1));
+
+        slots.close();
+
+        assert!(rx.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_probe_subscribing_after_the_close_is_released_at_once() {
+        let mut slots = BridgeSlots::<u32>::new();
+        slots.close();
+
+        assert!(received(slots.subscribe(1)).await.is_err());
+    }
+
+    #[test]
+    fn a_state_sent_before_the_close_stays_available() {
+        let mut slots = BridgeSlots::new();
+        slots.send(1, Ok(10)).unwrap();
+
+        slots.close();
+
+        assert!(matches!(slots.subscribe(1), Subscription::Ready(10)));
+    }
+
+    #[tokio::test]
+    async fn a_failed_state_returns_its_error_and_hands_nothing_over() {
+        let mut slots = BridgeSlots::<u32>::new();
+        let rx = received(slots.subscribe(1));
+
+        let sent = slots.send(
+            1,
+            Err(DaftError::ComputeError("finalizing failed".to_string())),
+        );
+        slots.close();
+
+        assert!(
+            matches!(sent, Err(DaftError::ComputeError(message)) if message == "finalizing failed")
+        );
+        assert!(rx.await.is_err());
     }
 }

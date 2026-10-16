@@ -14,9 +14,7 @@ use crate::{
     buffer::RowBasedBuffer,
     channel::{Receiver, Sender},
     join::{
-        build::{
-            BuildStateBridge, FinalizedBuild, FinalizedBuildStateReceiver, partition_into_writers,
-        },
+        build::{BuildStateBridge, FinalizedBuild, Subscription, partition_into_writers},
         join_operator::{JoinOperator, ProbeOutput},
         stats::JoinStats,
     },
@@ -586,14 +584,17 @@ impl<Op: JoinOperator + 'static> ProbeExecutionContext<Op> {
                             let bridge = self.build_state_bridge.clone();
                             tasks.spawn(async move {
                                 let finalized = match bridge.subscribe(input_id) {
-                                    FinalizedBuildStateReceiver::Receiver(rx) => {
-                                        rx.await.map_err(|e| {
-                                            common_error::DaftError::ValueError(format!(
-                                                "Failed to receive finalized build state: {e}"
+                                    Subscription::Receiver(rx) => {
+                                        // The build side stopped without a state for this
+                                        // input; when it failed, its own error is the one
+                                        // the query reports.
+                                        rx.await.map_err(|_| {
+                                            common_error::DaftError::InternalError(format!(
+                                                "the join's build side stopped without a result for input {input_id}"
                                             ))
                                         })?
                                     }
-                                    FinalizedBuildStateReceiver::Ready(v) => v,
+                                    Subscription::Ready(v) => v,
                                 };
                                 Ok(TaskOutput::BuildStateReady {
                                     input_id,

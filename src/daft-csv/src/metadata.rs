@@ -10,10 +10,7 @@ use daft_decoding::inference::infer;
 use daft_io::{GetResult, IOClient, IOStatsRef};
 use futures::{StreamExt, TryStreamExt};
 use snafu::ResultExt;
-use tokio::{
-    fs::File,
-    io::{AsyncBufRead, AsyncRead, BufReader},
-};
+use tokio::io::{AsyncBufRead, AsyncRead, BufReader};
 use tokio_util::io::StreamReader;
 
 use crate::{CsvParseOptions, schema::merge_schema};
@@ -119,7 +116,7 @@ pub(crate) async fn read_csv_schema_single(
     {
         GetResult::File(file) => {
             read_csv_schema_from_compressed_reader(
-                BufReader::new(File::open(file.path).await?),
+                BufReader::new(file.open().await?),
                 compression_codec,
                 parse_options,
                 max_bytes,

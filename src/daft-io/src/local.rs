@@ -18,7 +18,7 @@ use super::{
     object_io::{GetResult, ObjectSource},
 };
 use crate::{
-    FileFormat,
+    CountingReader, FileFormat,
     object_io::{self, FileMetadata, LSResult},
     range::GetRange,
     stats::IOStatsRef,
@@ -153,9 +153,56 @@ impl LocalSource {
     }
 }
 
+/// A local file, or a byte range of one, that a read asked for.
+///
+/// Its bytes are read through [`LocalFile::open`] or [`collect_file`], which
+/// record each byte read in the stats of the read that asked for it.
 pub struct LocalFile {
-    pub path: PathBuf,
-    pub range: Option<Range<usize>>,
+    path: PathBuf,
+    range: Option<Range<usize>>,
+    io_stats: Option<IOStatsRef>,
+}
+
+impl LocalFile {
+    /// The file's path on the local filesystem.
+    #[must_use]
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// The same file as a whole, whatever range was asked for.
+    #[must_use]
+    pub fn whole(self) -> Self {
+        Self {
+            range: None,
+            ..self
+        }
+    }
+
+    /// Opens the file positioned at its range's start, reading no further
+    /// than its end, and recording each byte read.
+    ///
+    /// # Errors
+    /// When the file cannot be opened or seeked to the range's start.
+    pub async fn open(self) -> Result<CountingReader<tokio::io::Take<tokio::fs::File>>> {
+        let mut file = tokio::fs::File::open(&self.path)
+            .await
+            .context(UnableToOpenFileSnafu {
+                path: self.path.to_string_lossy(),
+            })?;
+        let length = match &self.range {
+            Some(range) => {
+                file.seek(SeekFrom::Start(range.start as u64))
+                    .await
+                    .context(UnableToSeekSnafu {
+                        path: self.path.to_string_lossy(),
+                    })?;
+                range.end.saturating_sub(range.start) as u64
+            }
+            None => u64::MAX,
+        };
+        Ok(CountingReader::new(file.take(length), self.io_stats))
+    }
 }
 
 #[async_trait]
@@ -171,7 +218,7 @@ impl ObjectSource for LocalSource {
         io_stats: Option<IOStatsRef>,
     ) -> super::Result<GetResult> {
         if let Some(file) = strip_file_uri_to_path(uri) {
-            let size = self.get_size(uri, io_stats).await?;
+            let size = self.get_size(uri, io_stats.clone()).await?;
             let range = range
                 .map(|r| r.as_range(size))
                 .transpose()
@@ -179,6 +226,7 @@ impl ObjectSource for LocalSource {
             Ok(GetResult::File(LocalFile {
                 path: file.into(),
                 range,
+                io_stats,
             }))
         } else {
             Err(Error::InvalidFilePath { path: uri.into() }.into())
@@ -396,41 +444,26 @@ impl ObjectSource for LocalSource {
     }
 }
 
+/// Reads a local file, or its range, into memory, recording the bytes read.
+///
+/// # Errors
+/// When the file cannot be opened, seeked or read.
 pub async fn collect_file(local_file: LocalFile) -> Result<Bytes> {
-    let path = &local_file.path;
-    let mut file = tokio::fs::File::open(path)
+    let path = local_file.path.clone();
+    let mut buf = Vec::with_capacity(
+        local_file
+            .range
+            .as_ref()
+            .map_or(0, |range| range.end.saturating_sub(range.start)),
+    );
+    local_file
+        .open()
+        .await?
+        .read_to_end(&mut buf)
         .await
-        .context(UnableToOpenFileSnafu {
+        .context(UnableToReadBytesSnafu {
             path: path.to_string_lossy(),
         })?;
-
-    let mut buf = vec![];
-
-    match local_file.range {
-        None => {
-            let _ = file
-                .read_to_end(&mut buf)
-                .await
-                .context(UnableToReadBytesSnafu {
-                    path: path.to_string_lossy(),
-                })?;
-        }
-        Some(range) => {
-            let length = range.end - range.start;
-            file.seek(SeekFrom::Start(range.start as u64))
-                .await
-                .context(UnableToSeekSnafu {
-                    path: path.to_string_lossy(),
-                })?;
-            buf.reserve(length);
-            file.take(length as u64)
-                .read_to_end(&mut buf)
-                .await
-                .context(UnableToReadBytesSnafu {
-                    path: path.to_string_lossy(),
-                })?;
-        }
-    }
     Ok(Bytes::from(buf))
 }
 
@@ -461,6 +494,65 @@ mod tests {
         f.write_all(all_bytes).unwrap();
         f.flush().unwrap();
         Ok(bytes)
+    }
+
+    /// The bytes a local get of `range` returns, and the bytes its read recorded.
+    async fn get_and_count(contents: &[u8], range: Option<crate::range::GetRange>) -> (bytes::Bytes, usize) {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(contents).unwrap();
+        file.flush().unwrap();
+        let uri = format!("file://{}", file.path().to_str().unwrap());
+        let io_stats = crate::IOStatsContext::new("local-get");
+        let client = LocalSource::get_client().await.unwrap();
+
+        let got = client
+            .get(&uri, range, Some(io_stats.clone()))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+
+        (got, io_stats.load_bytes_read())
+    }
+
+    #[tokio::test]
+    async fn a_local_get_records_the_bytes_it_read() {
+        let contents: Vec<u8> = (0..=255u8).cycle().take(100_000).collect();
+        let cases = [
+            ("whole file", None, &contents[..]),
+            ("a range", Some(crate::range::GetRange::Bounded(1_000..5_000)), &contents[1_000..5_000]),
+            ("a suffix", Some(crate::range::GetRange::Suffix(300)), &contents[100_000 - 300..]),
+        ];
+        for (name, range, expected) in cases {
+            let (got, recorded) = get_and_count(&contents, range).await;
+
+            assert_eq!(got.as_ref(), expected, "{name}");
+            assert_eq!(recorded, expected.len(), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_local_file_read_whole_ignores_the_range_asked_for() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"0123456789").unwrap();
+        file.flush().unwrap();
+        let uri = format!("file://{}", file.path().to_str().unwrap());
+        let client = LocalSource::get_client().await.unwrap();
+        let crate::object_io::GetResult::File(local) = client
+            .get(&uri, Some(crate::range::GetRange::Bounded(2..4)), None)
+            .await
+            .unwrap()
+        else {
+            unreachable!("a local get returns its file")
+        };
+        let mut read = Vec::new();
+
+        tokio::io::AsyncReadExt::read_to_end(&mut local.whole().open().await.unwrap(), &mut read)
+            .await
+            .unwrap();
+
+        assert_eq!(read, b"0123456789");
     }
 
     #[tokio::test]

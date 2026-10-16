@@ -16,10 +16,7 @@ use daft_io::{GetResult, IOClient, IOStatsRef};
 use daft_recordbatch::RecordBatch;
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use snafu::{Snafu, futures::try_future::TryFutureExt};
-use tokio::{
-    fs::File,
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader},
-};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::io::StreamReader;
 use uuid::Uuid;
 
@@ -530,12 +527,14 @@ pub async fn stream_warc(
 
     let (reader, buffer_size, chunk_size): (Box<dyn AsyncBufRead + Unpin + Send>, usize, usize) =
         match io_client
-            .single_url_get(uri.to_string(), None, Some(io_stats.clone()))
+            // A WARC read reports the bytes it parses, after decompression,
+            // so the stored bytes are not counted on the way in as well.
+            .single_url_get(uri.to_string(), None, None)
             .await?
         {
             GetResult::File(file) => {
                 let buffer_size = 256 * 1024;
-                let file_reader = File::open(file.path).await?;
+                let file_reader = file.open().await?;
                 (
                     Box::new(BufReader::with_capacity(buffer_size, file_reader)),
                     buffer_size,

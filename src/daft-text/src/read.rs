@@ -7,10 +7,7 @@ use daft_core::prelude::*;
 use daft_io::{GetResult, IOClient, IOStatsRef};
 use daft_recordbatch::RecordBatch;
 use futures::{Stream, StreamExt, stream::BoxStream};
-use tokio::{
-    fs::File,
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader},
-};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::io::StreamReader;
 
 use crate::options::{TextConvertOptions, TextReadOptions};
@@ -25,10 +22,9 @@ async fn open_reader(
         .single_url_get(uri.to_string(), None, io_stats)
         .await?
     {
-        GetResult::File(file) => Box::new(BufReader::with_capacity(
-            buffer_size,
-            File::open(file.path).await?,
-        )),
+        GetResult::File(file) => {
+            Box::new(BufReader::with_capacity(buffer_size, file.open().await?))
+        }
         GetResult::Stream(stream, ..) => Box::new(BufReader::with_capacity(
             buffer_size,
             StreamReader::new(stream),

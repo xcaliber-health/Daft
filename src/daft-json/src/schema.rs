@@ -9,10 +9,7 @@ use daft_io::{GetRange, GetResult, IOClient, IOStatsRef};
 use futures::{StreamExt, TryStreamExt};
 use indexmap::IndexMap;
 use snafu::ResultExt;
-use tokio::{
-    fs::File,
-    io::{AsyncBufRead, AsyncBufReadExt, BufReader},
-};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use tokio_util::io::StreamReader;
 
 use crate::{
@@ -118,8 +115,10 @@ pub(crate) async fn read_json_schema_single(
         .single_url_get(uri.to_string(), range, io_stats)
         .await?
     {
+        // A local file's schema is inferred from its start, whatever range
+        // the read covers.
         GetResult::File(file) => (
-            Box::new(BufReader::new(File::open(file.path).await?)),
+            Box::new(BufReader::new(file.whole().open().await?)),
             max_bytes,
         ),
         GetResult::Stream(stream, size, ..) => (

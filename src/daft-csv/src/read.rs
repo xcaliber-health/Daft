@@ -22,7 +22,6 @@ use snafu::{
     futures::{TryFutureExt, try_future::Context},
 };
 use tokio::{
-    fs::File,
     io::{AsyncBufRead, AsyncRead, BufReader},
     task::JoinHandle,
 };
@@ -589,7 +588,7 @@ async fn read_csv_single_into_stream(
         {
             GetResult::File(file) => {
                 (
-                    Box::new(BufReader::new(File::open(file.path).await?)),
+                    Box::new(BufReader::new(file.open().await?)),
                     // Use user-provided buffer size, otherwise falling back to 512 KiB as the default.
                     read_options
                         .as_ref()

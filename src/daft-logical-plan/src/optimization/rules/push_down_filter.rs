@@ -494,7 +494,7 @@ impl PushDownFilter {
 
 /// The output columns of `exprs` that pass an input column through unchanged (a
 /// column, or an alias of one), each mapped to the input column it reads.
-fn passed_through_columns(exprs: &[ExprRef]) -> HashMap<String, ExprRef> {
+pub(crate) fn passed_through_columns(exprs: &[ExprRef]) -> HashMap<String, ExprRef> {
     exprs
         .iter()
         .filter_map(|e| {

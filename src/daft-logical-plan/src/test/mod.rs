@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use daft_scan::{Pushdowns, ScanOperatorRef, test_utils::DummyScanOperator};
+use daft_scan::{PartitionField, Pushdowns, ScanOperatorRef, test_utils::DummyScanOperator};
 use daft_schema::{field::Field, schema::Schema};
 
 use crate::builder::LogicalPlanBuilder;
@@ -23,6 +23,22 @@ pub fn dummy_scan_operator_with_size(
         num_rows_per_task,
         supports_count_pushdown_flag: false,
         stats: None,
+        ..Default::default()
+    }))
+}
+
+/// Create a dummy scan operator whose scan tasks apply pushed filters exactly, partitioned by
+/// the provided keys.
+pub fn dummy_exact_scan_operator(
+    fields: Vec<Field>,
+    partitioning_keys: Vec<PartitionField>,
+) -> ScanOperatorRef {
+    ScanOperatorRef(Arc::new(DummyScanOperator {
+        schema: Arc::new(Schema::new(fields)),
+        num_scan_tasks: 1,
+        applies_filters_exactly_flag: true,
+        partitioning_keys,
+        ..Default::default()
     }))
 }
 
@@ -51,5 +67,6 @@ pub fn dummy_scan_operator_for_aggregation(
         num_rows_per_task: None,
         supports_count_pushdown_flag,
         stats: None,
+        ..Default::default()
     }))
 }

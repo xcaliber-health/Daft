@@ -70,6 +70,10 @@ pub struct DaftPlanningConfig {
     /// max relations limit from 7 to 12.
     /// See https://github.com/Eventual-Inc/Daft/issues/6765 for the path to enabling by default.
     pub enable_dp_ccp_join_ordering: bool,
+    /// Disable deriving a restriction on one side of an equi-join from a restriction on the
+    /// other side's key. Derivation never changes an answer; disabling it only gives up the
+    /// reads it saves.
+    pub disable_join_key_inference: bool,
 }
 
 #[cfg(not(debug_assertions))]
@@ -85,6 +89,8 @@ impl DaftPlanningConfig {
         "DAFT_DEV_ENABLE_STRICT_FILTER_PUSHDOWN";
     const ENV_DAFT_DEV_ENABLE_DP_CCP_JOIN_ORDERING: &'static str =
         "DAFT_DEV_ENABLE_DP_CCP_JOIN_ORDERING";
+    const ENV_DAFT_DEV_DISABLE_JOIN_KEY_INFERENCE: &'static str =
+        "DAFT_DEV_DISABLE_JOIN_KEY_INFERENCE";
 
     #[must_use]
     pub fn from_env() -> Self {
@@ -100,6 +106,10 @@ impl DaftPlanningConfig {
 
         if let Some(val) = parse_bool_from_env(Self::ENV_DAFT_DEV_ENABLE_DP_CCP_JOIN_ORDERING) {
             cfg.enable_dp_ccp_join_ordering = val;
+        }
+
+        if let Some(val) = parse_bool_from_env(Self::ENV_DAFT_DEV_DISABLE_JOIN_KEY_INFERENCE) {
+            cfg.disable_join_key_inference = val;
         }
 
         cfg

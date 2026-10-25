@@ -83,3 +83,12 @@ class ScanOperator(abc.ABC):
     def supports_count_pushdown(self) -> bool:
         """Returns true if this scan can accept count pushdowns."""
         return False
+
+    def applies_filters_exactly(self) -> bool:
+        """Returns true if this scan's tasks apply pushed filters exactly, with the engine's own semantics.
+
+        Every row they output then satisfies the pushed filters and partition filters, and no row that
+        satisfies them is dropped. The optimizer derives restrictions across joins only from and into
+        such scans; returning false, the default, is always safe.
+        """
+        return False

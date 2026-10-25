@@ -48,6 +48,17 @@ pub trait ScanOperator: Send + Sync + Debug {
         false
     }
 
+    /// Whether the scan tasks this operator produces apply the pushed `filters` and
+    /// `partition_filters` exactly, by the engine's own expression semantics: every row they
+    /// output satisfies the pushed predicates, and no row that satisfies them is dropped.
+    ///
+    /// The optimizer derives new restrictions from the predicates of an exact scan, and
+    /// pushes derived restrictions only into exact scans. Returning `false` (the default)
+    /// keeps both out, which is always safe.
+    fn applies_filters_exactly(&self) -> bool {
+        false
+    }
+
     /// Pre-computed statistics for this source, if known cheaply (e.g. from
     /// manifest metadata). The optimizer populates `PlanStats` from this when
     /// available, skipping per-scan-task aggregation. Returning `None` (the

@@ -82,6 +82,15 @@ fn ensure_distinct_output_names(exprs: &[ExprRef], operation: &str) -> DaftResul
     }
 }
 
+/// The optimizer settings a planning config asks for; the defaults when there is none.
+fn optimizer_config(cfg: Option<&DaftPlanningConfig>) -> OptimizerConfig {
+    OptimizerConfig {
+        strict_pushdown: cfg.is_some_and(|conf| conf.enable_strict_filter_pushdown),
+        join_key_inference: !cfg.is_some_and(|conf| conf.disable_join_key_inference),
+        ..Default::default()
+    }
+}
+
 impl LogicalPlanBuilder {
     pub fn new(plan: Arc<LogicalPlan>, config: Option<Arc<DaftPlanningConfig>>) -> Self {
         Self { plan, config }
@@ -1066,17 +1075,7 @@ impl LogicalPlanBuilder {
 
         std::thread::spawn(move || {
             let optimizer = OptimizerBuilder::default()
-                .when(
-                    cfg.as_ref()
-                        .map(|conf| conf.enable_strict_filter_pushdown)
-                        .unwrap_or(false),
-                    |builder| {
-                        builder.with_optimizer_config(OptimizerConfig {
-                            strict_pushdown: true,
-                            ..Default::default()
-                        })
-                    },
-                )
+                .with_optimizer_config(optimizer_config(cfg.as_deref()))
                 .with_default_optimizations()
                 .when(
                     !cfg.as_ref()
@@ -1140,17 +1139,7 @@ impl LogicalPlanBuilder {
         let unoptimized_plan = self.build();
 
         let optimizer = OptimizerBuilder::default()
-            .when(
-                cfg.as_ref()
-                    .map(|conf| conf.enable_strict_filter_pushdown)
-                    .unwrap_or(false),
-                |builder| {
-                    builder.with_optimizer_config(OptimizerConfig {
-                        strict_pushdown: true,
-                        ..Default::default()
-                    })
-                },
-            )
+            .with_optimizer_config(optimizer_config(cfg.as_deref()))
             .with_default_optimizations()
             .enrich_with_stats(Some(execution_config.clone()))
             .when(

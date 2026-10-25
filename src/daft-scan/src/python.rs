@@ -441,6 +441,8 @@ pub mod pylib {
         /// Asked of the operator only when a count could be pushed down, since
         /// answering it may cost the operator a pass over its metadata.
         supports_count_pushdown: pyo3::sync::PyOnceLock<bool>,
+        /// Asked of the operator once, the first time the optimizer needs to know.
+        applies_filters_exactly: pyo3::sync::PyOnceLock<bool>,
         display_name: String,
     }
 
@@ -508,6 +510,11 @@ pub mod pylib {
             abc.call_method0(py, pyo3::intern!(py, "supports_count_pushdown"))?
                 .extract::<bool>(py)
         }
+
+        fn _applies_filters_exactly(abc: &pyo3::Py<pyo3::PyAny>, py: Python) -> PyResult<bool> {
+            abc.call_method0(py, pyo3::intern!(py, "applies_filters_exactly"))?
+                .extract::<bool>(py)
+        }
     }
 
     #[pymethods]
@@ -532,6 +539,7 @@ pub mod pylib {
                 can_absorb_select,
                 display_name,
                 supports_count_pushdown: pyo3::sync::PyOnceLock::new(),
+                applies_filters_exactly: pyo3::sync::PyOnceLock::new(),
             })
         }
     }
@@ -641,6 +649,21 @@ pub mod pylib {
                         // Declining is always safe: the count is then computed by reading.
                         log::warn!(
                             "{}: supports_count_pushdown() failed, reading to count instead: {err}",
+                            self.display_name
+                        );
+                        false
+                    })
+                })
+            })
+        }
+
+        fn applies_filters_exactly(&self) -> bool {
+            Python::attach(|py| {
+                *self.applies_filters_exactly.get_or_init(py, || {
+                    Self::_applies_filters_exactly(&self.operator, py).unwrap_or_else(|err| {
+                        // Declining is always safe: no restriction is derived from or into it.
+                        log::warn!(
+                            "{}: applies_filters_exactly() failed, treating its filters as inexact: {err}",
                             self.display_name
                         );
                         false

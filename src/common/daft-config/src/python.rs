@@ -29,11 +29,12 @@ impl PyDaftPlanningConfig {
         }
     }
 
-    #[pyo3(signature = (default_io_config=None, enable_strict_filter_pushdown=None))]
+    #[pyo3(signature = (default_io_config=None, enable_strict_filter_pushdown=None, disable_join_key_inference=None))]
     fn with_config_values(
         &mut self,
         default_io_config: Option<PyIOConfig>,
         enable_strict_filter_pushdown: Option<bool>,
+        disable_join_key_inference: Option<bool>,
     ) -> PyResult<Self> {
         let mut config = self.config.as_ref().clone();
 
@@ -43,6 +44,10 @@ impl PyDaftPlanningConfig {
 
         if let Some(enable_strict_filter_pushdown) = enable_strict_filter_pushdown {
             config.enable_strict_filter_pushdown = enable_strict_filter_pushdown;
+        }
+
+        if let Some(disable_join_key_inference) = disable_join_key_inference {
+            config.disable_join_key_inference = disable_join_key_inference;
         }
 
         Ok(Self {
@@ -60,6 +65,11 @@ impl PyDaftPlanningConfig {
     #[getter(enable_strict_filter_pushdown)]
     fn enable_strict_filter_pushdown(&self) -> PyResult<bool> {
         Ok(self.config.enable_strict_filter_pushdown)
+    }
+
+    #[getter(disable_join_key_inference)]
+    fn disable_join_key_inference(&self) -> PyResult<bool> {
+        Ok(self.config.disable_join_key_inference)
     }
 }
 

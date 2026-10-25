@@ -72,6 +72,7 @@ mod tests {
             num_rows_per_task: None,
             supports_count_pushdown_flag: false,
             stats,
+            ..Default::default()
         }))
     }
 

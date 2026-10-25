@@ -2847,9 +2847,53 @@ pub fn is_udf(expr: &ExprRef) -> bool {
     )
 }
 
+/// The estimated share of rows a membership test such as `is_in` keeps, whatever its length.
+const IN_LIST_SELECTIVITY: f64 = 0.2;
+
+/// The expression an `or` of equalities compares with literals in every disjunct, if it is one:
+/// `e = l1 OR e = l2 OR …`, either side of each `=`, a literal or a cast of one.
+///
+/// This is how a short `is_in` list is written once simplified, so it is estimated as one.
+fn equalities_of_one_expression(expr: &Expr) -> Option<&ExprRef> {
+    fn is_literal(expr: &Expr) -> bool {
+        match expr {
+            Expr::Literal(lit) => !matches!(lit, Literal::List(_)),
+            Expr::Cast(inner, ..) => is_literal(inner),
+            _ => false,
+        }
+    }
+    match expr {
+        Expr::BinaryOp {
+            op: Operator::Or,
+            left,
+            right,
+        } => {
+            let compared = equalities_of_one_expression(left)?;
+            (equalities_of_one_expression(right)? == compared).then_some(compared)
+        }
+        Expr::BinaryOp {
+            op: Operator::Eq,
+            left,
+            right,
+        } => match (is_literal(left), is_literal(right)) {
+            (false, true) => Some(left),
+            (true, false) => Some(right),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The estimated share of rows `expr` keeps as a filter, from its shape alone.
+///
+/// One predicate gets one estimate however it is written: an `or` of equalities between one
+/// expression and literals is estimated as the `is_in` list it spells.
 #[recursive::recursive]
 pub fn estimated_selectivity(expr: &Expr, schema: &Schema) -> f64 {
     let estimate = match expr {
+        Expr::BinaryOp {
+            op: Operator::Or, ..
+        } if equalities_of_one_expression(expr).is_some() => IN_LIST_SELECTIVITY,
         // Boolean operations that filter rows
         Expr::BinaryOp { op, left, right } => {
             let left_selectivity = estimated_selectivity(left, schema);
@@ -2895,7 +2939,9 @@ pub fn estimated_selectivity(expr: &Expr, schema: &Schema) -> f64 {
         Expr::NotNull(_) => 0.95,
 
         // All membership operations use same selectivity
-        Expr::IsIn(_, _) | Expr::Between(_, _, _) | Expr::InSubquery(_, _) | Expr::Exists(_) => 0.2,
+        Expr::IsIn(_, _) | Expr::Between(_, _, _) | Expr::InSubquery(_, _) | Expr::Exists(_) => {
+            IN_LIST_SELECTIVITY
+        }
 
         // Pass through for expressions that wrap other expressions
         Expr::Cast(expr, _, _) | Expr::Alias(expr, _) => estimated_selectivity(expr, schema),

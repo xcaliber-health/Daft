@@ -159,3 +159,41 @@ def test_a_filter_below_an_aggregate_reaches_the_scan(stored: DataFrame) -> None
     operators = _optimized(stored.groupby("k").agg(col("v").sum()).where(col("k") == 1))
 
     assert "Filter" not in operators, operators
+
+
+def _equal_to_any(column: str, values: list[int]) -> daft.Expression:
+    """``column`` equal to one of ``values``, written as an ``or`` of equalities."""
+    restriction = col(column) == lit(values[0])
+    for value in values[1:]:
+        restriction = restriction | (col(column) == lit(value))
+    return restriction
+
+
+@pytest.mark.parametrize(
+    "restriction",
+    [col("k").is_in(list(range(1, n + 1))) for n in (1, 2, 3, 4, 5, 6, 50)]
+    + [_equal_to_any("k", list(range(1, n + 1))) for n in (4, 6)],
+    ids=[f"is_in of {n}" for n in (1, 2, 3, 4, 5, 6, 50)] + [f"or of {n} equalities" for n in (4, 6)],
+)
+def test_a_list_of_group_keys_runs_below_the_aggregate_at_any_length(
+    stored: DataFrame, restriction: daft.Expression
+) -> None:
+    # Arrange
+    totals = stored.groupby("k").agg(col("v").sum())
+
+    # Act
+    operators = _optimized(totals.where(restriction))
+    after_grouping = totals.collect().where(restriction)
+
+    # Assert
+    assert "Filter" not in operators or operators.index("Filter") > operators.index("Aggregation"), operators
+    assert _sorted(totals.where(restriction), ["k"]) == _sorted(after_grouping, ["k"])
+
+
+def test_an_or_mixing_comparisons_keeps_its_own_estimate(stored: DataFrame) -> None:
+    # Not a list of values: (k > 5) or (k < 2) is estimated to keep more than half the rows.
+    totals = stored.groupby("k").agg(col("v").sum())
+
+    operators = _optimized(totals.where((col("k") > lit(5)) | (col("k") < lit(2))))
+
+    assert operators.index("Filter") < operators.index("Aggregation"), operators

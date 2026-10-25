@@ -18,6 +18,8 @@ pub struct DummyScanOperator {
     pub num_rows_per_task: Option<usize>,
     pub supports_count_pushdown_flag: bool,
     pub stats: Option<Statistics>,
+    pub applies_filters_exactly_flag: bool,
+    pub partitioning_keys: Vec<PartitionField>,
 }
 
 impl ScanOperator for DummyScanOperator {
@@ -30,7 +32,7 @@ impl ScanOperator for DummyScanOperator {
     }
 
     fn partitioning_keys(&self) -> &[PartitionField] {
-        &[]
+        &self.partitioning_keys
     }
 
     fn file_path_column(&self) -> Option<&str> {
@@ -63,6 +65,10 @@ impl ScanOperator for DummyScanOperator {
 
     fn supports_count_pushdown(&self) -> bool {
         self.supports_count_pushdown_flag
+    }
+
+    fn applies_filters_exactly(&self) -> bool {
+        self.applies_filters_exactly_flag
     }
 
     fn to_scan_tasks(&self, pushdowns: Pushdowns) -> DaftResult<Vec<ScanTaskRef>> {

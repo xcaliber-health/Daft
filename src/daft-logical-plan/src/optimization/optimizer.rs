@@ -9,9 +9,9 @@ use super::{
     rules::{
         DetectMonotonicId, DropIntoBatches, DropRepartition, EliminateCrossJoin, EliminateOffsets,
         EliminateSubqueryAliasRule, EnrichWithStats, ExtractWindowFunction, FilterNullJoinKey,
-        LiftProjectFromAgg, MaterializeScans, OptimizerRule, PushDownAggregation,
-        PushDownAntiSemiJoin, PushDownFilter, PushDownJoinPredicate, PushDownLimit,
-        PushDownProjection, PushDownShard, ReorderJoins, RewriteCheckpointSource,
+        InferJoinKeyFilters, LiftProjectFromAgg, MaterializeScans, OptimizerRule,
+        PushDownAggregation, PushDownAntiSemiJoin, PushDownFilter, PushDownJoinPredicate,
+        PushDownLimit, PushDownProjection, PushDownShard, ReorderJoins, RewriteCheckpointSource,
         RewriteCountDistinct, RewriteOffset, ShardScans, SimplifyExpressionsRule,
         SimplifyNullFilteredJoin, SplitExplodeFromProject, SplitGranularProjection, SplitUDFs,
         SplitUDFsFromFilters, UnnestPredicateSubquery, UnnestScalarSubquery,
@@ -25,13 +25,17 @@ pub struct OptimizerConfig {
     // Default maximum number of optimization passes the optimizer will make over a fixed-point RuleBatch.
     pub default_max_optimizer_passes: usize,
     pub strict_pushdown: bool,
+    /// Whether to filter each side of an equi-join by the restrictions the other side's key
+    /// carries ([`InferJoinKeyFilters`]).
+    pub join_key_inference: bool,
 }
 
 impl OptimizerConfig {
-    fn new(max_optimizer_passes: usize, strict_pushdown: bool) -> Self {
+    fn new(max_optimizer_passes: usize, strict_pushdown: bool, join_key_inference: bool) -> Self {
         Self {
             default_max_optimizer_passes: max_optimizer_passes,
             strict_pushdown,
+            join_key_inference,
         }
     }
 }
@@ -39,7 +43,7 @@ impl OptimizerConfig {
 impl Default for OptimizerConfig {
     fn default() -> Self {
         // Default to a max of 20 optimizer passes for a given batch.
-        Self::new(20, false)
+        Self::new(20, false, true)
     }
 }
 
@@ -173,6 +177,21 @@ impl OptimizerBuilder {
                 // TODO(Clark): Refine this fixed-point policy.
                 RuleExecutionStrategy::FixedPoint(None),
             ),
+        ]);
+        // --- Restrictions derived across join keys ---
+        // After the bulk of our rules every filter sits as low as it goes, wherever it was written,
+        // and scans still take filters. A fixed point carries a restriction derived on top of a
+        // join's side through the joins inside that side.
+        if self.config.join_key_inference {
+            self.rule_batches.push(RuleBatch::new(
+                vec![
+                    Box::new(InferJoinKeyFilters::new()),
+                    Box::new(PushDownFilter::new(self.config.strict_pushdown)),
+                ],
+                RuleExecutionStrategy::FixedPoint(None),
+            ));
+        }
+        self.rule_batches.extend(vec![
             // --- Rewrite Offset and Pushdown Limit ---
             // This needs to be separate from PushDownProjection because otherwise the limit and
             // projection just keep swapping places, preventing optimization
@@ -432,7 +451,7 @@ mod tests {
                 vec![Box::new(NoOp::new())],
                 RuleExecutionStrategy::Once,
             )],
-            OptimizerConfig::new(5, false),
+            OptimizerConfig::new(5, false, true),
         );
         let plan: Arc<LogicalPlan> =
             dummy_scan_node(dummy_scan_operator(vec![Field::new("a", DataType::Int64)])).build();
@@ -479,7 +498,7 @@ mod tests {
                 vec![Box::new(RotateProjection::new(false))],
                 RuleExecutionStrategy::FixedPoint(Some(20)),
             )],
-            OptimizerConfig::new(20, false),
+            OptimizerConfig::new(20, false, true),
         );
         let proj_exprs = vec![
             unresolved_col("a").add(lit(1)),
@@ -514,7 +533,7 @@ mod tests {
                 vec![Box::new(RotateProjection::new(true))],
                 RuleExecutionStrategy::FixedPoint(Some(20)),
             )],
-            OptimizerConfig::new(20, false),
+            OptimizerConfig::new(20, false, true),
         );
         let proj_exprs = vec![
             unresolved_col("a").add(lit(1)),
@@ -565,7 +584,7 @@ mod tests {
                     RuleExecutionStrategy::Once,
                 ),
             ],
-            OptimizerConfig::new(20, false),
+            OptimizerConfig::new(20, false, true),
         );
         let proj_exprs = vec![
             unresolved_col("a").add(lit(1)),
@@ -709,7 +728,7 @@ mod tests {
                 ],
                 RuleExecutionStrategy::Once,
             )],
-            OptimizerConfig::new(5, false),
+            OptimizerConfig::new(5, false, true),
         )
     }
 

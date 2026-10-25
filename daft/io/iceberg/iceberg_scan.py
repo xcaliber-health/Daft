@@ -371,6 +371,14 @@ class IcebergScanOperator(ScanOperator):
     def supports_count_pushdown(self) -> bool:
         return not self._has_delete_files()
 
+    def applies_filters_exactly(self) -> bool:
+        """Returns true unless rows carry a file path column.
+
+        Pushed filters are applied by the file reader after column mapping. A file path column is
+        filled in after the read, so the reader can't apply a filter on it.
+        """
+        return self._file_path_column is None
+
     def supported_count_modes(self) -> list[CountMode]:
         return [CountMode.All]
 

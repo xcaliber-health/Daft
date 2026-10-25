@@ -639,6 +639,11 @@ impl ScanOperator for GlobScanOperator {
         false
     }
 
+    fn applies_filters_exactly(&self) -> bool {
+        // The text reader takes no predicate, so it doesn't apply pushed filters.
+        !matches!(self.file_format_config.as_ref(), FileFormatConfig::Text(_))
+    }
+
     fn supports_count_pushdown(&self) -> bool {
         matches!(
             self.file_format_config.as_ref(),

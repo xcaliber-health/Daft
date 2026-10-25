@@ -3,7 +3,6 @@ use std::sync::Arc;
 use common_error::DaftResult;
 use common_treenode::{Transformed, TreeNode};
 use daft_algebra::boolean::combine_conjunction;
-use daft_core::join::JoinType;
 
 use super::OptimizerRule;
 use crate::{
@@ -104,14 +103,7 @@ impl OptimizerRule for FilterNullJoinKey {
             {
                 let (_, left_on, right_on, null_equals_nulls) = on.split_eq_preds();
 
-                let (can_filter_left, can_filter_right) = match join_type {
-                    JoinType::Inner => (true, true),
-                    JoinType::Left => (false, true),
-                    JoinType::Right => (true, false),
-                    JoinType::Outer => (false, false),
-                    JoinType::Anti => (false, true),
-                    JoinType::Semi => (true, true),
-                };
+                let (can_filter_left, can_filter_right) = join_type.unmatched_rows_droppable();
 
                 let left_null_pred = if can_filter_left {
                     combine_conjunction(

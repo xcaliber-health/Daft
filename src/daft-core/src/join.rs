@@ -66,6 +66,23 @@ impl JoinType {
             Self::Inner | Self::Right | Self::Anti | Self::Semi => false,
         }
     }
+
+    /// Whether the rows of each side, `(left, right)`, that match no row of the
+    /// other side can be dropped before the join without changing its output.
+    ///
+    /// A side's unmatched rows can be dropped when the join discards them, as an
+    /// inner join does, or when they only ever serve as matches, as the right side
+    /// of a semi or anti join does. A side whose unmatched rows are output, padded
+    /// with nulls or kept by an anti join, must keep them.
+    #[must_use]
+    pub fn unmatched_rows_droppable(&self) -> (bool, bool) {
+        match self {
+            Self::Inner | Self::Semi => (true, true),
+            Self::Left | Self::Anti => (false, true),
+            Self::Right => (true, false),
+            Self::Outer => (false, false),
+        }
+    }
 }
 
 impl FromStr for JoinType {

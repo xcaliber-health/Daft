@@ -2784,11 +2784,14 @@ class PyDaftPlanningConfig:
         self,
         default_io_config: IOConfig | None = None,
         enable_strict_filter_pushdown: bool | None = None,
+        disable_join_key_inference: bool | None = None,
     ) -> PyDaftPlanningConfig: ...
     @property
     def default_io_config(self) -> IOConfig: ...
     @property
     def enable_strict_filter_pushdown(self) -> bool: ...
+    @property
+    def disable_join_key_inference(self) -> bool: ...
 
 class PyDaftEventLogConfig:
     @staticmethod

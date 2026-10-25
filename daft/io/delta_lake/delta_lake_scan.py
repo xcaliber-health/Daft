@@ -413,6 +413,10 @@ class DeltaLakeScanOperator(ScanOperator):
     def can_absorb_select(self) -> bool:
         return True
 
+    def applies_filters_exactly(self) -> bool:
+        """Returns true: pushed filters are applied by the file reader after column mapping."""
+        return True
+
 
 # Returns True if the Delta Lake library does not return the deletion vectors in the add_actions.
 # These were removed in deltalake>=1.2.0.

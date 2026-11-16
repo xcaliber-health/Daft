@@ -30,9 +30,9 @@ use daft_dsl::{
     lit, resolved_col,
 };
 use daft_local_plan::{
-    Concat, Dedup, Filter, HashAggregate, IntoBatches, LocalPhysicalPlan, LocalPhysicalPlanRef,
-    PartialHashAggregate, PhysicalScan, Project, Sort, SourceId, WindowPartitionAndDynamicFrame,
-    WindowPartitionAndOrderBy, WindowPartitionOnly,
+    Concat, Dedup, Filter, GlobScan, HashAggregate, InMemoryScan, IntoBatches, LocalPhysicalPlan,
+    LocalPhysicalPlanRef, PartialHashAggregate, PhysicalScan, Project, Sort, SourceId,
+    WindowPartitionAndDynamicFrame, WindowPartitionAndOrderBy, WindowPartitionOnly,
 };
 use daft_logical_plan::{JoinType, stats::StatsState};
 use daft_micropartition::MicroPartition;
@@ -426,19 +426,25 @@ impl Drop for KeyFilterPublisher {
 ///
 /// A join filters only when all of these hold:
 /// - it drops the probe rows no build key matches: an inner or semi join;
-/// - its build side is estimated within `cfg.broadcast_join_size_bytes_threshold`
-///   and smaller than its probe side, so waiting for it costs little;
 /// - a key compares by plain equality, is of a type [`filters_by`] accepts, and
-///   reads a column the probe side carries unchanged from a Parquet scan
-///   ([`scans_filtered_by`]) that the build side does not also read.
+///   reads a column the probe side carries unchanged from a Parquet scan or a
+///   partial aggregation ([`scans_filtered_by`]) that no source of the build
+///   side also feeds;
+/// - for a scan, its build side is estimated within
+///   `cfg.broadcast_join_size_bytes_threshold` and smaller than its probe side:
+///   a scan holds back its reads while it waits, so the wait must cost little.
 ///
 /// Every such scan prunes by the keys; it also filters its rows only when that
-/// spares an operator's per-row state ([`ScanTarget::spares_state`]).
+/// spares an operator's per-row state ([`FilterTarget::spares_state`]). A partial
+/// aggregation filters the rows it takes itself, whatever their source, and
+/// waits for any build side: it holds what it aggregates to the end, and the
+/// join probes nothing before its build side is done. The publisher bounds what
+/// it hands either: listed values, hashed keys, or only their range.
 pub(crate) struct PlannedKeyFilter {
     /// Publishes the build side's keys; handed to the join.
     pub publisher: KeyFilterPublisher,
-    /// The filter each probe-side scan takes, by the scan's source.
-    pub scans: Vec<(SourceId, ScanKeyFilter)>,
+    /// The filter each probe-side scan or partial aggregation takes, by where it applies.
+    pub targets: Vec<(FilterSite, ScanKeyFilter)>,
 }
 
 /// The probe-side scans a join's keys filter, if any; see [`PlannedKeyFilter`].
@@ -456,18 +462,15 @@ pub(crate) fn plan_key_filter(
     if !cfg.enable_join_key_filters || !matches!(join_type, JoinType::Inner | JoinType::Semi) {
         return Ok(None);
     }
-    let (StatsState::Materialized(build), StatsState::Materialized(probe)) =
-        (build_child.get_stats_state(), probe_child.get_stats_state())
-    else {
-        return Ok(None);
+    let scans_may_wait = match (build_child.get_stats_state(), probe_child.get_stats_state()) {
+        (StatsState::Materialized(build), StatsState::Materialized(probe)) => {
+            let build_bytes = build.approx_stats.size_bytes;
+            build_bytes <= cfg.broadcast_join_size_bytes_threshold
+                && build_bytes < probe.approx_stats.size_bytes
+        }
+        _ => false,
     };
-    let build_bytes = build.approx_stats.size_bytes;
-    if build_bytes > cfg.broadcast_join_size_bytes_threshold
-        || build_bytes >= probe.approx_stats.size_bytes
-    {
-        return Ok(None);
-    }
-    let build_scans = scans_read_by(build_child)?;
+    let build_sources = sources_read_by(build_child)?;
     let targets = probe_on
         .iter()
         .enumerate()
@@ -481,7 +484,13 @@ pub(crate) fn plan_key_filter(
                 .into_iter()
                 .map(move |target| (key, target))
         })
-        .filter(|(_, target)| !build_scans.contains(&target.source))
+        .filter(|(_, target)| {
+            (scans_may_wait || matches!(target.site, FilterSite::PartialAggregate(_)))
+                && target
+                    .reads
+                    .iter()
+                    .all(|source| !build_sources.contains(source))
+        })
         .collect::<Vec<_>>();
     if targets.is_empty() || build_on.len() != probe_on.len() {
         return Ok(None);
@@ -493,11 +502,11 @@ pub(crate) fn plan_key_filter(
             cfg.join_key_filter_max_values,
             cfg.broadcast_join_size_bytes_threshold,
         ),
-        scans: targets
+        targets: targets
             .into_iter()
             .map(|(key, target)| {
                 (
-                    target.source,
+                    target.site,
                     ScanKeyFilter::new(bridge.clone(), key, target.column, target.spares_state),
                 )
             })
@@ -535,10 +544,31 @@ fn passed_through(
     })
 }
 
-/// A Parquet scan column a join key can restrict.
+/// Where a join key's filter applies on the probe side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum FilterSite {
+    /// A Parquet scan, by its source.
+    Scan(SourceId),
+    /// A partial aggregation, by the address of its plan node, which stays fixed while the
+    /// plan is built into a pipeline.
+    PartialAggregate(usize),
+}
+
+impl FilterSite {
+    /// The site of the partial aggregation `plan`.
+    pub(crate) fn partial_aggregate(plan: &LocalPhysicalPlan) -> Self {
+        Self::PartialAggregate(std::ptr::from_ref(plan) as usize)
+    }
+}
+
+/// A probe-side column, of a Parquet scan or a partial aggregation's input, that a join
+/// key can restrict.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct ScanTarget {
-    pub source: SourceId,
+pub(crate) struct FilterTarget {
+    pub site: FilterSite,
+    /// The sources whose rows reach the site; it waits for the build side, so none may
+    /// also feed that.
+    pub reads: Vec<SourceId>,
     pub column: String,
     /// Whether the key reaches the join through a grouping, window or
     /// distinct: an operator holding state for each row it takes, which rows
@@ -547,21 +577,23 @@ pub(crate) struct ScanTarget {
     pub spares_state: bool,
 }
 
-/// The Parquet scan columns whose values reach `plan`'s output column
-/// `column` unchanged, through operators below which keeping only some values
-/// of that column keeps the same rows above.
+/// The Parquet scan columns, and partial aggregation inputs, whose values reach
+/// `plan`'s output column `column` unchanged, through operators below which
+/// keeping only some values of that column keeps the same rows above.
 ///
 /// It passes through renaming projections, filters, sorts, batching, a
 /// concatenation's inputs, a distinct on that column, a grouping by it, and a
 /// window partitioned by it: the operators DuckDB's and DataFusion's join
 /// filters also pass. It stops at a limit, a sample, a join, a computed
-/// column, and a scan that limits or aggregates what it reads.
-pub(crate) fn scans_filtered_by(plan: &LocalPhysicalPlan, column: usize) -> Vec<ScanTarget> {
+/// column, and a scan that limits or aggregates what it reads. A partial
+/// aggregation grouping by the column is a target itself: it drops the rows it
+/// takes before aggregating them, so the scans below it only prune.
+pub(crate) fn scans_filtered_by(plan: &LocalPhysicalPlan, column: usize) -> Vec<FilterTarget> {
     scans_reached(plan, column, false)
 }
 
 #[recursive::recursive]
-fn scans_reached(plan: &LocalPhysicalPlan, column: usize, spares_state: bool) -> Vec<ScanTarget> {
+fn scans_reached(plan: &LocalPhysicalPlan, column: usize, spares_state: bool) -> Vec<FilterTarget> {
     match plan {
         LocalPhysicalPlan::PhysicalScan(PhysicalScan {
             source_id,
@@ -579,8 +611,9 @@ fn scans_reached(plan: &LocalPhysicalPlan, column: usize, spares_state: bool) ->
                         && pushdowns.limit.is_none()
                         && pushdowns.aggregation.is_none() =>
                 {
-                    vec![ScanTarget {
-                        source: *source_id,
+                    vec![FilterTarget {
+                        site: FilterSite::Scan(*source_id),
+                        reads: vec![*source_id],
                         column: field.name.to_string(),
                         spares_state,
                     }]
@@ -610,10 +643,25 @@ fn scans_reached(plan: &LocalPhysicalPlan, column: usize, spares_state: bool) ->
                 .map(|column| scans_reached(input, column, true))
                 .unwrap_or_default()
         }
-        LocalPhysicalPlan::HashAggregate(HashAggregate {
+        LocalPhysicalPlan::PartialHashAggregate(PartialHashAggregate {
             input, group_by, ..
-        })
-        | LocalPhysicalPlan::PartialHashAggregate(PartialHashAggregate {
+        }) => {
+            let Some(input_column) = passed_through(plan, input, group_by, column) else {
+                return Vec::new();
+            };
+            let Ok(reads) = sources_read_by(input) else {
+                return Vec::new();
+            };
+            let mut targets = scans_reached(input, input_column, false);
+            targets.push(FilterTarget {
+                site: FilterSite::partial_aggregate(plan),
+                reads: reads.into_iter().collect(),
+                column: input.schema().fields()[input_column].name.to_string(),
+                spares_state: true,
+            });
+            targets
+        }
+        LocalPhysicalPlan::HashAggregate(HashAggregate {
             input, group_by, ..
         }) => passed_through(plan, input, group_by, column)
             .map(|column| scans_reached(input, column, true))
@@ -639,12 +687,17 @@ fn scans_reached(plan: &LocalPhysicalPlan, column: usize, spares_state: bool) ->
     }
 }
 
-/// Every scan `plan` reads, by source.
-fn scans_read_by(plan: &LocalPhysicalPlanRef) -> DaftResult<HashSet<SourceId>> {
+/// Every source `plan` reads: its scans, in-memory inputs and globs.
+fn sources_read_by(plan: &LocalPhysicalPlanRef) -> DaftResult<HashSet<SourceId>> {
     let mut sources = HashSet::new();
     plan.apply(|node| {
-        if let LocalPhysicalPlan::PhysicalScan(scan) = node.as_ref() {
-            sources.insert(scan.source_id);
+        match node.as_ref() {
+            LocalPhysicalPlan::PhysicalScan(PhysicalScan { source_id, .. })
+            | LocalPhysicalPlan::InMemoryScan(InMemoryScan { source_id, .. })
+            | LocalPhysicalPlan::GlobScan(GlobScan { source_id, .. }) => {
+                sources.insert(*source_id);
+            }
+            _ => {}
         }
         Ok(TreeNodeRecursion::Continue)
     })?;
@@ -682,7 +735,7 @@ impl ScanKeyFilter {
     }
 
     /// Whether this filter drops the rows read, besides pruning; see
-    /// [`ScanTarget::spares_state`].
+    /// [`FilterTarget::spares_state`].
     pub(crate) fn filters_rows(&self) -> bool {
         self.filters_rows
     }

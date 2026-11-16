@@ -10,10 +10,17 @@
 //!   Held partials past a byte budget are merged and sent on early.
 //! - **Passing through:** when the probe shows aggregating barely reduces rows, each row
 //!   is sent on as its own partial state, at the cost of one projection.
+//!
+//! Below a join that drops the rows its build side does not match, it takes that join's
+//! key filter and drops those rows before aggregating them or passing them on, whatever
+//! their source, as a scan would: rows the join discards cost it no work.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicU8, AtomicUsize, Ordering},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU8, AtomicUsize, Ordering},
+    },
 };
 
 use common_daft_config::DaftExecutionConfig;
@@ -35,6 +42,7 @@ use super::base::{
 };
 use crate::{
     ExecutionTaskSpawner,
+    join::key_filter::{KeyRestriction, RowKeyFilter, ScanKeyFilter},
     pipeline::{InputId, NodeName},
 };
 
@@ -104,16 +112,88 @@ impl PartialAggregateParams {
     }
 }
 
-/// One worker's partials, held until the end or until they pass the byte budget.
-#[derive(Default)]
+/// One worker's partials for one input, held until the end or until they pass the byte
+/// budget.
 pub(crate) struct PartialAggregateState {
+    input_id: InputId,
     held: Vec<MicroPartition>,
     held_bytes: usize,
+}
+
+impl PartialAggregateState {
+    fn new(input_id: InputId) -> Self {
+        Self {
+            input_id,
+            held: Vec::new(),
+            held_bytes: 0,
+        }
+    }
+}
+
+/// What a join's key filters keep of one input.
+#[derive(Clone)]
+enum InputRestriction {
+    /// Every row: no join published a filter.
+    Everything,
+    /// No row: a join's build side holds no key.
+    Nothing,
+    /// The rows passing this filter.
+    Rows(Arc<RowKeyFilter>),
+}
+
+/// The key filters of the joins above, taken once per input for all workers.
+#[derive(Default)]
+struct InputKeyFilters {
+    filters: Vec<ScanKeyFilter>,
+    by_input: Mutex<HashMap<InputId, Arc<tokio::sync::OnceCell<InputRestriction>>>>,
+}
+
+impl InputKeyFilters {
+    /// What the filters keep of `input_id`; the first worker to ask waits for each join's
+    /// build side, and every other waits for it.
+    async fn restriction(&self, input_id: InputId) -> InputRestriction {
+        if self.filters.is_empty() {
+            return InputRestriction::Everything;
+        }
+        let cell = self
+            .by_input
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(input_id)
+            .or_default()
+            .clone();
+        cell.get_or_init(|| async {
+            let mut tests = Vec::with_capacity(self.filters.len());
+            for filter in &self.filters {
+                match filter.restriction(input_id).await {
+                    Some(KeyRestriction::Nothing) => return InputRestriction::Nothing,
+                    Some(KeyRestriction::Within { rows, .. }) => tests.push(rows),
+                    None => {}
+                }
+            }
+            if tests.is_empty() {
+                InputRestriction::Everything
+            } else {
+                InputRestriction::Rows(Arc::new(RowKeyFilter::new(tests)))
+            }
+        })
+        .await
+        .clone()
+    }
+
+    /// Drops what was kept for `input_id`, once it has ended.
+    fn forget(&self, input_id: InputId) {
+        self.by_input
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&input_id);
+    }
 }
 
 /// The operator; see the module documentation.
 pub struct PartialAggregateSink {
     params: Arc<PartialAggregateParams>,
+    key_filters: Arc<InputKeyFilters>,
 }
 
 impl PartialAggregateSink {
@@ -182,7 +262,17 @@ impl PartialAggregateSink {
                 probed_rows: AtomicUsize::new(0),
                 probed_groups: AtomicUsize::new(0),
             }),
+            key_filters: Arc::new(InputKeyFilters::default()),
         })
+    }
+
+    /// Drops, before aggregating, the rows these join key filters rule out.
+    pub(crate) fn with_key_filters(mut self, filters: Vec<ScanKeyFilter>) -> Self {
+        self.key_filters = Arc::new(InputKeyFilters {
+            filters,
+            by_input: Mutex::new(HashMap::new()),
+        });
+        self
     }
 }
 
@@ -224,9 +314,20 @@ impl StreamingSink for PartialAggregateSink {
         spawner: &ExecutionTaskSpawner,
     ) -> StreamingSinkExecuteResult<Self> {
         let params = self.params.clone();
+        let key_filters = self.key_filters.clone();
         spawner
             .spawn(
                 async move {
+                    let input = match key_filters.restriction(state.input_id).await {
+                        InputRestriction::Everything => input,
+                        InputRestriction::Nothing => {
+                            return Ok((state, StreamingSinkOutput::NeedMoreInput(None)));
+                        }
+                        InputRestriction::Rows(rows) => rows.apply(input)?,
+                    };
+                    if input.is_empty() {
+                        return Ok((state, StreamingSinkOutput::NeedMoreInput(None)));
+                    }
                     let output = partially_aggregate(&input, &mut state, &params)?;
                     Ok((state, StreamingSinkOutput::NeedMoreInput(output)))
                 },
@@ -243,6 +344,9 @@ impl StreamingSink for PartialAggregateSink {
     ) -> StreamingSinkFinalizeResult<Self> {
         let params = self.params.clone();
         let num_partitions = self.max_concurrency();
+        if let Some(state) = states.first() {
+            self.key_filters.forget(state.input_id);
+        }
         spawner
             .spawn(
                 async move {
@@ -315,8 +419,8 @@ impl StreamingSink for PartialAggregateSink {
         ]
     }
 
-    fn make_state(&self, _input_id: InputId) -> DaftResult<Self::State> {
-        Ok(PartialAggregateState::default())
+    fn make_state(&self, input_id: InputId) -> DaftResult<Self::State> {
+        Ok(PartialAggregateState::new(input_id))
     }
 
     fn batching_strategy(&self) -> Self::BatchingStrategy {
@@ -507,7 +611,7 @@ mod tests {
         )
         .unwrap();
         let params = &sink.params;
-        let mut state = PartialAggregateState::default();
+        let mut state = PartialAggregateState::new(0);
         let mut partials = morsels
             .iter()
             .filter_map(|input| partially_aggregate(input, &mut state, params).unwrap())
@@ -549,7 +653,7 @@ mod tests {
             &config(4, 0.4, usize::MAX),
         )
         .unwrap();
-        let mut state = PartialAggregateState::default();
+        let mut state = PartialAggregateState::new(0);
 
         let sent = morsels
             .iter()

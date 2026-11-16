@@ -33,7 +33,7 @@ use indexmap::{IndexMap, IndexSet};
 use super::OptimizerRule;
 use crate::{
     LogicalPlan,
-    ops::{Aggregate, Join, PartialAggregate, Project},
+    ops::{Aggregate, Distinct, Filter, Join, Limit, PartialAggregate, Project, Sort},
 };
 
 /// Pushes a [`PartialAggregate`] below an equi-join whose aggregations read one side;
@@ -146,6 +146,39 @@ fn join_below(
     }
 }
 
+/// Whether `plan` provably holds at most one row for each value of `columns`: it is an
+/// aggregation or a distinct keyed within them, seen through filters, sorts, limits and
+/// renaming projections.
+fn unique_by(plan: &LogicalPlan, columns: &IndexSet<String>) -> bool {
+    let within = |keys: &[ExprRef]| keys.iter().all(|key| columns.contains(key.name()));
+    match plan {
+        LogicalPlan::Aggregate(Aggregate { groupby, .. }) => within(groupby),
+        LogicalPlan::Distinct(Distinct {
+            columns: Some(keys),
+            ..
+        }) => within(keys),
+        LogicalPlan::Distinct(Distinct { columns: None, .. }) => plan
+            .schema()
+            .field_names()
+            .all(|name| columns.contains(name)),
+        LogicalPlan::Filter(Filter { input, .. })
+        | LogicalPlan::Sort(Sort { input, .. })
+        | LogicalPlan::Limit(Limit { input, .. }) => unique_by(input, columns),
+        // Unique on the columns it passes through is unique on all of `columns`.
+        LogicalPlan::Project(Project {
+            input, projection, ..
+        }) => {
+            let below = projection
+                .iter()
+                .filter(|expr| columns.contains(expr.name()))
+                .filter_map(|expr| expr.input_mapping())
+                .collect();
+            unique_by(input, &below)
+        }
+        _ => false,
+    }
+}
+
 /// A partial-aggregation column name used by neither join input nor the aggregate.
 fn fresh_name(taken: &IndexSet<String>, index: usize) -> String {
     let mut name = format!("__daft_pagg_{index}");
@@ -227,11 +260,35 @@ fn push_below_join(aggregate: &Aggregate) -> DaftResult<Option<Arc<LogicalPlan>>
         (JoinType::Inner | JoinType::Right, _, true) => Side::Right,
         _ => return Ok(None),
     };
-    let (side_plan, side_names, side_schema, side_keys) = match side {
-        Side::Left => (&join.left, &left_names, &left_schema, &left_keys),
-        Side::Right => (&join.right, &right_names, &right_schema, &right_keys),
+    let (side_plan, side_names, side_schema, side_keys, other_plan, other_keys) = match side {
+        Side::Left => (
+            &join.left,
+            &left_names,
+            &left_schema,
+            &left_keys,
+            &join.right,
+            &right_keys,
+        ),
+        Side::Right => (
+            &join.right,
+            &right_names,
+            &right_schema,
+            &right_keys,
+            &join.left,
+            &left_keys,
+        ),
     };
     if matches!(side_plan.as_ref(), LogicalPlan::PartialAggregate(_)) {
+        return Ok(None);
+    }
+    // When the other side holds at most one row per key, the join repeats no row of this
+    // side: aggregating it first saves no repeated work, only moves the aggregation below
+    // a join that may drop its rows.
+    let other_key_columns: IndexSet<String> = other_keys
+        .iter()
+        .filter_map(|key| key.input_mapping())
+        .collect();
+    if unique_by(other_plan, &other_key_columns) {
         return Ok(None);
     }
 
@@ -266,6 +323,9 @@ fn push_below_join(aggregate: &Aggregate) -> DaftResult<Option<Arc<LogicalPlan>>
                 .filter(|c| side_names.contains(c)),
         )
         .collect();
+    if unique_by(side_plan, &partial_groupby) {
+        return Ok(None);
+    }
 
     // The partial aggregations, each once.
     let mut partials: IndexMap<AggExpr, usize> = IndexMap::new();
@@ -398,7 +458,7 @@ mod tests {
     use common_error::DaftResult;
     use common_treenode::{TreeNode, TreeNodeRecursion};
     use daft_core::{join::JoinType, prelude::*};
-    use daft_dsl::{ExprRef, left_col, right_col, unresolved_col};
+    use daft_dsl::{ExprRef, left_col, lit, right_col, unresolved_col};
     use rstest::rstest;
 
     use super::PushPartialAggregateThroughJoin;
@@ -635,6 +695,60 @@ mod tests {
             partials(&optimized)[0].0,
             vec!["col(right.owner)".to_string(), "col(peer)".to_string()]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_side_already_aggregated_by_the_join_key_is_not_aggregated_again() -> DaftResult<()> {
+        let per_owner = peers().aggregate(
+            vec![unresolved_col("peer").sum().alias("peer")],
+            vec![unresolved_col("owner")],
+        )?;
+        let plan = aggregate(
+            link().join(
+                per_owner,
+                None,
+                vec!["owner".to_string()],
+                JoinType::Inner,
+                None,
+                Default::default(),
+            )?,
+            vec![unresolved_col("peer").sum().alias("s")],
+            vec![unresolved_col("subject")],
+        )?;
+
+        assert!(partials(&optimized(plan)?).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_join_whose_other_side_is_unique_by_its_key_is_not_pushed_through() -> DaftResult<()> {
+        // Each link row meets at most one row of a side aggregated by owner, seen through a
+        // filter and a renaming projection.
+        let per_owner = link()
+            .aggregate(
+                vec![unresolved_col("weight").sum().alias("total")],
+                vec![unresolved_col("owner")],
+            )?
+            .filter(unresolved_col("total").gt(lit(0)))?
+            .select(vec![
+                unresolved_col("owner").alias("o"),
+                unresolved_col("total"),
+            ])?;
+        let plan = aggregate(
+            peers().join(
+                per_owner,
+                Some(unresolved_col("owner").eq(unresolved_col("o"))),
+                vec![],
+                JoinType::Inner,
+                None,
+                Default::default(),
+            )?,
+            vec![unresolved_col("peer").sum().alias("s")],
+            vec![unresolved_col("total")],
+        )?;
+
+        assert!(partials(&optimized(plan)?).is_empty());
         Ok(())
     }
 

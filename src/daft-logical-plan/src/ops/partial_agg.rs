@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     LogicalPlan,
     logical_plan::{self},
-    stats::{PlanStats, StatsState},
+    stats::{ApproxStats, PlanStats, StatsState},
 };
 
 /// Grouped aggregations whose rows a later aggregation combines into the whole result.
@@ -88,13 +88,22 @@ impl PartialAggregate {
         self
     }
 
-    /// Takes its input's statistics: how far a partial aggregation reduces rows is only
-    /// known as it runs, and keeping the input's figures leaves every decision made from
-    /// them above (a join's build side, a broadcast) as it was without it.
+    /// Takes its input's estimate, less one row.
+    ///
+    /// How far it reduces rows is only known as it runs: it may pass every row on. Keeping
+    /// its input's estimate leaves every decision made from it (a join's build side, a key
+    /// filter, a broadcast) as it was without it. It never answers more rows than it takes,
+    /// so the one row fewer only breaks an exact tie, toward it: in a self-join, the side
+    /// it aggregates is the one more likely smaller.
     pub(crate) fn with_materialized_stats(mut self) -> Self {
-        let input_stats = self.input.materialized_stats();
-        self.stats_state =
-            StatsState::Materialized(PlanStats::new(input_stats.approx_stats.clone()).into());
+        let input = &self.input.materialized_stats().approx_stats;
+        let bytes_per_row = input.size_bytes / input.num_rows.max(1);
+        let approx_stats = ApproxStats {
+            num_rows: input.num_rows.saturating_sub(1),
+            size_bytes: input.size_bytes.saturating_sub(bytes_per_row),
+            acc_selectivity: input.acc_selectivity,
+        };
+        self.stats_state = StatsState::Materialized(PlanStats::new(approx_stats).into());
         self
     }
 

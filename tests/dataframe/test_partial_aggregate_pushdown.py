@@ -317,3 +317,89 @@ def test_many_rows_answer_as_without_pushdown(mode: str) -> None:
         )
 
     assert answer(build, ["subject"], pushdown=True) == answer(build, ["subject"], pushdown=False)
+
+
+def rows_out_of_partial_aggregate(df: DataFrame) -> int:
+    metrics = df.metrics.to_pydict()
+    return sum(
+        int({k: v["value"] for k, v in stats}["rows.out"])
+        for name, stats in zip(metrics["name"], metrics["stats"])
+        if name == "PartialGroupedAggregate"
+    )
+
+
+@pytest.mark.parametrize("source", ["memory", "parquet"])
+def test_rows_a_filtering_join_drops_are_dropped_before_they_are_aggregated(tmp_path, source: str) -> None:
+    n = 20_000
+    fact = {"k": list(range(n)), "v": [i % 7 for i in range(n)]}
+    dim = {"k": list(range(0, n, 100)), "g": [i % 3 for i in range(0, n, 100)]}
+
+    def read(name: str, data: dict[str, list[object]]) -> DataFrame:
+        if source == "memory":
+            return daft.from_pydict(data)
+        daft.from_pydict(data).write_parquet(str(tmp_path / name))
+        return daft.read_parquet(str(tmp_path / name))
+
+    facts, dims = read("fact", fact), read("dim", dim)
+
+    def build() -> DataFrame:
+        return facts.join(dims, on="k").groupby("g").agg(col("v").sum().alias("s"), col("v").count().alias("n"))
+
+    with planning_config_ctx(disable_partial_aggregate_pushdown=False):
+        df = build().collect()
+
+    assert "PartialAggregation" in plan(build)
+    assert in_order(df.to_pydict(), ["g"]) == answer(build, ["g"], pushdown=False)
+    # Grouped by the unique key, it answers one row per key it kept: only the join's.
+    assert rows_out_of_partial_aggregate(df) == len(dim["k"])
+
+
+def test_a_join_whose_build_side_holds_no_key_aggregates_no_row(mode: str) -> None:
+    fact = {"k": list(range(5_000)), "v": list(range(5_000))}
+
+    def build() -> DataFrame:
+        dims = daft.from_pydict({"k": [1, 2], "g": [1, 2]}).where(col("g") > 5)
+        return daft.from_pydict(fact).join(dims, on="k").groupby("g").agg(col("v").sum().alias("s"))
+
+    assert answer(build, ["g"], pushdown=True) == {"g": [], "s": []}
+
+
+def test_a_build_side_estimated_large_still_filters_the_partial_aggregation() -> None:
+    # The build side joins an aggregation kept by a condition few groups meet, so it is
+    # estimated far larger than it is, as TPC-H Q18's orders, totals and customers are.
+    n = 20_000
+    fact = {"k": [i % n for i in range(5 * n)], "v": [i % 7 for i in range(5 * n)]}
+    totals = {"k": [i % n for i in range(4 * n)], "q": [1 if i % n % 1000 else 100 for i in range(4 * n)]}
+    labels = {"k": list(range(n)), "label": [i % 3 for i in range(n)]}
+
+    def build() -> DataFrame:
+        kept = (
+            daft.from_pydict(totals)
+            .groupby("k")
+            .agg(col("q").sum().alias("total"))
+            .where(col("total") > 300)
+            .join(daft.from_pydict(labels), on="k")
+        )
+        return daft.from_pydict(fact).join(kept, on="k").groupby("total").agg(col("v").sum().alias("s"))
+
+    # The build side is estimated past the size a scan waits for, as Q18's is, while its 20
+    # keys still fit the budget for hashing them.
+    with (
+        planning_config_ctx(disable_partial_aggregate_pushdown=False),
+        execution_config_ctx(broadcast_join_size_bytes_threshold=1024),
+    ):
+        df = build().collect()
+
+    assert "PartialAggregation" in plan(build)
+    assert in_order(df.to_pydict(), ["total"]) == answer(build, ["total"], pushdown=False)
+    assert rows_out_of_partial_aggregate(df) == n // 1000
+
+
+def test_a_self_join_of_one_source_answers_as_without_pushdown(mode: str) -> None:
+    link = daft.from_pydict(LINK)
+
+    def build() -> DataFrame:
+        peers = link.select(col("owner"), col("subject").alias("peer"))
+        return link.join(peers, on="owner").groupby("subject").agg(col("peer").count().alias("n"))
+
+    assert answer(build, ["subject"], pushdown=True) == answer(build, ["subject"], pushdown=False)

@@ -48,7 +48,7 @@ use crate::{
     },
     join::{
         AsofJoinOperator, CrossJoinOperator, HashJoinOperator, JoinNode, SortMergeJoinOperator,
-        key_filter::{ScanKeyFilter, plan_key_filter},
+        key_filter::{FilterSite, ScanKeyFilter, plan_key_filter},
     },
     sinks::{
         aggregate::AggregateSink,
@@ -299,9 +299,10 @@ pub struct BuilderContext {
         )>,
     >,
     pub skipped_corrupt_files: std::sync::Arc<std::sync::Mutex<Vec<(String, String, bool)>>>,
-    /// Join-key filters planned by a hash join for the scans on its probe
-    /// side, held by scan source until that scan becomes a pipeline node.
-    scan_key_filters: std::cell::RefCell<HashMap<SourceId, Vec<ScanKeyFilter>>>,
+    /// Join-key filters planned by a hash join for the scans and partial
+    /// aggregations on its probe side, held by site until that site becomes a
+    /// pipeline node.
+    key_filters: std::cell::RefCell<HashMap<FilterSite, Vec<ScanKeyFilter>>>,
 }
 
 impl BuilderContext {
@@ -323,24 +324,24 @@ impl BuilderContext {
             shuffle_server,
             checkpoint: std::cell::RefCell::new(None),
             skipped_corrupt_files: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            scan_key_filters: std::cell::RefCell::new(HashMap::new()),
+            key_filters: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
-    /// Holds `filter` for the scan of `source` until that scan is built.
-    fn add_scan_key_filter(&self, source: SourceId, filter: ScanKeyFilter) {
-        self.scan_key_filters
+    /// Holds `filter` for `site` until that site is built.
+    fn add_key_filter(&self, site: FilterSite, filter: ScanKeyFilter) {
+        self.key_filters
             .borrow_mut()
-            .entry(source)
+            .entry(site)
             .or_default()
             .push(filter);
     }
 
-    /// Takes the join-key filters planned for the scan of `source`.
-    fn take_scan_key_filters(&self, source: SourceId) -> Vec<ScanKeyFilter> {
-        self.scan_key_filters
+    /// Takes the join-key filters planned for `site`.
+    fn take_key_filters(&self, site: FilterSite) -> Vec<ScanKeyFilter> {
+        self.key_filters
             .borrow_mut()
-            .remove(&source)
+            .remove(&site)
             .unwrap_or_default()
     }
 
@@ -507,7 +508,7 @@ fn physical_plan_to_pipeline(
                 cfg,
                 Some(ctx.skipped_corrupt_files.clone()),
             )
-            .with_key_filters(ctx.take_scan_key_filters(*source_id));
+            .with_key_filters(ctx.take_key_filters(FilterSite::Scan(*source_id)));
             SourceNode::new(
                 Box::new(scan_task_source),
                 stats_state.clone(),
@@ -1020,7 +1021,8 @@ fn physical_plan_to_pipeline(
             )
             .with_context(|_| PipelineCreationSnafu {
                 plan_name: physical_plan.name(),
-            })?;
+            })?
+            .with_key_filters(ctx.take_key_filters(FilterSite::partial_aggregate(physical_plan)));
             StreamingSinkNode::new(
                 Arc::new(agg_sink),
                 child_node,
@@ -1337,8 +1339,8 @@ fn physical_plan_to_pipeline(
                     cfg,
                 )?
                 .map(|planned| {
-                    for (source, filter) in planned.scans {
-                        ctx.add_scan_key_filter(source, filter);
+                    for (site, filter) in planned.targets {
+                        ctx.add_key_filter(site, filter);
                     }
                     planned.publisher
                 });

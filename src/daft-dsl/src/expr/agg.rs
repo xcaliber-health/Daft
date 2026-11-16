@@ -136,6 +136,12 @@ impl AggExpr {
             | Self::AnyValue(child, _) => child.clone(),
             _ => return Ok(None),
         };
-        Ok(Some(state.cast(&self.to_field(schema)?.dtype)))
+        // A state already of the partial's type is the argument itself, not a copy of it.
+        let dtype = self.to_field(schema)?.dtype;
+        Ok(Some(if state.to_field(schema)?.dtype == dtype {
+            state
+        } else {
+            state.cast(&dtype)
+        }))
     }
 }

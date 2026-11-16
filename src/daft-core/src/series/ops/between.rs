@@ -5,7 +5,7 @@ use crate::datatypes::BooleanArray;
 #[cfg(feature = "python")]
 use crate::series::utils::python_fn::py_between_op_utilfn;
 use crate::{
-    array::ops::DaftBetween,
+    array::ops::{DaftBetween, DaftCompare, DaftLogical},
     datatypes::{DataType, InferDataType},
     series::{IntoSeries, Series},
     with_match_primitive_daft_types,
@@ -13,6 +13,16 @@ use crate::{
 
 impl Series {
     pub fn between(&self, lower: &Self, upper: &Self) -> DaftResult<Self> {
+        let value_type = InferDataType::from(self.data_type());
+        if value_type.compares_decimals_exactly(&InferDataType::from(lower.data_type()))
+            || value_type.compares_decimals_exactly(&InferDataType::from(upper.data_type()))
+        {
+            // No common type holds every value: compare against each bound exactly, with
+            // the same `lower <= value AND value <= upper` the typed kernel computes.
+            let at_least_lower = self.gte(lower)?;
+            let at_most_upper = self.lte(upper)?;
+            return Ok(at_least_lower.and(&at_most_upper)?.into_series());
+        }
         let (_output_type, _intermediate, lower_comp_type) = InferDataType::from(self.data_type())
             .comparison_op(&InferDataType::from(lower.data_type()))?;
         let (_output_type, _intermediate, upper_comp_type) = InferDataType::from(self.data_type())

@@ -19,6 +19,15 @@ impl Series {
             return default(self.name(), self.len());
         }
 
+        if InferDataType::from(self.data_type())
+            .compares_decimals_exactly(&InferDataType::from(items.data_type()))
+        {
+            return Ok(self
+                .decimal128()?
+                .is_in_exactly(items.decimal128()?)?
+                .into_series());
+        }
+
         let (output_type, intermediate, comp_type) = InferDataType::from(self.data_type())
             .membership_op(&InferDataType::from(items.data_type()))?;
 

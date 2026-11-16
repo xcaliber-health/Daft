@@ -12,6 +12,8 @@
 //!   divisor is zero. A row error could not be guarded against, because a
 //!   conditional evaluates both of its branches over every row.
 
+use std::cmp::Ordering;
+
 use arrow::datatypes::i256;
 use common_error::{DaftError, DaftResult};
 
@@ -640,6 +642,82 @@ impl DecimalSum {
     }
 }
 
+/// An exact comparison of two decimal columns of different scales, row by row.
+///
+/// Each value is carried to the larger scale and the two are compared there, in 128
+/// bits, or in 256 bits for a row whose aligned value overflows 128. Nothing is rounded
+/// and no row fails, whatever the two types.
+#[derive(Clone, Copy, Debug)]
+pub struct DecimalComparison {
+    /// `10^(s_max − s1)`.
+    left_factor: ScaleFactor,
+    /// `10^(s_max − s2)`.
+    right_factor: ScaleFactor,
+    /// Both sides already share a scale, so they compare as they are.
+    same_scale: bool,
+}
+
+impl DecimalComparison {
+    /// Prepares the comparison of values at `left_scale` with values at `right_scale`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaftError::InternalError`] for a scale past 76 digits, which no decimal has.
+    pub fn new(left_scale: usize, right_scale: usize) -> DaftResult<Self> {
+        let aligned_scale = left_scale.max(right_scale);
+        Ok(Self {
+            left_factor: ScaleFactor::of(aligned_scale - left_scale)?,
+            right_factor: ScaleFactor::of(aligned_scale - right_scale)?,
+            same_scale: left_scale == right_scale,
+        })
+    }
+
+    /// How `left` (unscaled, at the left scale) orders against `right` (at the right scale).
+    #[must_use]
+    pub fn compare(&self, left: i128, right: i128) -> Ordering {
+        if self.same_scale {
+            return left.cmp(&right);
+        }
+        let aligned = self
+            .left_factor
+            .narrow
+            .and_then(|factor| left.checked_mul(factor))
+            .zip(
+                self.right_factor
+                    .narrow
+                    .and_then(|factor| right.checked_mul(factor)),
+            );
+        match aligned {
+            Some((left, right)) => left.cmp(&right),
+            // Two 38-digit values aligned to a common scale stay within 76 digits, so
+            // these multiplications cannot overflow 256 bits.
+            None => i256::from_i128(left)
+                .wrapping_mul(self.left_factor.wide)
+                .cmp(&i256::from_i128(right).wrapping_mul(self.right_factor.wide)),
+        }
+    }
+
+    /// A left `value` carried to the larger scale in 128 bits, or `None` when it overflows them.
+    #[must_use]
+    pub fn align_left_narrow(&self, value: i128) -> Option<i128> {
+        self.left_factor
+            .narrow
+            .and_then(|factor| value.checked_mul(factor))
+    }
+
+    /// `value` carried to the larger scale, in 256 bits; equal values align equally.
+    #[must_use]
+    pub fn align_left(&self, value: i128) -> i256 {
+        i256::from_i128(value).wrapping_mul(self.left_factor.wide)
+    }
+
+    /// As [`Self::align_left`], for a value of the right side.
+    #[must_use]
+    pub fn align_right(&self, value: i128) -> i256 {
+        i256::from_i128(value).wrapping_mul(self.right_factor.wide)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -1025,5 +1103,52 @@ mod tests {
         #[case] expected: bool,
     ) {
         assert_eq!(DecimalProduct::always_fits(left, right, answer), expected);
+    }
+
+    fn comparison(left_scale: usize, right_scale: usize) -> DecimalComparison {
+        DecimalComparison::new(left_scale, right_scale).expect("a comparison")
+    }
+
+    #[rstest]
+    // 1.12 at scale 2 against 1.120000 and 1.123456 at scale 6.
+    #[case::equal_at_the_larger_scale(112, 2, 1_120_000, 6, Ordering::Equal)]
+    #[case::differs_past_the_second_place(112, 2, 1_123_456, 6, Ordering::Less)]
+    #[case::greater(1_000, 2, 3_333_333, 6, Ordering::Greater)]
+    #[case::negative_against_positive(-1, 2, 1, 6, Ordering::Less)]
+    #[case::both_negative(-112, 2, -1_123_456, 6, Ordering::Greater)]
+    #[case::zero_at_different_scales(0, 2, 0, 6, Ordering::Equal)]
+    #[case::same_scale(5, 3, 7, 3, Ordering::Less)]
+    // ±(10^38 − 1) at scale 2 aligned to scale 6 overflow 128 bits.
+    #[case::past_128_bits(MAX_38, 2, MAX_38, 6, Ordering::Greater)]
+    #[case::past_128_bits_negative(-MAX_38, 2, -MAX_38, 6, Ordering::Less)]
+    #[case::past_128_bits_against_a_small_value(MAX_38, 2, 1, 6, Ordering::Greater)]
+    fn decimals_compare_exactly(
+        #[case] left: i128,
+        #[case] left_scale: usize,
+        #[case] right: i128,
+        #[case] right_scale: usize,
+        #[case] expected: Ordering,
+    ) {
+        assert_eq!(
+            comparison(left_scale, right_scale).compare(left, right),
+            expected
+        );
+        // Swapping the operands reverses the ordering.
+        assert_eq!(
+            comparison(right_scale, left_scale).compare(right, left),
+            expected.reverse()
+        );
+    }
+
+    #[test]
+    fn equal_values_align_equally() {
+        let comparison = comparison(2, 6);
+
+        assert_eq!(
+            comparison.align_left(112),
+            comparison.align_right(1_120_000)
+        );
+        assert_eq!(comparison.align_left_narrow(112), Some(1_120_000));
+        assert_eq!(comparison.align_left_narrow(MAX_38), None);
     }
 }

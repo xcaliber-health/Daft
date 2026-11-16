@@ -63,6 +63,10 @@ pub(crate) fn to_json_value(node: &LogicalPlan) -> serde_json::Value {
             "aggregations": aggregate.aggregations.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
             "groupby": aggregate.groupby.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
         }),
+        LogicalPlan::PartialAggregate(aggregate) => json!({
+            "aggregations": aggregate.aggregations.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+            "groupby": aggregate.groupby.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+        }),
         LogicalPlan::Pivot(pivot) => json!({
             "pivot_column": pivot.pivot_column.to_string(),
             "value_column": pivot.value_column.to_string(),

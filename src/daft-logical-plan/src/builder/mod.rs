@@ -87,6 +87,8 @@ fn optimizer_config(cfg: Option<&DaftPlanningConfig>) -> OptimizerConfig {
     OptimizerConfig {
         strict_pushdown: cfg.is_some_and(|conf| conf.enable_strict_filter_pushdown),
         join_key_inference: !cfg.is_some_and(|conf| conf.disable_join_key_inference),
+        partial_aggregate_pushdown: !cfg
+            .is_some_and(|conf| conf.disable_partial_aggregate_pushdown),
         ..Default::default()
     }
 }
@@ -1087,6 +1089,7 @@ impl LogicalPlanBuilder {
                         builder.reorder_joins(Some(execution_config.clone()), use_dp_ccp)
                     },
                 )
+                .push_partial_aggregates()
                 .simplify_expressions()
                 .split_granular_projections()
                 .enrich_with_stats(Some(execution_config))
@@ -1152,6 +1155,7 @@ impl LogicalPlanBuilder {
                     builder.reorder_joins(Some(execution_config.clone()), use_dp_ccp)
                 },
             )
+            .push_partial_aggregates()
             .simplify_expressions()
             .split_granular_projections()
             .enrich_with_stats(Some(execution_config))

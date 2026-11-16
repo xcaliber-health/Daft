@@ -74,6 +74,10 @@ pub struct DaftPlanningConfig {
     /// other side's key. Derivation never changes an answer; disabling it only gives up the
     /// reads it saves.
     pub disable_join_key_inference: bool,
+    /// Disable pushing a partial aggregation below an equi-join that its aggregations read
+    /// one side of. The pushdown never changes an answer; disabling it only gives up the
+    /// rows it spares the join.
+    pub disable_partial_aggregate_pushdown: bool,
 }
 
 #[cfg(not(debug_assertions))]
@@ -91,6 +95,8 @@ impl DaftPlanningConfig {
         "DAFT_DEV_ENABLE_DP_CCP_JOIN_ORDERING";
     const ENV_DAFT_DEV_DISABLE_JOIN_KEY_INFERENCE: &'static str =
         "DAFT_DEV_DISABLE_JOIN_KEY_INFERENCE";
+    const ENV_DAFT_DEV_DISABLE_PARTIAL_AGGREGATE_PUSHDOWN: &'static str =
+        "DAFT_DEV_DISABLE_PARTIAL_AGGREGATE_PUSHDOWN";
 
     #[must_use]
     pub fn from_env() -> Self {
@@ -110,6 +116,12 @@ impl DaftPlanningConfig {
 
         if let Some(val) = parse_bool_from_env(Self::ENV_DAFT_DEV_DISABLE_JOIN_KEY_INFERENCE) {
             cfg.disable_join_key_inference = val;
+        }
+
+        if let Some(val) =
+            parse_bool_from_env(Self::ENV_DAFT_DEV_DISABLE_PARTIAL_AGGREGATE_PUSHDOWN)
+        {
+            cfg.disable_partial_aggregate_pushdown = val;
         }
 
         cfg
@@ -169,6 +181,15 @@ pub struct DaftExecutionConfig {
     pub shuffle_aggregation_default_partitions: usize,
     pub partial_aggregation_threshold: usize,
     pub high_cardinality_aggregation_threshold: f64,
+    /// Rows a partial aggregation pushed below a join reads before judging how much it
+    /// reduces them.
+    pub partial_aggregate_pushdown_probe_rows: usize,
+    /// The distinct-groups-to-rows ratio above which a partial aggregation pushed below a
+    /// join stops aggregating and passes each row on as its own partial state.
+    pub partial_aggregate_pushdown_skip_ratio: f64,
+    /// Bytes of partial results a partial aggregation pushed below a join holds before it
+    /// emits them early, which is always correct.
+    pub partial_aggregate_pushdown_max_buffer_bytes: usize,
     pub read_sql_partition_size_bytes: usize,
     pub default_morsel_size: NonZeroUsize,
     pub shuffle_algorithm: String,
@@ -225,7 +246,10 @@ impl Default for DaftExecutionConfig {
             shuffle_aggregation_default_partitions: 200,
             partial_aggregation_threshold: 10000,
             high_cardinality_aggregation_threshold: 0.8,
-            read_sql_partition_size_bytes: 512 * 1024 * 1024, // 512MB
+            partial_aggregate_pushdown_probe_rows: 100_000,
+            partial_aggregate_pushdown_skip_ratio: 0.5,
+            partial_aggregate_pushdown_max_buffer_bytes: 256 * 1024 * 1024, // 256MB
+            read_sql_partition_size_bytes: 512 * 1024 * 1024,               // 512MB
             default_morsel_size: NonZeroUsize::new(128 * 1024).unwrap(),
             shuffle_algorithm: "auto".to_string(),
             pre_shuffle_merge_threshold: 1024 * 1024 * 1024, // 1GB

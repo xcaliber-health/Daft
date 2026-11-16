@@ -103,4 +103,5 @@ name = "daft-local-execution"
 version = {workspace = true}
 
 [dev-dependencies]
+rstest = {workspace = true}
 tempfile = "3.23.0"

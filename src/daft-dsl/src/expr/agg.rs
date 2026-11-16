@@ -1,6 +1,7 @@
 use common_error::{DaftError, DaftResult};
+use daft_core::{count_mode::CountMode, prelude::Schema};
 
-use crate::{AggExpr, ApproxPercentileParams, Expr, ExprRef};
+use crate::{AggExpr, ApproxPercentileParams, Expr, ExprRef, lit};
 
 #[recursive::recursive]
 pub fn extract_agg_expr(expr: &ExprRef) -> DaftResult<AggExpr> {
@@ -88,5 +89,53 @@ pub fn extract_agg_expr(expr: &ExprRef) -> DaftResult<AggExpr> {
             "Expected non-agg expressions in aggregation to be factored out before plan translation. Got: {:?}",
             expr
         ))),
+    }
+}
+
+impl AggExpr {
+    /// The aggregation that combines partial results of `self` into its whole result,
+    /// when that is an aggregation of the same kind over the partials.
+    ///
+    /// Counts combine by summing, and sums, minima, maxima and boolean and/or by
+    /// themselves; any value combines by taking any non-null partial. `None` for an
+    /// aggregation whose partials need a different shape (a mean, a distinct count, a
+    /// list, a sketch). `partial` is the column holding the partial results.
+    #[must_use]
+    pub fn merge_of_partial(&self, partial: ExprRef) -> Option<Self> {
+        match self {
+            Self::Count(..) | Self::Sum(_) => Some(Self::Sum(partial)),
+            Self::Min(_) => Some(Self::Min(partial)),
+            Self::Max(_) => Some(Self::Max(partial)),
+            Self::BoolAnd(_) => Some(Self::BoolAnd(partial)),
+            Self::BoolOr(_) => Some(Self::BoolOr(partial)),
+            Self::AnyValue(..) => Some(Self::AnyValue(partial, true)),
+            _ => None,
+        }
+    }
+
+    /// The partial result of `self` over a group of one row, as an expression over that
+    /// row, of the type `self` answers; `None` when [`Self::merge_of_partial`] is.
+    ///
+    /// Combining these per-row results with [`Self::merge_of_partial`] gives the same
+    /// answer as aggregating the rows, so a partial aggregation may pass rows on this way
+    /// instead of grouping them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `self` cannot be typed against `schema`.
+    pub fn single_row_partial(&self, schema: &Schema) -> DaftResult<Option<ExprRef>> {
+        let state = match self {
+            Self::Count(_, CountMode::All) => lit(1u64),
+            Self::Count(child, CountMode::Valid) => child.clone().not_null(),
+            Self::Count(child, CountMode::Null) => child.clone().is_null(),
+            Self::Sum(child)
+            | Self::Min(child)
+            | Self::Max(child)
+            | Self::BoolAnd(child)
+            | Self::BoolOr(child)
+            | Self::AnyValue(child, _) => child.clone(),
+            _ => return Ok(None),
+        };
+        Ok(Some(state.cast(&self.to_field(schema)?.dtype)))
     }
 }

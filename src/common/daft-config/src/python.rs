@@ -29,12 +29,13 @@ impl PyDaftPlanningConfig {
         }
     }
 
-    #[pyo3(signature = (default_io_config=None, enable_strict_filter_pushdown=None, disable_join_key_inference=None))]
+    #[pyo3(signature = (default_io_config=None, enable_strict_filter_pushdown=None, disable_join_key_inference=None, disable_partial_aggregate_pushdown=None))]
     fn with_config_values(
         &mut self,
         default_io_config: Option<PyIOConfig>,
         enable_strict_filter_pushdown: Option<bool>,
         disable_join_key_inference: Option<bool>,
+        disable_partial_aggregate_pushdown: Option<bool>,
     ) -> PyResult<Self> {
         let mut config = self.config.as_ref().clone();
 
@@ -48,6 +49,10 @@ impl PyDaftPlanningConfig {
 
         if let Some(disable_join_key_inference) = disable_join_key_inference {
             config.disable_join_key_inference = disable_join_key_inference;
+        }
+
+        if let Some(disable_partial_aggregate_pushdown) = disable_partial_aggregate_pushdown {
+            config.disable_partial_aggregate_pushdown = disable_partial_aggregate_pushdown;
         }
 
         Ok(Self {
@@ -70,6 +75,11 @@ impl PyDaftPlanningConfig {
     #[getter(disable_join_key_inference)]
     fn disable_join_key_inference(&self) -> PyResult<bool> {
         Ok(self.config.disable_join_key_inference)
+    }
+
+    #[getter(disable_partial_aggregate_pushdown)]
+    fn disable_partial_aggregate_pushdown(&self) -> PyResult<bool> {
+        Ok(self.config.disable_partial_aggregate_pushdown)
     }
 }
 
@@ -126,6 +136,9 @@ impl PyDaftExecutionConfig {
         shuffle_aggregation_default_partitions=None,
         partial_aggregation_threshold=None,
         high_cardinality_aggregation_threshold=None,
+        partial_aggregate_pushdown_probe_rows=None,
+        partial_aggregate_pushdown_skip_ratio=None,
+        partial_aggregate_pushdown_max_buffer_bytes=None,
         read_sql_partition_size_bytes=None,
         default_morsel_size=None,
         shuffle_algorithm=None,
@@ -173,6 +186,9 @@ impl PyDaftExecutionConfig {
         shuffle_aggregation_default_partitions: Option<usize>,
         partial_aggregation_threshold: Option<usize>,
         high_cardinality_aggregation_threshold: Option<f64>,
+        partial_aggregate_pushdown_probe_rows: Option<usize>,
+        partial_aggregate_pushdown_skip_ratio: Option<f64>,
+        partial_aggregate_pushdown_max_buffer_bytes: Option<usize>,
         read_sql_partition_size_bytes: Option<usize>,
         default_morsel_size: Option<usize>,
         shuffle_algorithm: Option<&str>,
@@ -275,6 +291,15 @@ impl PyDaftExecutionConfig {
         if let Some(high_cardinality_aggregation_threshold) = high_cardinality_aggregation_threshold
         {
             config.high_cardinality_aggregation_threshold = high_cardinality_aggregation_threshold;
+        }
+        if let Some(probe_rows) = partial_aggregate_pushdown_probe_rows {
+            config.partial_aggregate_pushdown_probe_rows = probe_rows;
+        }
+        if let Some(skip_ratio) = partial_aggregate_pushdown_skip_ratio {
+            config.partial_aggregate_pushdown_skip_ratio = skip_ratio;
+        }
+        if let Some(max_buffer_bytes) = partial_aggregate_pushdown_max_buffer_bytes {
+            config.partial_aggregate_pushdown_max_buffer_bytes = max_buffer_bytes;
         }
         if let Some(read_sql_partition_size_bytes) = read_sql_partition_size_bytes {
             config.read_sql_partition_size_bytes = read_sql_partition_size_bytes;
@@ -514,6 +539,21 @@ impl PyDaftExecutionConfig {
     #[getter]
     fn get_high_cardinality_aggregation_threshold(&self) -> PyResult<f64> {
         Ok(self.config.high_cardinality_aggregation_threshold)
+    }
+
+    #[getter]
+    fn get_partial_aggregate_pushdown_probe_rows(&self) -> PyResult<usize> {
+        Ok(self.config.partial_aggregate_pushdown_probe_rows)
+    }
+
+    #[getter]
+    fn get_partial_aggregate_pushdown_skip_ratio(&self) -> PyResult<f64> {
+        Ok(self.config.partial_aggregate_pushdown_skip_ratio)
+    }
+
+    #[getter]
+    fn get_partial_aggregate_pushdown_max_buffer_bytes(&self) -> PyResult<usize> {
+        Ok(self.config.partial_aggregate_pushdown_max_buffer_bytes)
     }
 
     #[getter]

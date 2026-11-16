@@ -484,7 +484,9 @@ impl PushDownFilter {
             | LogicalPlan::SubqueryAlias(..)
             | LogicalPlan::AsofJoin(..)
             | LogicalPlan::VLLMProject(..)
-            | LogicalPlan::StageCheckpointKeys(..) => {
+            | LogicalPlan::StageCheckpointKeys(..)
+            // Placed after every pushdown, below a join; nothing is pushed through it.
+            | LogicalPlan::PartialAggregate(..) => {
                 return Ok(Transformed::no(plan));
             }
         };

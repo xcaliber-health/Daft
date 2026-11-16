@@ -31,7 +31,7 @@ use daft_dsl::{
 };
 use daft_local_plan::{
     Concat, Dedup, Filter, HashAggregate, IntoBatches, LocalPhysicalPlan, LocalPhysicalPlanRef,
-    PhysicalScan, Project, Sort, SourceId, WindowPartitionAndDynamicFrame,
+    PartialHashAggregate, PhysicalScan, Project, Sort, SourceId, WindowPartitionAndDynamicFrame,
     WindowPartitionAndOrderBy, WindowPartitionOnly,
 };
 use daft_logical_plan::{JoinType, stats::StatsState};
@@ -611,6 +611,9 @@ fn scans_reached(plan: &LocalPhysicalPlan, column: usize, spares_state: bool) ->
                 .unwrap_or_default()
         }
         LocalPhysicalPlan::HashAggregate(HashAggregate {
+            input, group_by, ..
+        })
+        | LocalPhysicalPlan::PartialHashAggregate(PartialHashAggregate {
             input, group_by, ..
         }) => passed_through(plan, input, group_by, column)
             .map(|column| scans_reached(input, column, true))

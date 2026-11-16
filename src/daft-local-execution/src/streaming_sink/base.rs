@@ -377,10 +377,12 @@ impl<Op: StreamingSink + 'static> ExecutionContext<Op> {
                         self.stats_manager.activate_node(self.node_id);
                         self.node_initialized = true;
                     }
-                    self.batch_manager.set_pending_flush(input_id);
-                    if self.inputs.contains_key(&input_id) {
-                        self.dispatch_ready_batches(input_id)?;
-                    }
+                    // An input can end having sent no morsel, as when a filter keeps none
+                    // of its rows. It still finalizes and flushes, so an operator above
+                    // waiting for it (a join's build side) sees it end.
+                    self.get_or_create_input(input_id)?;
+                    self.batch_manager.flush_input(input_id);
+                    self.dispatch_ready_batches(input_id)?;
                     self.try_complete_input(input_id)?;
                     ControlFlow::Continue(())
                 }

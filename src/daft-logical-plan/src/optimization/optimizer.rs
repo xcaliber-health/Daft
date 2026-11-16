@@ -11,10 +11,11 @@ use super::{
         EliminateSubqueryAliasRule, EnrichWithStats, ExtractWindowFunction, FilterNullJoinKey,
         InferJoinKeyFilters, LiftProjectFromAgg, MaterializeScans, OptimizerRule,
         PushDownAggregation, PushDownAntiSemiJoin, PushDownFilter, PushDownJoinPredicate,
-        PushDownLimit, PushDownProjection, PushDownShard, ReorderJoins, RewriteCheckpointSource,
-        RewriteCountDistinct, RewriteOffset, ShardScans, SimplifyExpressionsRule,
-        SimplifyNullFilteredJoin, SplitExplodeFromProject, SplitGranularProjection, SplitUDFs,
-        SplitUDFsFromFilters, UnnestPredicateSubquery, UnnestScalarSubquery,
+        PushDownLimit, PushDownProjection, PushDownShard, PushPartialAggregateThroughJoin,
+        ReorderJoins, RewriteCheckpointSource, RewriteCountDistinct, RewriteOffset, ShardScans,
+        SimplifyExpressionsRule, SimplifyNullFilteredJoin, SplitExplodeFromProject,
+        SplitGranularProjection, SplitUDFs, SplitUDFsFromFilters, UnnestPredicateSubquery,
+        UnnestScalarSubquery,
     },
 };
 use crate::{LogicalPlan, optimization::rules::SplitVLLM};
@@ -28,6 +29,9 @@ pub struct OptimizerConfig {
     /// Whether to filter each side of an equi-join by the restrictions the other side's key
     /// carries ([`InferJoinKeyFilters`]).
     pub join_key_inference: bool,
+    /// Whether to push a partial aggregation below an equi-join that its aggregations read
+    /// one side of ([`PushPartialAggregateThroughJoin`]).
+    pub partial_aggregate_pushdown: bool,
 }
 
 impl OptimizerConfig {
@@ -36,6 +40,7 @@ impl OptimizerConfig {
             default_max_optimizer_passes: max_optimizer_passes,
             strict_pushdown,
             join_key_inference,
+            partial_aggregate_pushdown: true,
         }
     }
 }
@@ -272,6 +277,21 @@ impl OptimizerBuilder {
             ],
             RuleExecutionStrategy::Once,
         ));
+        self
+    }
+
+    /// Pushes a partial aggregation below an equi-join that its aggregations read one side
+    /// of ([`PushPartialAggregateThroughJoin`]), unless the config turns it off.
+    ///
+    /// It belongs after join reordering, which treats any other node as a leaf and would
+    /// no longer reorder the joins below a partial aggregation.
+    pub fn push_partial_aggregates(mut self) -> Self {
+        if self.config.partial_aggregate_pushdown {
+            self.rule_batches.push(RuleBatch::new(
+                vec![Box::new(PushPartialAggregateThroughJoin::new())],
+                RuleExecutionStrategy::Once,
+            ));
+        }
         self
     }
 

@@ -250,6 +250,26 @@ fn translate_helper(
                 ))
             }
         }
+        LogicalPlan::PartialAggregate(aggregate) => {
+            let (input_plan, inputs) = translate_helper(&aggregate.input, source_counter, psets)?;
+            let aggregations = aggregate
+                .aggregations
+                .iter()
+                .map(|expr| BoundAggExpr::try_new(extract_agg_expr(expr)?, input_plan.schema()))
+                .collect::<DaftResult<Vec<_>>>()?;
+            let groupby = BoundExpr::bind_all(&aggregate.groupby, input_plan.schema())?;
+            Ok((
+                LocalPhysicalPlan::partial_hash_aggregate(
+                    input_plan,
+                    aggregations,
+                    groupby,
+                    aggregate.output_schema.clone(),
+                    aggregate.stats_state.clone(),
+                    LocalNodeContext::default(),
+                ),
+                inputs,
+            ))
+        }
         LogicalPlan::Window(window) => {
             let (input_plan, inputs) = translate_helper(&window.input, source_counter, psets)?;
 

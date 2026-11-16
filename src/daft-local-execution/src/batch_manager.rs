@@ -65,14 +65,25 @@ where
     /// Buffers an incoming partition for the given input. Creates the input's
     /// buffer on first push, sized according to the current batch requirements.
     pub fn push(&mut self, input_id: InputId, partition: MicroPartition) {
-        let input = self.inputs.entry(input_id).or_insert_with(|| {
+        self.input(input_id).buffer.push(partition);
+    }
+
+    /// Signals that the given input has finished sending data, whether or not it sent
+    /// any. Unlike [`Self::set_pending_flush`], an input never pushed to is created empty,
+    /// so [`Self::can_flush`] holds for it at once.
+    pub fn flush_input(&mut self, input_id: InputId) {
+        self.input(input_id).pending_flush = true;
+    }
+
+    /// The input's buffer, created on first use, sized to the current batch requirements.
+    fn input(&mut self, input_id: InputId) -> &mut InputBuffer {
+        self.inputs.entry(input_id).or_insert_with(|| {
             let (lower, upper) = self.current_requirements.values();
             InputBuffer {
                 buffer: RowBasedBuffer::new(lower, upper),
                 pending_flush: false,
             }
-        });
-        input.buffer.push(partition);
+        })
     }
 
     /// Extracts the next batch for the given input by delegating to the

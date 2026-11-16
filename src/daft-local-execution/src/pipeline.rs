@@ -19,11 +19,11 @@ pub use daft_local_plan::InputId;
 use daft_local_plan::{
     AsofJoin, CommitWrite, Concat, CrossJoin, Dedup, Explode, Filter, FlightShuffleReadInput,
     GatherWrite, GlobScan, HashAggregate, HashJoin, InMemoryScan, IntoBatches, Limit,
-    LocalNodeContext, LocalPhysicalPlan, MonotonicallyIncreasingId, PhysicalScan, PhysicalWrite,
-    Pivot, Project, RepartitionWrite, Sample, ShuffleBackend, ShuffleReadBackend, Sort,
-    SortMergeJoin, SourceId, TopN, UDFProject, UnGroupedAggregate, Unpivot, VLLMProject,
-    WindowOrderByOnly, WindowPartitionAndDynamicFrame, WindowPartitionAndOrderBy,
-    WindowPartitionOnly,
+    LocalNodeContext, LocalPhysicalPlan, MonotonicallyIncreasingId, PartialHashAggregate,
+    PhysicalScan, PhysicalWrite, Pivot, Project, RepartitionWrite, Sample, ShuffleBackend,
+    ShuffleReadBackend, Sort, SortMergeJoin, SourceId, TopN, UDFProject, UnGroupedAggregate,
+    Unpivot, VLLMProject, WindowOrderByOnly, WindowPartitionAndDynamicFrame,
+    WindowPartitionAndOrderBy, WindowPartitionOnly,
 };
 use daft_logical_plan::{JoinType, stats::StatsState};
 use daft_micropartition::{MicroPartition, MicroPartitionRef};
@@ -74,8 +74,8 @@ use crate::{
     },
     streaming_sink::{
         async_udf::AsyncUdfSink, base::StreamingSinkNode, limit::LimitSink,
-        monotonically_increasing_id::MonotonicallyIncreasingIdSink, sample::SampleSink,
-        vllm::VLLMSink,
+        monotonically_increasing_id::MonotonicallyIncreasingIdSink,
+        partial_aggregate::PartialAggregateSink, sample::SampleSink, vllm::VLLMSink,
     },
 };
 
@@ -994,6 +994,34 @@ fn physical_plan_to_pipeline(
                 plan_name: physical_plan.name(),
             })?;
             BlockingSinkNode::new(
+                Arc::new(agg_sink),
+                child_node,
+                stats_state.clone(),
+                ctx,
+                context,
+            )
+            .boxed()
+        }
+        LocalPhysicalPlan::PartialHashAggregate(PartialHashAggregate {
+            input,
+            aggregations,
+            group_by,
+            schema,
+            stats_state,
+            context,
+        }) => {
+            let child_node = physical_plan_to_pipeline(input, cfg, ctx, input_senders)?;
+            let agg_sink = PartialAggregateSink::new(
+                aggregations,
+                group_by,
+                input.schema(),
+                schema.clone(),
+                cfg,
+            )
+            .with_context(|_| PipelineCreationSnafu {
+                plan_name: physical_plan.name(),
+            })?;
+            StreamingSinkNode::new(
                 Arc::new(agg_sink),
                 child_node,
                 stats_state.clone(),

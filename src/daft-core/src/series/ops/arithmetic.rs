@@ -6,7 +6,7 @@ use daft_schema::prelude::*;
 #[cfg(feature = "python")]
 use crate::series::utils::python_fn::run_python_binary_operator_fn;
 use crate::{
-    array::prelude::*,
+    array::{ops::division::Division, prelude::*},
     datatypes::{
         DaftArrowBackedType, DaftNumericType, Float64Type, InferDataType, Int32Type, Utf8Array,
         integer_to_decimal128,
@@ -15,7 +15,7 @@ use crate::{
         IntoSeries, Series, array_impl::ArrayWrapper, series_like::SeriesLike,
         utils::cast::cast_downcast_op,
     },
-    with_match_integer_daft_types, with_match_numeric_daft_types,
+    with_match_numeric_daft_types,
 };
 
 /// An operand of exact decimal arithmetic at its own decimal type.
@@ -61,7 +61,6 @@ enum ArithmeticOp {
     Sub,
     Mul,
     Div,
-    Rem,
 }
 
 impl ArithmeticOp {
@@ -71,15 +70,13 @@ impl ArithmeticOp {
         for<'a> &'a DataArray<T>: Add<Output = DaftResult<DataArray<T>>>
             + Sub<Output = DaftResult<DataArray<T>>>
             + Mul<Output = DaftResult<DataArray<T>>>
-            + Div<Output = DaftResult<DataArray<T>>>
-            + Rem<Output = DaftResult<DataArray<T>>>,
+            + Div<Output = DaftResult<DataArray<T>>>,
     {
         match self {
             Self::Add => lhs.add(rhs),
             Self::Sub => lhs.sub(rhs),
             Self::Mul => lhs.mul(rhs),
             Self::Div => lhs.div(rhs),
-            Self::Rem => lhs.rem(rhs),
         }
     }
 }
@@ -96,8 +93,7 @@ where
     for<'a> &'a DataArray<T>: Add<Output = DaftResult<DataArray<T>>>
         + Sub<Output = DaftResult<DataArray<T>>>
         + Mul<Output = DaftResult<DataArray<T>>>
-        + Div<Output = DaftResult<DataArray<T>>>
-        + Rem<Output = DaftResult<DataArray<T>>>,
+        + Div<Output = DaftResult<DataArray<T>>>,
 {
     let lhs = lhs.cast(dtype)?;
     let rhs = rhs.cast(dtype)?;
@@ -117,14 +113,47 @@ fn numeric_series_binary_op(
     })
 }
 
-fn integer_series_binary_op(
+/// Floored or truncated division of numeric series; see [`crate::array::ops::division`].
+#[derive(Clone, Copy)]
+enum DivisionOp {
+    FloorDivide,
+    FlooredRemainder,
+    TruncatedDivide,
+    TruncatedRemainder,
+}
+
+fn cast_downcast_division_op<T>(
+    lhs: &Series,
+    rhs: &Series,
+    dtype: &DataType,
+    op: DivisionOp,
+) -> DaftResult<Series>
+where
+    T: DaftNumericType + DaftArrowBackedType,
+    T::Native: Division,
+    ArrayWrapper<DataArray<T>>: SeriesLike,
+{
+    let lhs = lhs.cast(dtype)?;
+    let rhs = rhs.cast(dtype)?;
+    let lhs = lhs.downcast::<DataArray<T>>()?;
+    let rhs = rhs.downcast::<DataArray<T>>()?;
+    let result = match op {
+        DivisionOp::FloorDivide => lhs.floor_divide(rhs),
+        DivisionOp::FlooredRemainder => lhs.floored_remainder(rhs),
+        DivisionOp::TruncatedDivide => lhs.truncated_divide(rhs),
+        DivisionOp::TruncatedRemainder => lhs.truncated_remainder(rhs),
+    };
+    Ok(result?.into_series())
+}
+
+fn numeric_series_division_op(
     lhs: &Series,
     rhs: &Series,
     output_type: &DataType,
-    op: ArithmeticOp,
+    op: DivisionOp,
 ) -> DaftResult<Series> {
-    with_match_integer_daft_types!(output_type, |$T| {
-        cast_downcast_numeric_op::<$T>(lhs, rhs, output_type, op)
+    with_match_numeric_daft_types!(output_type, |$T| {
+        cast_downcast_division_op::<$T>(lhs, rhs, output_type, op)
     })
 }
 
@@ -473,7 +502,7 @@ impl Rem for &Series {
             #[cfg(feature = "python")]
             DataType::Python => run_python_binary_operator_fn(lhs, rhs, "mod"),
             output_type if output_type.is_numeric() => {
-                numeric_series_binary_op(lhs, rhs, output_type, ArithmeticOp::Rem)
+                numeric_series_division_op(lhs, rhs, output_type, DivisionOp::FlooredRemainder)
             }
             output_type if output_type.is_fixed_size_numeric() => {
                 fixed_size_binary_op(lhs, rhs, output_type, FixedSizeBinaryOp::Rem)
@@ -484,6 +513,14 @@ impl Rem for &Series {
 }
 
 impl Series {
+    /// `self // rhs`, rounded toward negative infinity for every numeric type.
+    ///
+    /// A row is null where either side is null or an integer divisor is zero; `MIN // −1`
+    /// wraps to `MIN`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a type error for operands that cannot be floor-divided.
     pub fn floor_div(&self, rhs: &Self) -> DaftResult<Self> {
         let output_type = InferDataType::from(self.data_type())
             .floor_div(&InferDataType::from(rhs.data_type()))?;
@@ -491,14 +528,52 @@ impl Series {
         match &output_type {
             #[cfg(feature = "python")]
             DataType::Python => run_python_binary_operator_fn(lhs, rhs, "floordiv"),
-            output_type if output_type.is_integer() => {
-                integer_series_binary_op(lhs, rhs, output_type, ArithmeticOp::Div)
-            }
             output_type if output_type.is_numeric() => {
-                let div_floor = lhs.div(rhs)?.floor()?;
-                div_floor.cast(output_type)
+                numeric_series_division_op(lhs, rhs, output_type, DivisionOp::FloorDivide)
             }
             _ => arithmetic_op_not_implemented!(self, "floor_div", rhs, output_type),
+        }
+    }
+
+    /// SQL's `%` and `MOD`: the remainder with the dividend's sign, truncated toward zero.
+    ///
+    /// The result type is that of `%`. A row is null where either side is null or an
+    /// integer divisor is zero; `MIN % −1` is 0.
+    ///
+    /// # Errors
+    ///
+    /// Returns a type error for operands that have no remainder.
+    pub fn sql_remainder(&self, rhs: &Self) -> DaftResult<Self> {
+        let output_type =
+            InferDataType::from(self.data_type()).rem(InferDataType::from(rhs.data_type()))?;
+        match &output_type {
+            output_type if output_type.is_numeric() => {
+                numeric_series_division_op(self, rhs, output_type, DivisionOp::TruncatedRemainder)
+            }
+            _ => arithmetic_op_not_implemented!(self, "%", rhs, output_type),
+        }
+    }
+
+    /// SQL's `//`: integer division truncated toward zero.
+    ///
+    /// Float operands are divided and floored, as the operator has always done in SQL.
+    /// The result type is that of `//`. A row is null where either side is null or an
+    /// integer divisor is zero; `MIN // −1` wraps to `MIN`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a type error for operands that cannot be divided.
+    pub fn sql_integer_divide(&self, rhs: &Self) -> DaftResult<Self> {
+        let output_type = InferDataType::from(self.data_type())
+            .floor_div(&InferDataType::from(rhs.data_type()))?;
+        match &output_type {
+            output_type if output_type.is_integer() => {
+                numeric_series_division_op(self, rhs, output_type, DivisionOp::TruncatedDivide)
+            }
+            output_type if output_type.is_numeric() => {
+                numeric_series_division_op(self, rhs, output_type, DivisionOp::FloorDivide)
+            }
+            _ => arithmetic_op_not_implemented!(self, "//", rhs, output_type),
         }
     }
 }

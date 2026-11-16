@@ -20,6 +20,7 @@ mod concat;
 mod concat_agg;
 mod count;
 mod decimal_comparison;
+pub mod division;
 mod exp;
 mod filter;
 mod float;

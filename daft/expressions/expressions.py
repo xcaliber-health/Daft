@@ -270,12 +270,19 @@ class Expression:
         return Expression._from_pyexpr(expr._expr / self._expr)
 
     def __mod__(self, other: Expression) -> Expression:
-        """Takes the mod of two numeric expressions (``e1 % e2``)."""
+        """Takes the floored modulo of two numeric expressions (``e1 % e2``).
+
+        The result takes the divisor's sign, so that ``e1 == e2 * (e1 // e2) + e1 % e2``
+        for every sign. A row whose integer divisor is zero is null.
+        """
         expr = Expression._to_expression(other)
         return Expression._from_pyexpr(self._expr % expr._expr)
 
     def __rmod__(self, other: Expression) -> Expression:
-        """Takes the mod of two numeric expressions (``e1 % e2``)."""
+        """Takes the floored modulo of two numeric expressions (``e2 % e1``).
+
+        The result takes the divisor's sign. A row whose integer divisor is zero is null.
+        """
         expr = Expression._to_expression(other)
         return Expression._from_pyexpr(expr._expr % self._expr)
 
@@ -373,12 +380,19 @@ class Expression:
         return Expression._from_pyexpr(expr)
 
     def __floordiv__(self, other: Expression) -> Expression:
-        """Floor divides two numeric expressions (``e1 / e2``)."""
+        """Floor divides two numeric expressions (``e1 // e2``).
+
+        The quotient rounds toward negative infinity for every numeric type. A row whose
+        integer divisor is zero is null.
+        """
         expr = Expression._to_expression(other)
         return Expression._from_pyexpr(self._expr // expr._expr)
 
     def __rfloordiv__(self, other: object) -> Expression:
-        """Reverse floor divides two numeric expressions (``e2 / e1``)."""
+        """Reverse floor divides two numeric expressions (``e2 // e1``).
+
+        The quotient rounds toward negative infinity. A row whose integer divisor is zero is null.
+        """
         expr = Expression._to_expression(other)
         return Expression._from_pyexpr(expr._expr // self._expr)
 

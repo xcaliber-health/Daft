@@ -187,6 +187,10 @@ As an example, consider the filter query below and compare the two equivalent Py
 
 Pretty sweet! Of course, this support for running Expressions on your columns extends well beyond arithmetic as we'll see in the next section on SQL Functions.
 
+!!! note "Integer division and modulo"
+
+    SQL's `%` (and `MOD(a, b)`) and `//` truncate toward zero, as the SQL standard's `MOD` does: `-7 % 2` is `-1` and `-7 // 2` is `-3`. The Python Expression API's `%` and `//` floor instead, as Python's do: `-7 % 2` is `1` and `-7 // 2` is `-4`. In both, a row whose integer divisor is zero is null.
+
 ### SQL Functions
 
 SQL also has access to all of Daft's powerful [`daft.Expression`][daft.Expression] functionality through SQL functions.

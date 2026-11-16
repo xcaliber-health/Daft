@@ -17,7 +17,7 @@ use crate::{
     },
     prelude::{BinaryArray, Decimal128Array, FixedSizeBinaryArray},
     series::Series,
-    utils::decimal::{DecimalAnswer, DecimalProduct, DecimalQuotient},
+    utils::decimal::{DecimalAnswer, DecimalProduct, DecimalQuotient, DecimalSum},
 };
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -104,22 +104,6 @@ where
     type Output = DaftResult<DataArray<T>>;
     fn add(self, rhs: Self) -> Self::Output {
         arithmetic_helper(self, rhs, |l, r| l + r)
-    }
-}
-
-impl Add for &Decimal128Array {
-    type Output = DaftResult<Decimal128Array>;
-    fn add(self, rhs: Self) -> Self::Output {
-        assert_eq!(self.data_type(), rhs.data_type());
-        arithmetic_helper(self, rhs, |l, r| l + r)
-    }
-}
-
-impl Sub for &Decimal128Array {
-    type Output = DaftResult<Decimal128Array>;
-    fn sub(self, rhs: Self) -> Self::Output {
-        assert_eq!(self.data_type(), rhs.data_type());
-        arithmetic_helper(self, rhs, |l, r| l - r)
     }
 }
 
@@ -306,6 +290,68 @@ where
 }
 
 impl Decimal128Array {
+    /// Adds `rhs` to this decimal column, answering `result`'s decimal type exactly.
+    ///
+    /// Each side keeps its own scale; they are combined at the larger one and
+    /// rounded once, half away from zero, when the result keeps fewer places. A row
+    /// answers null where either side is null or the sum does not fit the result
+    /// type. Either side may be a single value, which is broadcast. The result takes
+    /// this column's name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaftError::ValueError`] for lengths that cannot broadcast, and
+    /// [`DaftError::TypeError`] when `result` is not a decimal type.
+    pub fn add_exactly(&self, rhs: &Self, result: &DataType) -> DaftResult<Self> {
+        let (left, right) = (
+            decimal_type(self.data_type())?,
+            decimal_type(rhs.data_type())?,
+        );
+        let answer = DecimalAnswer::of(result)?;
+        if DecimalSum::always_fits(left, right, answer) {
+            let (left_factor, right_factor) = aligning_factors(left.1, right.1);
+            return if left.1 == right.1 {
+                decimal_rows_that_always_fit(self, rhs, result, i128::wrapping_add)
+            } else {
+                decimal_rows_that_always_fit(self, rhs, result, move |l, r| {
+                    l.wrapping_mul(left_factor)
+                        .wrapping_add(r.wrapping_mul(right_factor))
+                })
+            };
+        }
+        let sum = DecimalSum::new(left.1, right.1, answer)?;
+        exact_decimal_rows(self, rhs, result, |l, r| sum.add(l, r))
+    }
+
+    /// Subtracts `rhs` from this decimal column, answering `result`'s decimal type exactly.
+    ///
+    /// As [`Self::add_exactly`], for the difference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaftError::ValueError`] for lengths that cannot broadcast, and
+    /// [`DaftError::TypeError`] when `result` is not a decimal type.
+    pub fn subtract_exactly(&self, rhs: &Self, result: &DataType) -> DaftResult<Self> {
+        let (left, right) = (
+            decimal_type(self.data_type())?,
+            decimal_type(rhs.data_type())?,
+        );
+        let answer = DecimalAnswer::of(result)?;
+        if DecimalSum::always_fits(left, right, answer) {
+            let (left_factor, right_factor) = aligning_factors(left.1, right.1);
+            return if left.1 == right.1 {
+                decimal_rows_that_always_fit(self, rhs, result, i128::wrapping_sub)
+            } else {
+                decimal_rows_that_always_fit(self, rhs, result, move |l, r| {
+                    l.wrapping_mul(left_factor)
+                        .wrapping_sub(r.wrapping_mul(right_factor))
+                })
+            };
+        }
+        let sum = DecimalSum::new(left.1, right.1, answer)?;
+        exact_decimal_rows(self, rhs, result, |l, r| sum.subtract(l, r))
+    }
+
     /// Divides this decimal column by `rhs`, answering `result`'s decimal type exactly.
     ///
     /// Each side keeps its own scale. A quotient is rounded half away from zero at
@@ -338,20 +384,81 @@ impl Decimal128Array {
     /// Returns [`DaftError::ValueError`] for lengths that cannot broadcast, and
     /// [`DaftError::TypeError`] when `result` is not a decimal type.
     pub fn multiply_exactly(&self, rhs: &Self, result: &DataType) -> DaftResult<Self> {
-        let product = DecimalProduct::new(
-            decimal_scale(self.data_type())?,
-            decimal_scale(rhs.data_type())?,
-            DecimalAnswer::of(result)?,
-        )?;
+        let (left, right) = (
+            decimal_type(self.data_type())?,
+            decimal_type(rhs.data_type())?,
+        );
+        let answer = DecimalAnswer::of(result)?;
+        if DecimalProduct::always_fits(left, right, answer) {
+            return decimal_rows_that_always_fit(self, rhs, result, i128::wrapping_mul);
+        }
+        let product = DecimalProduct::new(left.1, right.1, answer)?;
         exact_decimal_rows(self, rhs, result, |l, r| product.of(l, r))
     }
 }
 
 fn decimal_scale(dtype: &DataType) -> DaftResult<usize> {
+    decimal_type(dtype).map(|(_, scale)| scale)
+}
+
+/// A decimal operand's `(precision, scale)`.
+fn decimal_type(dtype: &DataType) -> DaftResult<(usize, usize)> {
     match dtype {
-        DataType::Decimal128(_, scale) => Ok(*scale),
+        DataType::Decimal128(precision, scale) => Ok((*precision, *scale)),
         other => Err(DaftError::TypeError(format!(
             "Expected a decimal operand, not {other}"
+        ))),
+    }
+}
+
+/// `10^(s_max − s1)` and `10^(s_max − s2)`, which carry each side to the larger scale.
+fn aligning_factors(left_scale: usize, right_scale: usize) -> (i128, i128) {
+    let scale = left_scale.max(right_scale);
+    // Both exponents are at most 38, so each power fits 128 bits.
+    let power = |exponent: usize| 10_i128.pow((scale - exponent) as u32);
+    (power(left_scale), power(right_scale))
+}
+
+/// Applies `op` to every pair of values, broadcasting a single value on either side,
+/// where the result type provably holds every answer.
+///
+/// No row is checked and the loop has no branch, so it vectorizes; the result's
+/// validity is the inputs'. Values under a null are computed but never read, which is
+/// why `op` must not panic: it wraps.
+#[inline(never)]
+fn decimal_rows_that_always_fit<F>(
+    lhs: &Decimal128Array,
+    rhs: &Decimal128Array,
+    result: &DataType,
+    op: F,
+) -> DaftResult<Decimal128Array>
+where
+    F: Fn(i128, i128) -> i128 + Copy,
+{
+    let field = Arc::new(Field::new(lhs.name(), result.clone()));
+    let (lhs_values, rhs_values) = (lhs.values(), rhs.values());
+    match (lhs.len(), rhs.len()) {
+        (a, b) if a == b => {
+            let values = zip(lhs_values.iter(), rhs_values.iter()).map(|(l, r)| op(*l, *r));
+            Decimal128Array::from_field_and_values(field, values)
+                .with_nulls(NullBuffer::union(lhs.nulls(), rhs.nulls()))
+        }
+        (len, 1) => match rhs.get(0) {
+            None => Ok(Decimal128Array::full_null(lhs.name(), result, len)),
+            Some(r) => {
+                Decimal128Array::from_field_and_values(field, lhs_values.iter().map(|l| op(*l, r)))
+                    .with_nulls(lhs.nulls().cloned())
+            }
+        },
+        (1, len) => match lhs.get(0) {
+            None => Ok(Decimal128Array::full_null(lhs.name(), result, len)),
+            Some(l) => {
+                Decimal128Array::from_field_and_values(field, rhs_values.iter().map(|r| op(l, *r)))
+                    .with_nulls(rhs.nulls().cloned())
+            }
+        },
+        (a, b) => Err(DaftError::ValueError(format!(
+            "Cannot apply operation on arrays of different lengths: {a} vs {b}"
         ))),
     }
 }

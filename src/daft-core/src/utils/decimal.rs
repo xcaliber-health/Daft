@@ -1,5 +1,5 @@
 //! Exact decimal arithmetic: collapses (sums, means and percentiles) and the
-//! row-wise quotient and product.
+//! row-wise sum, difference, quotient and product.
 //!
 //! A decimal is held as an integer of unscaled units at a fixed scale. Every
 //! answer here is exact while it fits its type, rounds half away from zero where
@@ -466,6 +466,17 @@ pub struct DecimalProduct {
 }
 
 impl DecimalProduct {
+    /// Whether every product of a `left` and a `right` decimal, each `(precision,
+    /// scale)`, fits `answer` exactly, so that no row needs a check or rounding.
+    ///
+    /// True when `answer` is the exact product type, `(p1 + p2, s1 + s2)` or wider:
+    /// a `p1`-digit value times a `p2`-digit value has at most `p1 + p2` digits, which
+    /// also bounds its 128-bit intermediate.
+    #[must_use]
+    pub fn always_fits(left: (usize, usize), right: (usize, usize), answer: DecimalAnswer) -> bool {
+        answer.scale == left.1 + right.1 && answer.precision >= left.0 + right.0
+    }
+
     /// Prepares the product of values at `left_scale` and `right_scale`, answering `answer`.
     ///
     /// # Errors
@@ -508,6 +519,124 @@ impl DecimalProduct {
             }
         };
         self.answer.holds(product)
+    }
+}
+
+/// The sum or difference of two decimal columns at a result type, row by row.
+///
+/// Both sides are carried to the larger of their scales, `s_max`, and combined
+/// exactly there. A result scale below `s_max` (a capped type) divides the result
+/// down once, rounding half away from zero, so it never rounds each side
+/// separately. Each row computes in 128 bits, and moves to 256 bits only when the
+/// aligned values or their sum overflow 128, so no row wraps.
+#[derive(Clone, Copy, Debug)]
+pub struct DecimalSum {
+    /// `10^(s_max − s1)`.
+    left_factor: ScaleFactor,
+    /// `10^(s_max − s2)`.
+    right_factor: ScaleFactor,
+    /// Both sides already share a scale, so they combine without a rescale.
+    same_scale: bool,
+    /// `10^(s_max − s)`; one when the result keeps every place.
+    reduction: ScaleFactor,
+    answer: DecimalAnswer,
+}
+
+impl DecimalSum {
+    /// Whether every sum or difference of a `left` and a `right` decimal, each
+    /// `(precision, scale)`, fits `answer` exactly, so that no row needs a check or
+    /// rounding.
+    ///
+    /// True when `answer` is the exact type, `(max(p1 − s1, p2 − s2) + max(s1, s2) + 1,
+    /// max(s1, s2))` or wider: both sides then align to that scale and combine within
+    /// 38 digits, which also bounds the 128-bit intermediates.
+    #[must_use]
+    pub fn always_fits(left: (usize, usize), right: (usize, usize), answer: DecimalAnswer) -> bool {
+        let scale = left.1.max(right.1);
+        let integer_digits = (left.0 - left.1).max(right.0 - right.1) + 1;
+        answer.scale == scale && answer.precision >= integer_digits + scale
+    }
+
+    /// Prepares the sum of values at `left_scale` and `right_scale`, answering `answer`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaftError::InternalError`] when the answer has more places than
+    /// either side, which no result type asks for.
+    pub fn new(left_scale: usize, right_scale: usize, answer: DecimalAnswer) -> DaftResult<Self> {
+        let aligned_scale = left_scale.max(right_scale);
+        let reduction = aligned_scale.checked_sub(answer.scale).ok_or_else(|| {
+            DaftError::InternalError(format!(
+                "A decimal sum at scale {aligned_scale} cannot answer scale {}",
+                answer.scale
+            ))
+        })?;
+        Ok(Self {
+            left_factor: ScaleFactor::of(aligned_scale - left_scale)?,
+            right_factor: ScaleFactor::of(aligned_scale - right_scale)?,
+            same_scale: left_scale == right_scale,
+            reduction: ScaleFactor::of(reduction)?,
+            answer,
+        })
+    }
+
+    /// `left + right` in unscaled units of the answer, rounded half away from zero.
+    ///
+    /// Answers `None` when the sum does not fit the answer.
+    #[must_use]
+    pub fn add(&self, left: i128, right: i128) -> Option<i128> {
+        self.combine(left, right, i128::checked_add, i256::checked_add)
+    }
+
+    /// `left − right` in unscaled units of the answer, rounded half away from zero.
+    ///
+    /// Answers `None` when the difference does not fit the answer.
+    #[must_use]
+    pub fn subtract(&self, left: i128, right: i128) -> Option<i128> {
+        self.combine(left, right, i128::checked_sub, i256::checked_sub)
+    }
+
+    #[inline]
+    fn combine(
+        &self,
+        left: i128,
+        right: i128,
+        narrow: fn(i128, i128) -> Option<i128>,
+        wide: fn(i256, i256) -> Option<i256>,
+    ) -> Option<i128> {
+        // Equal scales, the common case, combine directly, as arrow-rs does: skipping
+        // the multiply by one is about 40% of the per-row cost.
+        let aligned = if self.same_scale {
+            narrow(left, right)
+        } else {
+            self.left_factor
+                .narrow
+                .and_then(|factor| left.checked_mul(factor))
+                .zip(
+                    self.right_factor
+                        .narrow
+                        .and_then(|factor| right.checked_mul(factor)),
+                )
+                .and_then(|(left, right)| narrow(left, right))
+        };
+        let combined = match aligned {
+            Some(combined) if self.reduction.is_one() => combined,
+            Some(combined) => match self.reduction.narrow {
+                Some(reduction) => divide_rounding_half_away_narrow(combined, reduction)?,
+                None => divide_rounding_half_away(i256::from_i128(combined), self.reduction.wide)
+                    .ok()?
+                    .to_i128()?,
+            },
+            None => {
+                // Two 38-digit values aligned to a common scale stay within 76 digits.
+                let left = i256::from_i128(left).checked_mul(self.left_factor.wide)?;
+                let right = i256::from_i128(right).checked_mul(self.right_factor.wide)?;
+                divide_rounding_half_away(wide(left, right)?, self.reduction.wide)
+                    .ok()?
+                    .to_i128()?
+            }
+        };
+        self.answer.holds(combined)
     }
 }
 
@@ -797,5 +926,104 @@ mod tests {
         let refused = DecimalProduct::new(1, 1, answer(38, 3));
 
         assert!(matches!(refused, Err(DaftError::InternalError(_))));
+    }
+
+    fn sum(left_scale: usize, right_scale: usize, answer: DecimalAnswer) -> DecimalSum {
+        DecimalSum::new(left_scale, right_scale, answer).expect("a sum")
+    }
+
+    #[rstest]
+    // 1.50 + 0.25 at scales 2 and 2.
+    #[case::same_scales(150, 2, 25, 2, answer(10, 2), 175)]
+    // 1.50 at scale 2 + 0.250000 at scale 6 = 1.750000.
+    #[case::different_scales(150, 2, 250_000, 6, answer(38, 6), 1_750_000)]
+    // 1.50 + (−0.250000) = 1.250000.
+    #[case::negative_operand(150, 2, -250_000, 6, answer(38, 6), 1_250_000)]
+    // Capped at scale 5: 1.234565 + 0 → 1.23457, half away from zero.
+    #[case::lowered_rounds_up(1_234_565, 6, 0, 6, answer(38, 5), 123_457)]
+    #[case::lowered_rounds_negative_away(-1_234_565, 6, 0, 6, answer(38, 5), -123_457)]
+    #[case::lowered_rounds_down(1_234_564, 6, 0, 6, answer(38, 5), 123_456)]
+    fn sums_are_exact(
+        #[case] left: i128,
+        #[case] left_scale: usize,
+        #[case] right: i128,
+        #[case] right_scale: usize,
+        #[case] answer: DecimalAnswer,
+        #[case] expected: i128,
+    ) {
+        let sum = sum(left_scale, right_scale, answer);
+
+        assert_eq!(sum.add(left, right), Some(expected));
+    }
+
+    #[rstest]
+    #[case::exact(150, 25, 125)]
+    #[case::below_zero(25, 150, -125)]
+    fn differences_are_exact(#[case] left: i128, #[case] right: i128, #[case] expected: i128) {
+        let sum = sum(2, 2, answer(10, 2));
+
+        assert_eq!(sum.subtract(left, right), Some(expected));
+    }
+
+    #[test]
+    fn a_sum_past_128_bits_is_reduced_exactly() {
+        // (10^38 − 1) at scale 0 aligned to scale 2 overflows 128 bits; at a capped
+        // scale 0 the sum of it and 1 is 10^38, which still exceeds 38 digits.
+        let sum = sum(0, 2, answer(38, 0));
+
+        assert_eq!(sum.add(MAX_38, 100), None);
+        // 10^37 at scale 0 aligns to 10^39 at scale 2, past 128 bits; adding 10^36
+        // (10^38 at scale 2) and reducing back to scale 0 answers 1.1 × 10^37 exactly.
+        assert_eq!(
+            sum.add(10_i128.pow(37), 10_i128.pow(38)),
+            Some(11 * 10_i128.pow(36))
+        );
+    }
+
+    #[rstest]
+    // 99.99 + 0.01 does not fit (4, 2).
+    #[case::past_the_precision(9_999, 1)]
+    // −99.99 − 0.01 does not fit either.
+    #[case::past_the_precision_below_zero(-9_999, -1)]
+    fn sums_without_an_answer_are_null(#[case] left: i128, #[case] right: i128) {
+        let sum = sum(2, 2, answer(4, 2));
+
+        assert_eq!(sum.add(left, right), None);
+    }
+
+    #[test]
+    fn a_sum_cannot_answer_more_places_than_it_has() {
+        let refused = DecimalSum::new(2, 3, answer(38, 4));
+
+        assert!(matches!(refused, Err(DaftError::InternalError(_))));
+    }
+
+    #[rstest]
+    #[case::exact_type((10, 2), (10, 2), answer(11, 2), true)]
+    #[case::wider_type((10, 2), (10, 4), answer(38, 4), true)]
+    #[case::one_digit_short((10, 2), (10, 2), answer(10, 2), false)]
+    // (18, 2) + (38, 6) is capped at (38, 6): 33 integer digits do not fit 32.
+    #[case::capped((18, 2), (38, 6), answer(38, 6), false)]
+    #[case::lowered_scale((38, 10), (30, 2), answer(38, 9), false)]
+    fn a_sum_always_fits_only_its_exact_type(
+        #[case] left: (usize, usize),
+        #[case] right: (usize, usize),
+        #[case] answer: DecimalAnswer,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(DecimalSum::always_fits(left, right, answer), expected);
+    }
+
+    #[rstest]
+    #[case::exact_type((18, 2), (18, 2), answer(36, 4), true)]
+    #[case::capped((18, 2), (38, 6), answer(38, 6), false)]
+    #[case::lowered_scale((38, 4), (23, 2), answer(38, 6), false)]
+    fn a_product_always_fits_only_its_exact_type(
+        #[case] left: (usize, usize),
+        #[case] right: (usize, usize),
+        #[case] answer: DecimalAnswer,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(DecimalProduct::always_fits(left, right, answer), expected);
     }
 }

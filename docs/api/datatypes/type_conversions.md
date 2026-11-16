@@ -149,3 +149,22 @@ To check the inferred DataType for a Python object, use [`DataType.infer_from_ob
 | `numpy.ndarray`<br>`torch.Tensor`<br>`tensorflow.Tensor`<br>`jax.Array`<br>`cupy.ndarray`<br><br>with numpy dtype `T` | Tensor[T] |
 | `numpy.datetime64` with `U` = [datetime unit](https://numpy.org/doc/stable/reference/arrays.datetime.html#datetime-units) | - Date if `U` = "Y", "M", "W", or "D"<br>- Timestamp[s] if `U` = "h", "m", or "s"<br>- Timestamp[ms] if `U` = "ms"<br>- Timestamp[us] if `U` = "us"<br>- Timestamp[ns] if `U` = "ns", "ps", "fs", or "as" |
 | `PIL.Image.Image` with `M` = [image mode](https://pillow.readthedocs.io/en/stable/handbook/concepts.html#concept-modes) | Image[M]<br>(supported modes: L, LA, RGB, RGBA) |
+
+## Decimal Arithmetic
+
+Arithmetic between two decimals answers a decimal, computed exactly. An integer operand takes part as the narrowest decimal that holds its type: for example, `Int64` is `Decimal128[precision=20, scale=0]`. A decimal combined with a float answers a float.
+
+For `Decimal128[p1, s1]` and `Decimal128[p2, s2]`, the result type is:
+
+| **Operator** | **Precision**                           | **Scale**              |
+|--------------|-----------------------------------------|------------------------|
+| `+`, `-`     | `max(p1 - s1, p2 - s2) + max(s1, s2) + 1` | `max(s1, s2)`          |
+| `*`          | `p1 + p2`                               | `s1 + s2`              |
+| `/`          | `p1 - s1 + s2 + max(6, s1 + p2 + 1)`    | `max(6, s1 + p2 + 1)`  |
+
+**Capping:** a precision over 38 is capped at 38. The integer digits are kept and the scale is lowered to make room, but never below `min(scale, 6)`. This is the rule SQL Server, Hive and Spark use.
+
+**Values:**
+
+- A result with more places than its type keeps is rounded half away from zero.
+- A result that does not fit its type is null, as is a quotient whose divisor is zero.

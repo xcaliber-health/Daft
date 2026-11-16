@@ -2564,6 +2564,28 @@ impl Expr {
         })
     }
 
+    /// Whether the expression has one value for every row: it reads no column, holds no
+    /// aggregation, window or subquery, and is deterministic.
+    ///
+    /// A literal is constant, and so is a cast of one or an operator or deterministic
+    /// function over constants alone.
+    #[must_use]
+    pub fn is_constant(self: &Arc<Self>) -> bool {
+        self.is_deterministic()
+            && !self.exists(|e| {
+                matches!(
+                    e.as_ref(),
+                    Self::Column(..)
+                        | Self::Agg(..)
+                        | Self::Over(..)
+                        | Self::WindowFunction(..)
+                        | Self::Subquery(..)
+                        | Self::InSubquery(..)
+                        | Self::Exists(..)
+                )
+            })
+    }
+
     /// Returns the expression as SQL using PostgreSQL's dialect.
     pub fn to_sql(&self) -> Option<String> {
         fn to_sql_inner<W: Write>(expr: &Expr, buffer: &mut W) -> io::Result<()> {

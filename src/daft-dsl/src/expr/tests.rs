@@ -296,3 +296,28 @@ mod selectivity {
         );
     }
 }
+
+mod constants {
+    use rstest::rstest;
+
+    use super::*;
+
+    fn two_as_int64() -> ExprRef {
+        lit(2).cast(&DataType::Int64)
+    }
+
+    #[rstest]
+    #[case::literal(lit(2), true)]
+    #[case::cast_literal(two_as_int64(), true)]
+    #[case::literals_combined(lit(2).add(lit(0)), true)]
+    #[case::date_from_text(lit("2020-01-01").cast(&DataType::Date), true)]
+    #[case::column(resolved_col("a"), false)]
+    #[case::column_and_literal(resolved_col("a").add(two_as_int64()), false)]
+    #[case::aggregation_of_a_literal(Arc::new(Expr::Agg(AggExpr::Sum(lit(1)))), false)]
+    fn a_constant_reads_no_column_and_aggregates_nothing(
+        #[case] expr: ExprRef,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(expr.is_constant(), expected);
+    }
+}

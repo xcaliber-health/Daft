@@ -202,8 +202,11 @@ impl Project {
                             // If not previously seen, continue recursing down children
                             expr.children()
                         } else {
-                            // If previously seen, cache the expression (if it involves computation)
+                            // If previously seen, cache the expression if it involves computation.
+                            // A constant is never cached: it is cheap to evaluate where it is used,
+                            // and a function that needs a constant argument must still receive one.
                             if optimization::requires_computation(expr)
+                                && !expr.is_constant()
                                 && !expr.exists(|e| {
                                     matches!(
                                         e.as_ref(),
@@ -809,6 +812,28 @@ mod tests {
         };
         assert_eq!(third_projection.projection, expected_third_projection);
 
+        Ok(())
+    }
+
+    /// A constant used by two expressions is not cached into a projection below: it stays
+    /// a constant where it is used.
+    #[test]
+    fn a_repeated_constant_is_not_cached() -> DaftResult<()> {
+        let source = dummy_scan_node(dummy_scan_operator(vec![
+            Field::new("a", DataType::Int64),
+            Field::new("b", DataType::Int64),
+        ]))
+        .build();
+        let two = lit(2).cast(&DataType::Int64);
+        let expressions = vec![
+            binary_op(Operator::Plus, resolved_col("a"), two.clone()).alias("x"),
+            binary_op(Operator::Plus, resolved_col("b"), two).alias("y"),
+        ];
+
+        let projection = Project::try_new(source.clone(), expressions.clone())?;
+
+        assert_eq!(projection.projection, expressions);
+        assert!(matches!(projection.input.as_ref(), LogicalPlan::Source(_)));
         Ok(())
     }
 

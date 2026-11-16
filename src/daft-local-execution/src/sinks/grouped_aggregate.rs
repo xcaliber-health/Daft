@@ -426,18 +426,17 @@ impl GroupedAggregateSink {
             ));
         }
 
-        let final_group_by = if !partial_agg_exprs.is_empty() {
-            group_by
-                .iter()
-                .enumerate()
-                .map(|(i, e)| {
-                    let field = e.as_ref().to_field(input_schema)?;
-                    Ok(BoundExpr::new_unchecked(bound_col(i, field)))
-                })
-                .collect::<DaftResult<Vec<_>>>()?
-        } else {
-            group_by.to_vec()
-        };
+        // A partial aggregate lays its group keys out first, at positions 0..n, whether or
+        // not it computes any aggregations; a keys-only grouping produces partials too. The
+        // final stage therefore reads the keys at those positions, never at the input's.
+        let final_group_by = group_by
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let field = e.as_ref().to_field(input_schema)?;
+                Ok(BoundExpr::new_unchecked(bound_col(i, field)))
+            })
+            .collect::<DaftResult<Vec<_>>>()?;
 
         let strategy = if has_map_groups {
             // Always use partition-only for MapGroups so that we only hash-partition
@@ -541,8 +540,14 @@ impl BlockingSink for GroupedAggregateSink {
                                 }
                             }
 
-                            // If we have no partially aggregated partitions, aggregate the unaggregated partitions using the original aggregations
-                            if params.partial_agg_exprs.is_empty() && !unaggregated.is_empty() {
+                            // If only raw rows were buffered and the aggregations have no partial stage,
+                            // aggregate the raw rows once with the original aggregations. A keys-only
+                            // grouping also has no partial stage but can hold partials, which the
+                            // branches below combine.
+                            if params.partial_agg_exprs.is_empty()
+                                && partially_aggregated.is_empty()
+                                && !unaggregated.is_empty()
+                            {
                                 let concated = MicroPartition::concat(unaggregated)?;
                                 let agged = concated
                                     .agg(&params.original_aggregations, &params.group_by)?;

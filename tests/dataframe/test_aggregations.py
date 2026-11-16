@@ -1191,3 +1191,116 @@ def test_groupby_agg_concat_list_with_delimiter_raises(make_df):
     with pytest.raises(Exception) as exc_info:
         df.groupby("b").string_agg("a", delimiter=",").collect()
     assert "Concat Agg delimiter is only supported for Utf8 types" in str(exc_info.value)
+
+
+# A grouping with keys and no aggregations runs through the same two-stage operator as any
+# other grouping. Each case is forced down one of its three paths: few groups (aggregate each
+# batch, then partition), many groups with raw rows only, and many groups where a partition
+# holds both partially aggregated and raw rows.
+KEYS_ONLY_PATHS = [
+    pytest.param({"high_cardinality_aggregation_threshold": 1.1}, id="few-groups"),
+    pytest.param(
+        {"high_cardinality_aggregation_threshold": 0.0, "partial_aggregation_threshold": 10**9},
+        id="many-groups-raw",
+    ),
+    pytest.param(
+        {"high_cardinality_aggregation_threshold": 0.0, "partial_aggregation_threshold": 7},
+        id="many-groups-partial-and-raw",
+    ),
+]
+
+KEYS_ONLY_SHAPES = [
+    pytest.param({"c": ["x"] * 12, "p": [f"p{i % 4}" for i in range(12)]}, ["p", "c"], id="constant-key-last-in-input"),
+    pytest.param(
+        {"p": [i % 7 for i in range(10_000)], "c": ["abc"[i % 3] for i in range(10_000)]},
+        ["c", "p"],
+        id="few-distinct-values",
+    ),
+    pytest.param(
+        {"c": ["abc"[i % 3] for i in range(600)], "s": [i % 2 for i in range(600)], "p": [i % 50 for i in range(600)]},
+        ["p", "c", "s"],
+        id="three-keys-out-of-order",
+    ),
+    pytest.param({"c": [i % 3 for i in range(5_000)], "p": list(range(5_000))}, ["p", "c"], id="many-distinct-keys"),
+    pytest.param(
+        {"p": [i % 4 for i in range(100)], "c": [i % 5 for i in range(100)]}, ["p", "c"], id="keys-in-input-order"
+    ),
+    pytest.param({"c": ["x"] * 50, "p": [i % 9 for i in range(50)]}, ["p"], id="single-key"),
+]
+
+
+def _rows(table: dict[str, list], columns: list[str]) -> list[tuple]:
+    return sorted(zip(*(table[name] for name in columns)))
+
+
+@pytest.mark.parametrize("data, keys", KEYS_ONLY_SHAPES)
+@pytest.mark.parametrize("config", KEYS_ONLY_PATHS)
+def test_a_keys_only_grouping_answers_its_keys_in_order(data, keys, config) -> None:
+    frame = daft.from_pydict(data)
+    expected = sorted(set(zip(*(data[name] for name in keys))))
+
+    with daft.context.execution_config_ctx(**config):
+        grouped = frame.groupby(*keys).agg()
+        answered = grouped.to_pydict()
+
+    assert grouped.schema().column_names() == keys
+    assert list(answered) == keys
+    assert _rows(answered, keys) == expected
+
+
+@pytest.mark.parametrize("data, keys", KEYS_ONLY_SHAPES)
+@pytest.mark.parametrize("config", KEYS_ONLY_PATHS)
+def test_a_keys_only_grouping_equals_the_distinct_keys(data, keys, config) -> None:
+    frame = daft.from_pydict(data)
+
+    with daft.context.execution_config_ctx(**config):
+        grouped = frame.groupby(*keys).agg().to_pydict()
+        distinct = frame.select(*keys).distinct().to_pydict()
+        counted = frame.groupby(*keys).agg(col(keys[0]).count().alias("n")).to_pydict()
+
+    assert _rows(grouped, keys) == _rows(distinct, keys) == _rows(counted, keys)
+
+
+@pytest.mark.parametrize("config", KEYS_ONLY_PATHS)
+def test_a_keys_only_grouping_folds_and_joins_back_by_its_key(config) -> None:
+    events = daft.from_pydict({"c": ["x"] * 8, "p": ["p1", "p1", "p2", "p3", "p3", "p3", "p2", "p1"]})
+    subjects = daft.from_pydict({"p": ["p1", "p2", "p3", "p4"]})
+
+    with daft.context.execution_config_ctx(**config):
+        folded = events.groupby("p", "c").agg().groupby("p").agg(col("c").count().alias("n"))
+        joined = subjects.join(folded, on="p", how="left").sort("p").to_pydict()
+
+    assert joined == {"p": ["p1", "p2", "p3", "p4"], "n": [1, 1, 1, None]}
+
+
+def _mixed_keys(rows: int, distinct: int) -> dict[str, list]:
+    """Six key columns of different types, in an order the grouping does not use."""
+    import datetime
+
+    ids = [i % distinct for i in range(rows)]
+    return {
+        "when": [datetime.datetime(2020, 1, 1) + datetime.timedelta(seconds=i) for i in ids],
+        "name": [f"n{i}" for i in ids],
+        "score": [i / 4 for i in ids],
+        "day": [datetime.date(2020, 1, 1) + datetime.timedelta(days=i % 1000) for i in ids],
+        "maybe": [None if i % 5 == 1 else i % 11 for i in ids],
+        "id": ids,
+    }
+
+
+MIXED_KEYS = ["id", "name", "score", "when", "day", "maybe"]
+
+
+@pytest.mark.parametrize("distinct", [1, 9_999, 10_001, 400_000])
+def test_a_keys_only_grouping_of_mixed_types_equals_the_distinct_keys(distinct) -> None:
+    data = _mixed_keys(max(distinct, 20_000), distinct)
+    frame = daft.from_pydict(data)
+
+    grouped = frame.groupby(*MIXED_KEYS).agg()
+    answered = grouped.to_pydict()
+    distinct_rows = frame.select(*MIXED_KEYS).distinct().to_pydict()
+
+    assert grouped.schema().column_names() == MIXED_KEYS
+    assert list(answered) == MIXED_KEYS
+    assert len(answered["id"]) == distinct
+    assert _rows(answered, MIXED_KEYS) == _rows(distinct_rows, MIXED_KEYS)

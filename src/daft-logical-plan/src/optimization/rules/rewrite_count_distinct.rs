@@ -3,7 +3,7 @@ use std::sync::Arc;
 use common_error::DaftResult;
 use common_treenode::{Transformed, TreeNode};
 use daft_core::prelude::CountMode;
-use daft_dsl::{AggExpr, Expr, resolved_col};
+use daft_dsl::{AggExpr, Column, Expr, ExprRef, ResolvedColumn, resolved_col};
 
 use super::OptimizerRule;
 use crate::{
@@ -57,7 +57,7 @@ impl OptimizerRule for RewriteCountDistinct {
             let sub_expr_name = sub_expr.semantic_id(aggregate.input.schema().as_ref()).id;
 
             // TODO: UNDO
-            let input_node = if sub_expr.has_compute() {
+            let input_node = if !reads_input_column(&sub_expr, &sub_expr_name) {
                 // We need to create a project node to make this a permanent column
                 // Otherwise, distinct with only use it for the groupby and not include in the output
                 // Ideally, projection pushdown will clean this up
@@ -87,6 +87,23 @@ impl OptimizerRule for RewriteCountDistinct {
             Ok(Transformed::yes(count_node))
         })
     }
+}
+
+/// Whether `expr` is a bare read of the input column `name`, so that no projection is
+/// needed to make `name` a column the distinct can read.
+///
+/// Decided by shape, not by `name` being in the input's schema: `not(b) as b` is named
+/// like the input column `b` but isn't it, and reading `b` would count the wrong values.
+/// Aliases are unwrapped first; any other expression must be projected.
+fn reads_input_column(expr: &ExprRef, name: &str) -> bool {
+    let mut expr = expr;
+    while let Expr::Alias(inner, _) = expr.as_ref() {
+        expr = inner;
+    }
+    matches!(
+        expr.as_ref(),
+        Expr::Column(Column::Resolved(ResolvedColumn::Basic(column))) if column.as_ref() == name
+    )
 }
 
 #[cfg(test)]
@@ -243,6 +260,60 @@ mod tests {
                         .count(CountMode::Valid)
                         .alias("a_plus_b_count_distinct"),
                 ],
+                vec![],
+            )?
+            .build();
+
+        assert_optimized_plan_eq(plan, expected)?;
+        Ok(())
+    }
+
+    // A wrapper the scheduler calls compute-free (`is_null` of a column) still needs
+    // its own column to be counted distinctly.
+    #[test]
+    fn rewrite_count_distinct_of_a_compute_free_expression_projects_it() -> DaftResult<()> {
+        let scan_op = dummy_scan_operator(vec![
+            Field::new("a", DataType::Int64),
+            Field::new("b", DataType::Int64),
+        ]);
+
+        let plan = dummy_scan_node(scan_op.clone())
+            .aggregate(vec![unresolved_col("a").is_null().count_distinct()], vec![])?
+            .build();
+
+        let expected = dummy_scan_node(scan_op)
+            .select(vec![unresolved_col("a").is_null().alias("a.is_null()")])?
+            .distinct(Some(vec![unresolved_col("a.is_null()")]))?
+            .aggregate(
+                vec![unresolved_col("a.is_null()").count(CountMode::Valid)],
+                vec![],
+            )?
+            .build();
+
+        assert_optimized_plan_eq(plan, expected)?;
+        Ok(())
+    }
+
+    // An expression aliased to an input column's name is not that column: it is projected.
+    #[test]
+    fn rewrite_count_distinct_of_an_expression_named_like_a_column_projects_it() -> DaftResult<()> {
+        let scan_op = dummy_scan_operator(vec![
+            Field::new("a", DataType::Int64),
+            Field::new("b", DataType::Boolean),
+        ]);
+
+        let plan = dummy_scan_node(scan_op.clone())
+            .aggregate(
+                vec![unresolved_col("b").not().alias("b").count_distinct()],
+                vec![],
+            )?
+            .build();
+
+        let expected = dummy_scan_node(scan_op)
+            .select(vec![unresolved_col("b").not().alias("b.not()")])?
+            .distinct(Some(vec![unresolved_col("b.not()")]))?
+            .aggregate(
+                vec![unresolved_col("b.not()").count(CountMode::Valid)],
                 vec![],
             )?
             .build();

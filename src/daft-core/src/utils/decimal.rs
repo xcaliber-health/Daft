@@ -1,10 +1,16 @@
-//! Exact arithmetic for collapsing decimals: sums, means and percentiles.
+//! Exact decimal arithmetic: collapses (sums, means and percentiles) and the
+//! row-wise quotient and product.
 //!
-//! A decimal is held as an integer of unscaled units at a fixed scale. These
-//! collapses answer exactly while the answer fits its type, round half away from
-//! zero where the answer has more places than its type keeps, and refuse with an
-//! error where the answer does not fit. They never wrap and never answer null
-//! for values that are present: null already means that a group had no values.
+//! A decimal is held as an integer of unscaled units at a fixed scale. Every
+//! answer here is exact while it fits its type, rounds half away from zero where
+//! it has more places than its type keeps, and never wraps.
+//!
+//! The two families differ where an answer does not fit:
+//! - A collapse refuses with an error. It never answers null for values that are
+//!   present, because null already means that a group had no values.
+//! - A row answers null, as a decimal cast does, and so does a quotient whose
+//!   divisor is zero. A row error could not be guarded against, because a
+//!   conditional evaluates both of its branches over every row.
 
 use arrow::datatypes::i256;
 use common_error::{DaftError, DaftResult};
@@ -38,7 +44,7 @@ impl DecimalAnswer {
     pub fn of(dtype: &DataType) -> DaftResult<Self> {
         let DataType::Decimal128(precision, scale) = *dtype else {
             return Err(DaftError::TypeError(format!(
-                "A decimal collapse must answer a decimal, not {dtype}"
+                "A decimal answer must have a decimal type, not {dtype}"
             )));
         };
         let max = u32::try_from(precision)
@@ -78,6 +84,12 @@ impl DecimalAnswer {
                     self.precision, self.scale
                 ))
             })
+    }
+
+    /// Returns `value` when its magnitude fits this type, and `None` otherwise.
+    #[must_use]
+    pub fn holds(self, value: i128) -> Option<i128> {
+        (value.unsigned_abs() <= self.max.unsigned_abs()).then_some(value)
     }
 
     /// `10^(answer scale − input scale)`, the factor that carries an input value into the answer's scale.
@@ -310,6 +322,195 @@ pub fn exact_decimal_percentile_of(
     answer.fit(percentile, "percentile").map(Some)
 }
 
+/// Most digits a row-wise scale factor spans. `10^76` is the largest power of ten
+/// that fits 256 bits, and it covers every factor two 38-digit decimals can need.
+const MAX_FACTOR_DIGITS: usize = 76;
+
+/// A power of ten that carries a value between scales, in 128 bits when it fits.
+#[derive(Clone, Copy, Debug)]
+struct ScaleFactor {
+    narrow: Option<i128>,
+    wide: i256,
+}
+
+impl ScaleFactor {
+    /// `10^digits`.
+    fn of(digits: usize) -> DaftResult<Self> {
+        let wide = u32::try_from(digits)
+            .ok()
+            .filter(|_| digits <= MAX_FACTOR_DIGITS)
+            .and_then(|digits| i256::from_i128(10).checked_pow(digits))
+            .ok_or_else(|| {
+                DaftError::InternalError(format!(
+                    "A decimal scale factor of 10^{digits} does not fit 256 bits"
+                ))
+            })?;
+        Ok(Self {
+            narrow: wide.to_i128(),
+            wide,
+        })
+    }
+
+    /// Whether the factor is one, so that multiplying or dividing by it changes nothing.
+    fn is_one(self) -> bool {
+        self.narrow == Some(1)
+    }
+}
+
+/// Divides `numerator` by a nonzero `denominator` in 128 bits, rounding half away from zero.
+///
+/// It divides magnitudes, biased by half the divisor, so it rounds without a
+/// remainder or a branch: `⌊(n + ⌊d/2⌋) / d⌋` rounds up exactly when `2·(n mod d) ≥ d`.
+/// When both fit 64 bits, it uses a native 64-bit division, which costs a fraction
+/// of a 128-bit one. Answers `None` only for a magnitude of `2^127`, which no
+/// decimal reaches.
+fn divide_rounding_half_away_narrow(numerator: i128, denominator: i128) -> Option<i128> {
+    let divisor = denominator.unsigned_abs();
+    // At most 2^127 + 2^126, so the bias cannot overflow 128 bits.
+    let biased = numerator.unsigned_abs() + divisor / 2;
+    let magnitude = match (u64::try_from(biased), u64::try_from(divisor)) {
+        (Ok(biased), Ok(divisor)) => u128::from(biased / divisor),
+        _ => biased / divisor,
+    };
+    let magnitude = i128::try_from(magnitude).ok()?;
+    Some(if (numerator ^ denominator) < 0 {
+        -magnitude
+    } else {
+        magnitude
+    })
+}
+
+/// The quotient of two decimal columns at a result type, row by row.
+///
+/// The dividend (unscaled, at scale `s1`) and the divisor (at scale `s2`) keep
+/// their own scales. The quotient at result scale `s` is `dividend·10^k / divisor`
+/// with `k = s − s1 + s2`; when `k` is negative, the divisor is scaled by `10^−k`
+/// instead. Each row computes in 128 bits and moves to 256 bits only when a scaled
+/// operand overflows 128, so no row wraps.
+#[derive(Clone, Copy, Debug)]
+pub struct DecimalQuotient {
+    dividend_factor: ScaleFactor,
+    divisor_factor: ScaleFactor,
+    answer: DecimalAnswer,
+}
+
+impl DecimalQuotient {
+    /// Prepares the quotient of a dividend at `dividend_scale` by a divisor at
+    /// `divisor_scale`, answering `answer`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaftError::InternalError`] when a scale factor exceeds 256 bits,
+    /// which no pair of 38-digit decimals reaches.
+    pub fn new(
+        dividend_scale: usize,
+        divisor_scale: usize,
+        answer: DecimalAnswer,
+    ) -> DaftResult<Self> {
+        let raised = answer.scale + divisor_scale;
+        let (dividend_digits, divisor_digits) = match raised.checked_sub(dividend_scale) {
+            Some(digits) => (digits, 0),
+            None => (0, dividend_scale - raised),
+        };
+        Ok(Self {
+            dividend_factor: ScaleFactor::of(dividend_digits)?,
+            divisor_factor: ScaleFactor::of(divisor_digits)?,
+            answer,
+        })
+    }
+
+    /// `dividend / divisor` in unscaled units of the answer, rounded half away from zero.
+    ///
+    /// Answers `None` when the divisor is zero or the quotient does not fit the answer.
+    #[must_use]
+    pub fn of(&self, dividend: i128, divisor: i128) -> Option<i128> {
+        if divisor == 0 {
+            return None;
+        }
+        let narrow = self
+            .dividend_factor
+            .narrow
+            .and_then(|factor| dividend.checked_mul(factor))
+            .zip(
+                self.divisor_factor
+                    .narrow
+                    .and_then(|factor| divisor.checked_mul(factor)),
+            );
+        let quotient = match narrow {
+            Some((numerator, denominator)) => {
+                divide_rounding_half_away_narrow(numerator, denominator)?
+            }
+            None => {
+                let numerator = i256::from_i128(dividend).checked_mul(self.dividend_factor.wide)?;
+                let denominator = i256::from_i128(divisor).checked_mul(self.divisor_factor.wide)?;
+                divide_rounding_half_away(numerator, denominator)
+                    .ok()?
+                    .to_i128()?
+            }
+        };
+        self.answer.holds(quotient)
+    }
+}
+
+/// The product of two decimal columns at a result type, row by row.
+///
+/// The raw product of a value at scale `s1` and one at scale `s2` is already at
+/// scale `s1 + s2`. A result scale below that divides it down, rounding half away
+/// from zero. Each row computes in 128 bits and moves to 256 bits only when the
+/// product overflows 128, so no row wraps.
+#[derive(Clone, Copy, Debug)]
+pub struct DecimalProduct {
+    /// `10^(s1 + s2 − s)`; one when the result keeps every place.
+    reduction: ScaleFactor,
+    answer: DecimalAnswer,
+}
+
+impl DecimalProduct {
+    /// Prepares the product of values at `left_scale` and `right_scale`, answering `answer`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaftError::InternalError`] when the answer has more places than the
+    /// product, which no result type asks for.
+    pub fn new(left_scale: usize, right_scale: usize, answer: DecimalAnswer) -> DaftResult<Self> {
+        let product_scale = left_scale + right_scale;
+        let reduction = product_scale.checked_sub(answer.scale).ok_or_else(|| {
+            DaftError::InternalError(format!(
+                "A decimal product at scale {product_scale} cannot answer scale {}",
+                answer.scale
+            ))
+        })?;
+        Ok(Self {
+            reduction: ScaleFactor::of(reduction)?,
+            answer,
+        })
+    }
+
+    /// `left × right` in unscaled units of the answer, rounded half away from zero.
+    ///
+    /// Answers `None` when the product does not fit the answer.
+    #[must_use]
+    pub fn of(&self, left: i128, right: i128) -> Option<i128> {
+        let product = match left.checked_mul(right) {
+            Some(product) if self.reduction.is_one() => product,
+            Some(product) => match self.reduction.narrow {
+                Some(reduction) => divide_rounding_half_away_narrow(product, reduction)?,
+                None => divide_rounding_half_away(i256::from_i128(product), self.reduction.wide)
+                    .ok()?
+                    .to_i128()?,
+            },
+            None => {
+                // Two 38-digit values multiply to at most 76 digits, which fits 256 bits.
+                let product = i256::from_i128(left).checked_mul(i256::from_i128(right))?;
+                divide_rounding_half_away(product, self.reduction.wide)
+                    .ok()?
+                    .to_i128()?
+            }
+        };
+        self.answer.holds(product)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -470,5 +671,131 @@ mod tests {
             exact_decimal_percentile([None, None], median, 2, answer).expect("a percentile"),
             None
         );
+    }
+
+    fn quotient(
+        dividend_scale: usize,
+        divisor_scale: usize,
+        answer: DecimalAnswer,
+    ) -> DecimalQuotient {
+        DecimalQuotient::new(dividend_scale, divisor_scale, answer).expect("a quotient")
+    }
+
+    #[rstest]
+    // 6.00 / 2.00 and 9.20 / 9.20 at (18, 2) answer (37, 21).
+    #[case::three(600, 2, 200, 2, answer(37, 21), 3 * 10_i128.pow(21))]
+    #[case::one(920, 2, 920, 2, answer(37, 21), 10_i128.pow(21))]
+    #[case::six(150, 2, 25, 2, answer(37, 21), 6 * 10_i128.pow(21))]
+    // 1.500000 at (18, 6) / 0.25 at (18, 2) answers (37, 25).
+    #[case::mixed_scales(1_500_000, 6, 25, 2, answer(37, 25), 6 * 10_i128.pow(25))]
+    // 6.00 · 10^37 overflows 128 bits; the quotient 3 · 10^37 still fits 38 digits.
+    #[case::past_128_bits(600, 2, 200, 2, answer(38, 37), 3 * 10_i128.pow(37))]
+    // 1.0000000000 / 3 at scale 2: the divisor is scaled, not the dividend.
+    #[case::divisor_scaled(10_i128.pow(10), 10, 3, 0, answer(10, 2), 33)]
+    fn quotients_are_exact(
+        #[case] dividend: i128,
+        #[case] dividend_scale: usize,
+        #[case] divisor: i128,
+        #[case] divisor_scale: usize,
+        #[case] answer: DecimalAnswer,
+        #[case] expected: i128,
+    ) {
+        let quotient = quotient(dividend_scale, divisor_scale, answer);
+
+        assert_eq!(quotient.of(dividend, divisor), Some(expected));
+    }
+
+    #[rstest]
+    // 2 / 3 = 0.66666… → 0.6666666666667 at scale 13.
+    #[case::rounds_up(200, 300, 6_666_666_666_667)]
+    #[case::rounds_negative_away(-200, 300, -6_666_666_666_667)]
+    #[case::rounds_negative_divisor_away(200, -300, -6_666_666_666_667)]
+    // 1 / 3 = 0.33333… → 0.3333333333333.
+    #[case::rounds_down(100, 300, 3_333_333_333_333)]
+    // 1 / 8 = 0.125 exactly.
+    #[case::exact(100, 800, 1_250_000_000_000)]
+    fn quotients_round_half_away_from_zero(
+        #[case] dividend: i128,
+        #[case] divisor: i128,
+        #[case] expected: i128,
+    ) {
+        let quotient = quotient(2, 2, answer(21, 13));
+
+        assert_eq!(quotient.of(dividend, divisor), Some(expected));
+    }
+
+    #[rstest]
+    #[case::zero_divisor(100, 0)]
+    // 99999999.99 / 0.01 = 9999999999 needs 23 digits at scale 13.
+    #[case::past_the_precision(9_999_999_999, 1)]
+    fn quotients_without_an_answer_are_null(#[case] dividend: i128, #[case] divisor: i128) {
+        let quotient = quotient(2, 2, answer(21, 13));
+
+        assert_eq!(quotient.of(dividend, divisor), None);
+    }
+
+    fn product(left_scale: usize, right_scale: usize, answer: DecimalAnswer) -> DecimalProduct {
+        DecimalProduct::new(left_scale, right_scale, answer).expect("a product")
+    }
+
+    const NINE_E17: i128 = 900_000_000_000_000_000;
+
+    #[rstest]
+    #[case::exact(150, 200, answer(36, 4), 30_000)]
+    #[case::negative(-150, 200, answer(36, 4), -30_000)]
+    // 9000000000000000.00² = 8.1 · 10^31, at scale 4.
+    #[case::large(
+        NINE_E17,
+        NINE_E17,
+        answer(36, 4),
+        810_000_000_000_000_000_000_000_000_000_000_000
+    )]
+    // 1.25 × 0.10 = 0.125 → 0.13; 1.24 × 0.10 = 0.124 → 0.12.
+    #[case::reduced_rounds_up(125, 10, answer(38, 2), 13)]
+    #[case::reduced_rounds_negative_away(-125, 10, answer(38, 2), -13)]
+    #[case::reduced_rounds_down(124, 10, answer(38, 2), 12)]
+    fn products_are_exact(
+        #[case] left: i128,
+        #[case] right: i128,
+        #[case] answer: DecimalAnswer,
+        #[case] expected: i128,
+    ) {
+        let product = product(2, 2, answer);
+
+        assert_eq!(product.of(left, right), Some(expected));
+    }
+
+    #[test]
+    fn a_product_past_128_bits_is_reduced_exactly() {
+        // 10^10 · 10^10 at scale 10 each is 10^40 at scale 20; at scale 2 it is 10^22.
+        let product = product(10, 10, answer(38, 2));
+
+        assert_eq!(
+            product.of(10_i128.pow(20), 10_i128.pow(20)),
+            Some(10_i128.pow(22))
+        );
+    }
+
+    #[rstest]
+    // 99.99 × 99.99 = 9998.0001 does not fit (4, 2).
+    #[case::past_the_precision(9_999, 9_999, 2, answer(4, 2))]
+    // 10^20 · 10^20 at scale 0 needs 41 digits.
+    #[case::past_38_digits(10_i128.pow(20), 10_i128.pow(20), 0, answer(38, 0))]
+    fn products_without_an_answer_are_null(
+        #[case] left: i128,
+        #[case] right: i128,
+        #[case] scale: usize,
+        #[case] answer: DecimalAnswer,
+    ) {
+        let product = product(scale, scale, answer);
+
+        assert_eq!(product.of(left, right), None);
+    }
+
+    #[test]
+    fn a_product_cannot_answer_more_places_than_it_has() {
+        let refused = DecimalProduct::new(1, 1, answer(38, 3));
+
+        assert!(matches!(refused, Err(DaftError::InternalError(_))));
     }
 }

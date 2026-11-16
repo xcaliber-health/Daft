@@ -24,6 +24,7 @@ pub use daft_schema::{
     image_mode::ImageMode,
     time_unit::{TimeUnit, format_string_has_offset, infer_timeunit_from_format_string},
 };
+pub(crate) use infer_datatype::integer_to_decimal128;
 pub use infer_datatype::try_physical_supertype;
 use num_traits::{Bounded, Float, FromPrimitive, Num, NumCast, ToPrimitive, Zero};
 use serde::Serialize;

@@ -1,6 +1,6 @@
 use std::ops::{Add, Div, Mul, Rem, Sub};
 
-use common_error::DaftResult;
+use common_error::{DaftError, DaftResult};
 use daft_schema::prelude::*;
 
 #[cfg(feature = "python")]
@@ -9,6 +9,7 @@ use crate::{
     array::prelude::*,
     datatypes::{
         DaftArrowBackedType, DaftNumericType, Float64Type, InferDataType, Int32Type, Utf8Array,
+        integer_to_decimal128,
     },
     series::{
         IntoSeries, Series, array_impl::ArrayWrapper, series_like::SeriesLike,
@@ -16,6 +17,20 @@ use crate::{
     },
     with_match_integer_daft_types, with_match_numeric_daft_types,
 };
+
+/// An operand of exact decimal arithmetic at its own decimal type.
+///
+/// An integer becomes the narrowest decimal that holds every value of its type; a
+/// decimal is returned as it is, without a copy.
+fn decimal_operand(series: &Series) -> DaftResult<Series> {
+    match series.data_type() {
+        DataType::Decimal128(..) => Ok(series.clone()),
+        dtype if dtype.is_integer() => series.cast(&integer_to_decimal128(dtype)?),
+        dtype => Err(DaftError::TypeError(format!(
+            "Expected a decimal or integer operand, not {dtype}"
+        ))),
+    }
+}
 
 macro_rules! impl_arithmetic_ref_for_series {
     ($trait:ident, $op:ident) => {
@@ -355,7 +370,11 @@ impl Mul for &Series {
             // Decimal Types
             // ----------------
             DataType::Decimal128(..) => {
-                Ok(cast_downcast_op!(lhs, rhs, &output_type, Decimal128Array, mul)?.into_series())
+                let (lhs, rhs) = (decimal_operand(lhs)?, decimal_operand(rhs)?);
+                Ok(lhs
+                    .downcast::<Decimal128Array>()?
+                    .multiply_exactly(rhs.downcast::<Decimal128Array>()?, &output_type)?
+                    .into_series())
             }
             // ----------------
             // FixedSizeLists of numeric types (fsl, embedding, tensor, etc.)
@@ -418,7 +437,11 @@ impl Div for &Series {
             // Decimal Types
             // ----------------
             DataType::Decimal128(..) => {
-                Ok(cast_downcast_op!(lhs, rhs, &output_type, Decimal128Array, div)?.into_series())
+                let (lhs, rhs) = (decimal_operand(lhs)?, decimal_operand(rhs)?);
+                Ok(lhs
+                    .downcast::<Decimal128Array>()?
+                    .divide_exactly(rhs.downcast::<Decimal128Array>()?, &output_type)?
+                    .into_series())
             }
             // ----------------
             // FixedSizeLists of numeric types (fsl, embedding, tensor, etc.)

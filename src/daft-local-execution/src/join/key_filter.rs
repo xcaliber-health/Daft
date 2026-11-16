@@ -222,6 +222,8 @@ fn distinct_values(column: Series) -> DaftResult<Vec<Literal>> {
 #[derive(Debug)]
 pub(crate) struct KeyFilter {
     keys: Vec<KeyValues>,
+    /// Whether the build side matches some key to more than one row; `None` when unknown.
+    repeats_keys: Option<bool>,
 }
 
 impl KeyFilter {
@@ -242,7 +244,22 @@ impl KeyFilter {
                 .iter()
                 .map(|column| KeyValues::of(column, max_values, max_member_bytes))
                 .collect::<DaftResult<_>>()?,
+            repeats_keys: None,
         })
+    }
+
+    /// A filter restricting nothing, for a build side whose keys cannot be read.
+    fn unrestricted() -> Self {
+        Self {
+            keys: Vec::new(),
+            repeats_keys: None,
+        }
+    }
+
+    /// Notes whether the build side matches some key to more than one row.
+    fn with_repeats_keys(mut self, repeats_keys: Option<bool>) -> Self {
+        self.repeats_keys = repeats_keys;
+        self
     }
 
     /// What join key `key` restricts `column` to.
@@ -395,16 +412,25 @@ impl KeyFilterPublisher {
     }
 
     /// Publishes an input's filter from its finished build side's key columns,
-    /// or no filter when there are none. A filter that cannot be made is not
-    /// an error of the query: the scans read unfiltered and the join decides.
-    pub(crate) fn publish(&self, input_id: InputId, keys: Option<DaftResult<Vec<Series>>>) {
-        let filter = keys.and_then(|keys| {
-            keys.and_then(|keys| {
-                KeyFilter::from_build_keys(&keys, self.max_values, self.max_member_bytes)
+    /// with whether those keys repeat, or no filter when there is neither. A
+    /// filter that cannot be made is not an error of the query: the scans read
+    /// unfiltered and the join decides.
+    pub(crate) fn publish(
+        &self,
+        input_id: InputId,
+        keys: Option<DaftResult<Vec<Series>>>,
+        repeats_keys: Option<bool>,
+    ) {
+        let filter = keys
+            .and_then(|keys| {
+                keys.and_then(|keys| {
+                    KeyFilter::from_build_keys(&keys, self.max_values, self.max_member_bytes)
+                })
+                .inspect_err(|error| log::debug!("no key filter for this join: {error}"))
+                .ok()
             })
-            .inspect_err(|error| log::debug!("no key filter for this join: {error}"))
-            .ok()
-        });
+            .or_else(|| repeats_keys.map(|_| KeyFilter::unrestricted()))
+            .map(|filter| filter.with_repeats_keys(repeats_keys));
         self.bridge.publish(input_id, filter.map(Arc::new));
     }
 
@@ -743,10 +769,23 @@ impl ScanKeyFilter {
     /// Waits for the build side, then returns what it restricts this column
     /// to for `input_id`, if anything.
     pub(crate) async fn restriction(&self, input_id: InputId) -> Option<KeyRestriction> {
-        self.bridge
-            .wait(input_id)
-            .await
-            .and_then(|filter| filter.restriction(self.key, &self.column))
+        self.restriction_and_repeats(input_id).await.0
+    }
+
+    /// Waits for the build side, then returns what it restricts this column to
+    /// for `input_id`, if anything, and whether it matches some key to more than
+    /// one row, if known.
+    pub(crate) async fn restriction_and_repeats(
+        &self,
+        input_id: InputId,
+    ) -> (Option<KeyRestriction>, Option<bool>) {
+        match self.bridge.wait(input_id).await {
+            Some(filter) => (
+                filter.restriction(self.key, &self.column),
+                filter.repeats_keys,
+            ),
+            None => (None, None),
+        }
     }
 }
 

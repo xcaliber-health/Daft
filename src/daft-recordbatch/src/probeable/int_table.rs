@@ -22,6 +22,8 @@ where
 {
     hash_table: HashMap<T::Native, V>,
     num_tables: usize,
+    /// Rows added; more than the keys held when a key repeats.
+    num_rows: usize,
 }
 
 impl<T: DaftIntegerType, V: ProbeContent> IntProbeTable<T, V>
@@ -35,6 +37,7 @@ where
         Ok(Self {
             hash_table,
             num_tables: 0,
+            num_rows: 0,
         })
     }
 
@@ -59,6 +62,7 @@ where
 
             let idx = (self.num_tables << TABLE_IDX_SHIFT) | i;
             self.hash_table.entry(h).or_default().add_row(idx as u64);
+            self.num_rows += 1;
         }
 
         self.num_tables += 1;
@@ -98,6 +102,10 @@ where
                 .clone(),
         )?;
         Ok(Box::new(iter.map(|output| output.is_some())))
+    }
+
+    fn repeats_keys(&self) -> bool {
+        self.num_rows > self.hash_table.len()
     }
 }
 

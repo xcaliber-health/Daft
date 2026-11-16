@@ -342,7 +342,9 @@ def rows_out_of_partial_aggregate(df: DataFrame) -> int:
 def test_rows_a_filtering_join_drops_are_dropped_before_they_are_aggregated(tmp_path, source: str) -> None:
     n = 20_000
     fact = {"k": list(range(n)), "v": [i % 7 for i in range(n)]}
-    dim = {"k": list(range(0, n, 100)), "g": [i % 3 for i in range(0, n, 100)]}
+    # Each kept key twice, so the join repeats the rows it keeps and aggregating pays.
+    kept = [k for k in range(0, n, 100) for _ in range(2)]
+    dim = {"k": kept, "g": [k % 3 for k in kept]}
 
     def read(name: str, data: dict[str, list[object]]) -> DataFrame:
         if source == "memory":
@@ -361,7 +363,7 @@ def test_rows_a_filtering_join_drops_are_dropped_before_they_are_aggregated(tmp_
     assert "PartialAggregation" in plan(build)
     assert in_order(df.to_pydict(), ["g"]) == answer(build, ["g"], pushdown=False)
     # Grouped by the unique key, it answers one row per key it kept: only the join's.
-    assert rows_out_of_partial_aggregate(df) == len(dim["k"])
+    assert rows_out_of_partial_aggregate(df) == len(set(kept))
 
 
 def test_a_join_whose_build_side_holds_no_key_aggregates_no_row(mode: str) -> None:
@@ -381,7 +383,8 @@ def test_a_build_side_estimated_large_still_filters_the_partial_aggregation() ->
     n = 20_000
     fact = {"k": [i % n for i in range(5 * n)], "v": [i % 7 for i in range(5 * n)]}
     totals = {"k": [i % n for i in range(4 * n)], "q": [1 if i % n % 1000 else 100 for i in range(4 * n)]}
-    labels = {"k": list(range(n)), "label": [i % 3 for i in range(n)]}
+    # Two labels per key, so the join repeats the rows it keeps.
+    labels = {"k": [k for k in range(n) for _ in range(2)], "label": [i % 3 for i in range(2 * n)]}
 
     def build() -> DataFrame:
         kept = (
@@ -414,3 +417,43 @@ def test_a_self_join_of_one_source_answers_as_without_pushdown(mode: str) -> Non
         return link.join(peers, on="owner").groupby("subject").agg(col("peer").count().alias("n"))
 
     assert answer(build, ["subject"], pushdown=True) == answer(build, ["subject"], pushdown=False)
+
+
+@native_only
+@pytest.mark.parametrize(
+    ("per_subject", "aggregated"),
+    [
+        # Each event names one subject, held once: the join repeats no event, so no event
+        # is aggregated below it.
+        pytest.param(None, False, id="many_to_one"),
+        # Each subject is held three times: the join repeats every event, so the events
+        # are aggregated below it.
+        pytest.param(3, True, id="repeated_build_keys"),
+    ],
+)
+def test_events_are_aggregated_below_a_join_only_when_it_repeats_them(
+    per_subject: int | None, aggregated: bool
+) -> None:
+    n, subjects = 20_000, 2_000
+    events = {"event_id": list(range(n)), "subject": [i % subjects for i in range(n)]}
+    copies = per_subject or 1
+    side = {
+        "subject": [s for s in range(subjects // 10) for _ in range(copies)],
+        "tier": [s % 3 for s in range(subjects // 10) for _ in range(copies)],
+    }
+
+    def build() -> DataFrame:
+        return (
+            daft.from_pydict(events)
+            .join(daft.from_pydict(side), on="subject")
+            .groupby("tier")
+            .agg(col("event_id").count().alias("n"))
+        )
+
+    with planning_config_ctx(disable_partial_aggregate_pushdown=False):
+        df = build().collect()
+
+    assert "PartialAggregation" in plan(build)
+    assert in_order(df.to_pydict(), ["tier"]) == answer(build, ["tier"], pushdown=False)
+    # Aggregated, it answers one row per subject the join keeps; otherwise one per event.
+    assert rows_out_of_partial_aggregate(df) == (subjects // 10 if aggregated else n)

@@ -12,9 +12,16 @@
 //! - **Passing through:** when the probe shows aggregating barely reduces rows, each row
 //!   is sent on as its own partial state, at the cost of one projection.
 //!
-//! Below a join that drops the rows its build side does not match, it takes that join's
-//! key filter and drops those rows before aggregating them or passing them on, whatever
-//! their source, as a scan would: rows the join discards cost it no work.
+//! Below a join that drops the rows its build side does not match, it waits for that
+//! side and takes what it publishes for each input:
+//!
+//! - **whether its keys repeat.** Aggregating first pays only when the join repeats this
+//!   side's rows. When the build side holds each key once, as the one side of a
+//!   many-to-one lookup does, the join repeats none, and grouping by a high-cardinality
+//!   key below it costs more than grouping above it: every row passes on unchanged but
+//!   for its state, and the join does the filtering it does today.
+//! - **its key filter**, otherwise: the rows the join would discard are dropped before
+//!   they are aggregated or passed on, whatever their source, as a scan would drop them.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -140,6 +147,8 @@ enum InputRestriction {
     Everything,
     /// No row: a join's build side holds no key.
     Nothing,
+    /// Every row, passed on as its own partial state: the join repeats none of them.
+    Unrepeated,
     /// The rows passing this filter.
     Rows(Arc<RowKeyFilter>),
 }
@@ -167,14 +176,19 @@ impl InputKeyFilters {
             .clone();
         cell.get_or_init(|| async {
             let mut tests = Vec::with_capacity(self.filters.len());
+            let mut unrepeated = false;
             for filter in &self.filters {
-                match filter.restriction(input_id).await {
+                let (restriction, repeats_keys) = filter.restriction_and_repeats(input_id).await;
+                unrepeated |= repeats_keys == Some(false);
+                match restriction {
                     Some(KeyRestriction::Nothing) => return InputRestriction::Nothing,
                     Some(KeyRestriction::Within { rows, .. }) => tests.push(rows),
                     None => {}
                 }
             }
-            if tests.is_empty() {
+            if unrepeated {
+                InputRestriction::Unrepeated
+            } else if tests.is_empty() {
                 InputRestriction::Everything
             } else {
                 InputRestriction::Rows(Arc::new(RowKeyFilter::new(tests)))
@@ -320,6 +334,12 @@ impl StreamingSink for PartialAggregateSink {
                             return Ok((state, StreamingSinkOutput::NeedMoreInput(None)));
                         }
                         InputRestriction::Rows(rows) => rows.apply(input)?,
+                        InputRestriction::Unrepeated => {
+                            let states = (!input.is_empty())
+                                .then(|| input.eval_expression_list(&params.single_row_states))
+                                .transpose()?;
+                            return Ok((state, StreamingSinkOutput::NeedMoreInput(states)));
+                        }
                     };
                     if input.is_empty() {
                         return Ok((state, StreamingSinkOutput::NeedMoreInput(None)));

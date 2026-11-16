@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, cmp::Ordering};
 
 use common_error::DaftResult;
 use daft_schema::prelude::DataType;
@@ -53,7 +53,26 @@ impl CompareOp {
     }
 }
 
+/// Compares two decimals of different types exactly, each aligned to the larger scale.
+fn compare_decimals_exactly(lhs: &Series, rhs: &Series, op: CompareOp) -> DaftResult<BooleanArray> {
+    let (lhs, rhs) = (lhs.decimal128()?, rhs.decimal128()?);
+    match op {
+        CompareOp::Equal => lhs.compare_exactly(rhs, Ordering::is_eq),
+        CompareOp::NotEqual => lhs.compare_exactly(rhs, Ordering::is_ne),
+        CompareOp::Lt => lhs.compare_exactly(rhs, Ordering::is_lt),
+        CompareOp::Lte => lhs.compare_exactly(rhs, Ordering::is_le),
+        CompareOp::Gt => lhs.compare_exactly(rhs, Ordering::is_gt),
+        CompareOp::Gte => lhs.compare_exactly(rhs, Ordering::is_ge),
+        CompareOp::EqNullSafe => lhs.equal_null_safe_exactly(rhs),
+    }
+}
+
 fn compare_dispatch(lhs: &Series, rhs: &Series, op: CompareOp) -> DaftResult<BooleanArray> {
+    if InferDataType::from(lhs.data_type())
+        .compares_decimals_exactly(&InferDataType::from(rhs.data_type()))
+    {
+        return compare_decimals_exactly(lhs, rhs, op);
+    }
     let (output_type, intermediate_type, comparison_type) = InferDataType::from(lhs.data_type())
         .comparison_op(&InferDataType::from(rhs.data_type()))?;
     assert_eq!(

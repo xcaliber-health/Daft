@@ -195,6 +195,37 @@ impl InferDataType<'_> {
             ))
         })
     }
+    /// Whether two decimals compare exactly, each aligned to the larger scale, rather
+    /// than through a common type.
+    ///
+    /// True when both are decimals of different types whose common type would pass 38
+    /// digits: no decimal type holds every value of both, but a comparison answers a
+    /// boolean and needs none.
+    #[must_use]
+    pub fn compares_decimals_exactly(&self, other: &Self) -> bool {
+        match (self.0, other.0) {
+            (DataType::Decimal128(p1, s1), DataType::Decimal128(p2, s2))
+                if (p1, s1) != (p2, s2) =>
+            {
+                (p1 - s1).max(p2 - s2) + (*s1).max(*s2) > MAX_DECIMAL_PRECISION
+            }
+            _ => false,
+        }
+    }
+
+    /// The result type of comparing these two types, or of testing membership.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaftError::TypeError`] for types that cannot be compared.
+    pub fn comparison_result(&self, other: &Self) -> DaftResult<DataType> {
+        if self.compares_decimals_exactly(other) {
+            Ok(DataType::Boolean)
+        } else {
+            Ok(self.comparison_op(other)?.0)
+        }
+    }
+
     pub fn membership_op(
         &self,
         other: &Self,
@@ -867,5 +898,30 @@ mod tests {
         #[case] expected: DataType,
     ) {
         assert_eq!(infer(op, &left, &DataType::Int64), expected);
+    }
+
+    #[rstest]
+    // (38,2) against (38,6) needs 36 + 6 = 42 digits.
+    #[case::past_38_digits(decimal(38, 2), decimal(38, 6), true)]
+    #[case::constant_of_higher_scale(decimal(38, 2), decimal(18, 6), true)]
+    // (34,2) against (38,6) needs 32 + 6 = 38 digits: a common type holds both.
+    #[case::exactly_38_digits(decimal(34, 2), decimal(38, 6), false)]
+    #[case::same_type(decimal(38, 2), decimal(38, 2), false)]
+    #[case::not_both_decimals(decimal(38, 2), DataType::Float64, false)]
+    fn decimals_past_38_digits_compare_exactly(
+        #[case] left: DataType,
+        #[case] right: DataType,
+        #[case] expected: bool,
+    ) {
+        let (left, right) = (InferDataType::from(&left), InferDataType::from(&right));
+
+        assert_eq!(left.compares_decimals_exactly(&right), expected);
+        assert_eq!(right.compares_decimals_exactly(&left), expected);
+        if expected {
+            assert_eq!(
+                left.comparison_result(&right).expect("a type"),
+                DataType::Boolean
+            );
+        }
     }
 }

@@ -2282,9 +2282,8 @@ impl Expr {
                 let expr_field = expr.to_field(schema)?;
                 let expr_type = &expr_field.dtype;
                 let field_name = &expr_field.name;
-                let field_type = InferDataType::from(expr_type)
-                    .membership_op(&(&list_dtype).into())?
-                    .0;
+                let field_type =
+                    InferDataType::from(expr_type).comparison_result(&(&list_dtype).into())?;
                 Ok(Field::new(field_name.clone(), field_type))
             }
             Self::List(items) => {
@@ -2301,12 +2300,10 @@ impl Expr {
                 let value_field = value.to_field(schema)?;
                 let lower_field = lower.to_field(schema)?;
                 let upper_field = upper.to_field(schema)?;
-                let (lower_result_type, _intermediate, _comp_type) =
-                    InferDataType::from(&value_field.dtype)
-                        .membership_op(&InferDataType::from(&lower_field.dtype))?;
-                let (upper_result_type, _intermediate, _comp_type) =
-                    InferDataType::from(&value_field.dtype)
-                        .membership_op(&InferDataType::from(&upper_field.dtype))?;
+                let lower_result_type = InferDataType::from(&value_field.dtype)
+                    .comparison_result(&InferDataType::from(&lower_field.dtype))?;
+                let upper_result_type = InferDataType::from(&value_field.dtype)
+                    .comparison_result(&InferDataType::from(&upper_field.dtype))?;
                 let (result_type, _intermediate, _comp_type) =
                     InferDataType::from(&lower_result_type)
                         .membership_op(&InferDataType::from(&upper_result_type))?;
@@ -2335,9 +2332,8 @@ impl Expr {
                     | Operator::LtEq
                     | Operator::GtEq
                     | Operator::EqNullSafe => {
-                        let (result_type, _intermediate, _comp_type) =
-                            InferDataType::from(&left_field.dtype)
-                                .comparison_op(&InferDataType::from(&right_field.dtype))?;
+                        let result_type = InferDataType::from(&left_field.dtype)
+                            .comparison_result(&InferDataType::from(&right_field.dtype))?;
                         Ok(Field::new(left_field.name.as_ref(), result_type))
                     }
 

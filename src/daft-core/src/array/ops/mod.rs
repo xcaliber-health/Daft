@@ -19,6 +19,7 @@ mod comparison;
 mod concat;
 mod concat_agg;
 mod count;
+mod decimal_comparison;
 mod exp;
 mod filter;
 mod float;

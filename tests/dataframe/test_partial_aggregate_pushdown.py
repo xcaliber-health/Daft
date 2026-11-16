@@ -14,6 +14,7 @@ import pytest
 import daft
 from daft import DataFrame, Expression, col
 from daft.context import execution_config_ctx, planning_config_ctx
+from tests.conftest import get_tests_daft_runner_name
 
 # Subjects linked to owners: a self-join on owner repeats each subject once per peer.
 LINK = {
@@ -320,6 +321,13 @@ def test_many_rows_answer_as_without_pushdown(mode: str) -> None:
     assert answer(build, ["subject"], pushdown=True) == answer(build, ["subject"], pushdown=False)
 
 
+# A join's key filter reaches a partial aggregation in the same pipeline; across the
+# distributed runner's stages it does not, and the answers are the same.
+native_only = pytest.mark.skipif(
+    get_tests_daft_runner_name() != "native", reason="join key filters are planned within a local pipeline"
+)
+
+
 def rows_out_of_partial_aggregate(df: DataFrame) -> int:
     metrics = df.metrics.to_pydict()
     return sum(
@@ -329,6 +337,7 @@ def rows_out_of_partial_aggregate(df: DataFrame) -> int:
     )
 
 
+@native_only
 @pytest.mark.parametrize("source", ["memory", "parquet"])
 def test_rows_a_filtering_join_drops_are_dropped_before_they_are_aggregated(tmp_path, source: str) -> None:
     n = 20_000
@@ -365,6 +374,7 @@ def test_a_join_whose_build_side_holds_no_key_aggregates_no_row(mode: str) -> No
     assert answer(build, ["g"], pushdown=True) == {"g": [], "s": []}
 
 
+@native_only
 def test_a_build_side_estimated_large_still_filters_the_partial_aggregation() -> None:
     # The build side joins an aggregation kept by a condition few groups meet, so it is
     # estimated far larger than it is, as TPC-H Q18's orders, totals and customers are.

@@ -2,8 +2,9 @@
 //!
 //! Its output rows, merged per group by each aggregation's merge function, give the whole
 //! aggregation of its input; any number of rows may carry the same group. That freedom
-//! lets it work in one of two modes, chosen once for all workers after a probe of the
-//! first rows:
+//! lets it work in one of two modes, chosen once for all workers from the first morsel,
+//! by how many distinct groups a sample of its rows holds, before any row is aggregated
+//! (the way the grouped aggregation chooses its strategy):
 //!
 //! - **Accumulating:** each morsel is aggregated and held; at the end the held partials are
 //!   merged per group, in parallel by hash partition, so each group leaves as about one row.
@@ -16,11 +17,8 @@
 //! their source, as a scan would: rows the join discards cost it no work.
 
 use std::{
-    collections::HashMap,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU8, AtomicUsize, Ordering},
-    },
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use common_daft_config::DaftExecutionConfig;
@@ -46,12 +44,14 @@ use crate::{
     pipeline::{InputId, NodeName},
 };
 
-/// The first rows are aggregated while it is decided whether aggregating pays.
-const PROBING: u8 = 0;
-/// Aggregating pays: every morsel is aggregated and held.
-const ACCUMULATING: u8 = 1;
-/// Aggregating does not pay: each row leaves as its own partial state.
-const PASSING_THROUGH: u8 = 2;
+/// Whether aggregating pays, decided once from the first morsel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// Every morsel is aggregated and held.
+    Accumulating,
+    /// Each row leaves as its own partial state.
+    PassingThrough,
+}
 
 /// What every worker of the operator shares.
 struct PartialAggregateParams {
@@ -66,43 +66,46 @@ struct PartialAggregateParams {
     /// The grouping columns, bound to the output.
     output_group_by: Vec<BoundExpr>,
     output_schema: SchemaRef,
-    /// Rows to aggregate before deciding.
+    /// Rows of the first morsel sampled to decide the mode.
     probe_rows: usize,
-    /// Aggregated rows per input row above which aggregating does not pay.
+    /// Distinct groups per sampled row above which aggregating does not pay.
     skip_ratio: f64,
     /// Bytes of held partials, per worker, past which they are merged and sent on.
     max_held_bytes: usize,
-    /// One of [`PROBING`], [`ACCUMULATING`] or [`PASSING_THROUGH`].
-    mode: AtomicU8,
-    /// Input rows aggregated while probing.
-    probed_rows: AtomicUsize,
-    /// Rows the probe's morsels aggregated to.
-    probed_groups: AtomicUsize,
+    /// The mode, set by the first morsel any worker takes.
+    mode: OnceLock<Mode>,
 }
 
 impl PartialAggregateParams {
-    /// Notes a probed morsel of `rows` rows aggregated to `groups`, and decides the mode once
-    /// enough rows are probed. Returns the mode in force.
-    fn probe(&self, rows: usize, groups: usize) -> u8 {
-        let probed_rows = self.probed_rows.fetch_add(rows, Ordering::Relaxed) + rows;
-        let probed_groups = self.probed_groups.fetch_add(groups, Ordering::Relaxed) + groups;
-        if probed_rows < self.probe_rows {
-            return PROBING;
+    /// The mode in force, deciding it from `input` if no morsel has yet.
+    ///
+    /// The first worker to ask samples its morsel while any other waits, as the grouped
+    /// aggregation decides its strategy: the grouping of at most `probe_rows` rows is
+    /// hashed, so no row is aggregated before the decision and one sample serves all.
+    /// Either mode answers correctly, so a sample that cannot be hashed accumulates.
+    fn mode(&self, input: &MicroPartition) -> Mode {
+        *self.mode.get_or_init(|| {
+            self.sampled_ratio(input)
+                .map_or(Mode::Accumulating, |ratio| {
+                    if ratio > self.skip_ratio {
+                        Mode::PassingThrough
+                    } else {
+                        Mode::Accumulating
+                    }
+                })
+        })
+    }
+
+    /// Distinct groups per row in a sample of `input`.
+    fn sampled_ratio(&self, input: &MicroPartition) -> DaftResult<f64> {
+        let sample = input.slice(0, input.len().min(self.probe_rows.max(1)))?;
+        let keys = sample.eval_expression_list(&self.group_by)?;
+        let mut groups = HashSet::with_capacity(sample.len());
+        for batch in keys.record_batches() {
+            groups.extend(batch.hash_rows()?.values().iter().copied());
         }
         #[allow(clippy::cast_precision_loss)]
-        let ratio = probed_groups as f64 / probed_rows as f64;
-        let decided = if ratio > self.skip_ratio {
-            PASSING_THROUGH
-        } else {
-            ACCUMULATING
-        };
-        match self
-            .mode
-            .compare_exchange(PROBING, decided, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => decided,
-            Err(current) => current,
-        }
+        Ok(groups.len() as f64 / sample.len().max(1) as f64)
     }
 
     /// Merges partials per group.
@@ -258,9 +261,7 @@ impl PartialAggregateSink {
                 skip_ratio: cfg.partial_aggregate_pushdown_skip_ratio,
                 max_held_bytes: cfg.partial_aggregate_pushdown_max_buffer_bytes
                     / get_compute_pool_num_threads().max(1),
-                mode: AtomicU8::new(PROBING),
-                probed_rows: AtomicUsize::new(0),
-                probed_groups: AtomicUsize::new(0),
+                mode: OnceLock::new(),
             }),
             key_filters: Arc::new(InputKeyFilters::default()),
         })
@@ -283,15 +284,10 @@ fn partially_aggregate(
     state: &mut PartialAggregateState,
     params: &PartialAggregateParams,
 ) -> DaftResult<Option<MicroPartition>> {
-    let mode = params.mode.load(Ordering::Acquire);
-    if mode == PASSING_THROUGH {
+    if params.mode(input) == Mode::PassingThrough {
         return Ok(Some(input.eval_expression_list(&params.single_row_states)?));
     }
     let partial = input.agg(&params.aggregations, &params.group_by)?;
-    if mode == PROBING && params.probe(input.len(), partial.len()) == PASSING_THROUGH {
-        // Partials may leave at any time; this one leaves now.
-        return Ok(Some(partial));
-    }
     state.held_bytes += partial.size_bytes();
     state.held.push(partial);
     if state.held_bytes <= params.max_held_bytes {
@@ -634,8 +630,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_probe_of_rows_that_do_not_repeat_passes_later_rows_through() {
+    #[rstest]
+    // The first morsel holds one key twice: half as many groups as rows.
+    #[case::over_the_ratio_every_row_passes_through(0.4, vec![2, 2, 2, 2, 2, 2], 0)]
+    #[case::within_the_ratio_every_morsel_is_held(0.6, vec![0, 0, 0, 0, 0, 0], 6)]
+    fn the_first_morsel_decides_for_every_morsel(
+        #[case] skip_ratio: f64,
+        #[case] sent: Vec<usize>,
+        #[case] held: usize,
+    ) {
         let dtype = DataType::Int64;
         let morsels = morsels(&dtype, 2);
         let input_schema = morsels[0].schema();
@@ -644,26 +647,23 @@ mod tests {
             key_field(),
             aggregation.as_ref().to_field(&input_schema).unwrap(),
         ]));
-        // Each of the first two morsels holds one key twice: the probe halves its rows.
         let sink = PartialAggregateSink::new(
             &[aggregation],
             &[BoundExpr::new_unchecked(bound_col(0, key_field()))],
             &input_schema,
             output_schema,
-            &config(4, 0.4, usize::MAX),
+            &config(1 << 20, skip_ratio, usize::MAX),
         )
         .unwrap();
         let mut state = PartialAggregateState::new(0);
 
-        let sent = morsels
+        let rows_sent = morsels
             .iter()
             .map(|input| partially_aggregate(input, &mut state, &sink.params).unwrap())
             .map(|output| output.map_or(0, |partial| partial.len()))
             .collect::<Vec<_>>();
 
-        // The probe ends after two morsels at 2 groups of 4 rows, over the ratio: the second
-        // morsel's partial leaves at once, and every later row passes through.
-        assert_eq!(sent, vec![0, 1, 2, 2, 2, 2]);
-        assert_eq!(state.held.len(), 1);
+        assert_eq!(rows_sent, sent);
+        assert_eq!(state.held.len(), held);
     }
 }

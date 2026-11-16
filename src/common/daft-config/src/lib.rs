@@ -181,11 +181,11 @@ pub struct DaftExecutionConfig {
     pub shuffle_aggregation_default_partitions: usize,
     pub partial_aggregation_threshold: usize,
     pub high_cardinality_aggregation_threshold: f64,
-    /// Rows a partial aggregation pushed below a join reads before judging how much it
-    /// reduces them.
+    /// Rows of its first morsel a partial aggregation pushed below a join samples to judge
+    /// how much aggregating reduces them.
     pub partial_aggregate_pushdown_probe_rows: usize,
-    /// The distinct-groups-to-rows ratio above which a partial aggregation pushed below a
-    /// join stops aggregating and passes each row on as its own partial state.
+    /// The distinct-groups-to-sampled-rows ratio above which a partial aggregation pushed
+    /// below a join passes each row on as its own partial state instead of aggregating.
     pub partial_aggregate_pushdown_skip_ratio: f64,
     /// Bytes of partial results a partial aggregation pushed below a join holds before it
     /// emits them early, which is always correct.

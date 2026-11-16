@@ -28,10 +28,11 @@ PEERS = {
     "score": [1.5, -2.0, None, 3.25, 0.0, 4.5, -1.0, 2.0, 9.0],
 }
 
-# The modes the operator may run in, each forced: probing for ever, accumulating, passing
-# every row through, and accumulating with every partial sent on at once.
+# The modes the operator may run in: decided from a sample of a whole first batch, then
+# forced to accumulate, to pass every row through, and to accumulate sending every partial
+# on at once.
 MODES = {
-    "probing": {"partial_aggregate_pushdown_probe_rows": 1 << 40},
+    "sampled": {"partial_aggregate_pushdown_probe_rows": 1 << 40},
     "accumulating": {
         "partial_aggregate_pushdown_probe_rows": 1,
         "partial_aggregate_pushdown_skip_ratio": 1.0,

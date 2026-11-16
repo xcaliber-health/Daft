@@ -338,10 +338,10 @@ def set_execution_config(
         shuffle_aggregation_default_partitions: Maximum number of partitions to create when performing aggregations on the Ray Runner. Defaults to 200, unless the number of input partitions is less than 200.
         partial_aggregation_threshold: Threshold for performing partial aggregations on the Native Runner. Defaults to 10000 rows.
         high_cardinality_aggregation_threshold: Threshold selectivity for performing high cardinality aggregations on the Native Runner. Defaults to 0.8.
-        partial_aggregate_pushdown_probe_rows: Rows a partial aggregation pushed below a join reads before judging how
-            much it reduces them. Defaults to 100,000.
-        partial_aggregate_pushdown_skip_ratio: The ratio of distinct groups to rows above which a partial aggregation
-            pushed below a join stops aggregating and passes each row on. Defaults to 0.5.
+        partial_aggregate_pushdown_probe_rows: Rows of its first batch a partial aggregation pushed below a join
+            samples to judge how much aggregating reduces them. Defaults to 100,000.
+        partial_aggregate_pushdown_skip_ratio: The ratio of distinct groups to sampled rows above which a partial
+            aggregation pushed below a join passes each row on instead of aggregating. Defaults to 0.5.
         partial_aggregate_pushdown_max_buffer_bytes: Bytes of partial results a partial aggregation pushed below a join
             holds before emitting them early. Defaults to 256MB.
         read_sql_partition_size_bytes: Target size of partition when reading from SQL databases. Defaults to 512MB

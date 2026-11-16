@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import decimal
 import itertools
+import operator
 import random
 import tempfile
 from collections.abc import Iterator
@@ -198,20 +199,66 @@ def test_decimal_division_rounds_half_away_from_zero(a, b, expected) -> None:
     assert quotient == expected
 
 
+OPERATORS = {"+": operator.add, "-": operator.sub, "*": operator.mul, "/": operator.truediv}
+
+
 @pytest.mark.parametrize(
-    "a_type, b_type, operator, expected",
+    "a_type, b_type, symbol, expected",
     [
-        pytest.param((18, 2), (18, 2), "/", daft.DataType.decimal128(37, 21), id="divide"),
-        pytest.param((18, 6), (18, 2), "/", daft.DataType.decimal128(37, 25), id="divide-mixed"),
         pytest.param((18, 2), (18, 2), "*", daft.DataType.decimal128(36, 4), id="multiply"),
         pytest.param((10, 2), pa.int32(), "*", daft.DataType.decimal128(20, 2), id="multiply-integer"),
+        pytest.param((10, 2), (10, 2), "/", daft.DataType.decimal128(23, 13), id="divide"),
+        pytest.param((18, 2), (18, 2), "/", daft.DataType.decimal128(38, 20), id="divide-capped"),
+        pytest.param((18, 6), (18, 2), "/", daft.DataType.decimal128(38, 24), id="divide-mixed"),
+        pytest.param((20, 2), (5, 2), "/", daft.DataType.decimal128(28, 8), id="divide-wide-dividend"),
+        pytest.param((18, 2), (38, 6), "+", daft.DataType.decimal128(38, 6), id="add-capped"),
+        pytest.param((38, 4), (30, 4), "-", daft.DataType.decimal128(38, 4), id="subtract-capped"),
+        pytest.param((18, 2), (38, 6), "*", daft.DataType.decimal128(38, 6), id="multiply-capped"),
+        pytest.param((38, 4), (23, 2), "*", daft.DataType.decimal128(38, 6), id="multiply-tpch-q1"),
     ],
 )
-def test_decimal_result_types_are_unchanged(a_type, b_type, operator, expected) -> None:
+def test_decimal_result_types_follow_the_reference_rule(a_type, b_type, symbol, expected) -> None:
     frame = _frame([], a_type, [], b_type)
-    expression = daft.col("a") / daft.col("b") if operator == "/" else daft.col("a") * daft.col("b")
 
-    assert frame.select(expression.alias("r")).schema()["r"].dtype == expected
+    dtype = frame.select(OPERATORS[symbol](daft.col("a"), daft.col("b")).alias("r")).schema()["r"].dtype
+
+    assert dtype == expected
+
+
+@pytest.mark.parametrize(
+    "symbol, expected",
+    [
+        pytest.param("+", decimal.Decimal("1.75"), id="add"),
+        pytest.param("-", decimal.Decimal("1.25"), id="subtract"),
+        pytest.param("*", decimal.Decimal("0.375"), id="multiply"),
+    ],
+)
+def test_decimal_arithmetic_past_38_digits_answers(symbol, expected) -> None:
+    frame = _frame(["1.50"], (18, 2), ["0.250000"], (38, 6))
+
+    (answer,) = frame.select(OPERATORS[symbol](daft.col("a"), daft.col("b")).alias("r")).to_pydict()["r"]
+
+    assert answer == expected
+
+
+def test_a_capped_sum_that_does_not_fit_is_null() -> None:
+    biggest = "9" * 32 + ".999999"
+    frame = _frame([biggest, "1.000000"], (38, 6), ["99999999999999.99", "2.50"], (16, 2))
+
+    sums = frame.select((daft.col("a") + daft.col("b")).alias("r")).to_pydict()["r"]
+
+    assert sums == [None, decimal.Decimal("3.5")]
+
+
+def test_division_by_a_decimal_literal_plans() -> None:
+    frame = _frame(["1.00", "2.00"], (10, 2), ["1", "1"], (10, 2))
+
+    quotients = frame.select((daft.col("a") / daft.lit(decimal.Decimal("3.00"))).alias("q")).to_pydict()["q"]
+
+    assert quotients == [
+        decimal.Decimal("0.3333333333333333333333333333"),
+        decimal.Decimal("0.6666666666666666666666666667"),
+    ]
 
 
 def test_decimal_division_by_zero_is_null() -> None:
@@ -287,24 +334,25 @@ def _random_values(generator: random.Random, dtype: DecimalType | pa.DataType, c
         pytest.param((18, 6), (18, 2), id="18-6-by-18-2"),
         pytest.param((5, 2), (10, 2), id="5-2-by-10-2"),
         pytest.param(pa.int32(), (10, 2), id="int32-by-10-2"),
+        pytest.param((18, 2), (38, 6), id="18-2-by-38-6"),
+        pytest.param((38, 4), (23, 2), id="38-4-by-23-2"),
     ],
 )
-@pytest.mark.parametrize("operator", ["/", "*"])
-def test_decimal_arithmetic_matches_exact_arithmetic(a_type, b_type, operator, wide_context) -> None:
+@pytest.mark.parametrize("symbol", ["+", "-", "*", "/"])
+def test_decimal_arithmetic_matches_exact_arithmetic(a_type, b_type, symbol, wide_context) -> None:
     generator = random.Random(53)
     left = _random_values(generator, a_type, 500)
     right = _random_values(generator, b_type, 500)
     frame = _frame(left, a_type, right, b_type)
-    expression = daft.col("a") / daft.col("b") if operator == "/" else daft.col("a") * daft.col("b")
-    result = frame.select(expression.alias("r"))
+    result = frame.select(OPERATORS[symbol](daft.col("a"), daft.col("b")).alias("r"))
 
     answers = result.to_pydict()["r"]
 
     dtype = result.schema()["r"].dtype
     for a, b, answer in zip(left, right, answers):
         a, b = decimal.Decimal(a), decimal.Decimal(b)
-        if operator == "/" and b.is_zero():
+        if symbol == "/" and b.is_zero():
             expected = None
         else:
-            expected = _exact(a / b if operator == "/" else a * b, dtype)
-        assert answer == expected, f"{a} {operator} {b}"
+            expected = _exact(OPERATORS[symbol](a, b), dtype)
+        assert answer == expected, f"{a} {symbol} {b}"

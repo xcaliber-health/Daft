@@ -176,7 +176,11 @@ impl Add for &Series {
             // Decimal Types
             // ----------------
             DataType::Decimal128(..) => {
-                Ok(cast_downcast_op!(lhs, rhs, &output_type, Decimal128Array, add)?.into_series())
+                let (lhs, rhs) = (decimal_operand(lhs)?, decimal_operand(rhs)?);
+                Ok(lhs
+                    .downcast::<Decimal128Array>()?
+                    .add_exactly(rhs.downcast::<Decimal128Array>()?, &output_type)?
+                    .into_series())
             }
             // ----------------
             // FixedSizeLists of numeric types (fsl, embedding, tensor, etc.)
@@ -280,7 +284,11 @@ impl Sub for &Series {
             // Decimal Types
             // ----------------
             DataType::Decimal128(..) => {
-                Ok(cast_downcast_op!(lhs, rhs, &output_type, Decimal128Array, sub)?.into_series())
+                let (lhs, rhs) = (decimal_operand(lhs)?, decimal_operand(rhs)?);
+                Ok(lhs
+                    .downcast::<Decimal128Array>()?
+                    .subtract_exactly(rhs.downcast::<Decimal128Array>()?, &output_type)?
+                    .into_series())
             }
             // ----------------
             // Temporal types

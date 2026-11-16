@@ -18,12 +18,6 @@ arrow_string_types = [pa.string(), pa.large_string()]
 def arrow_number_combinations():
     for left in arrow_number_types:
         for right in arrow_number_types:
-            # we can't perform all ops on decimal and 64 bit ints
-            if pa.types.is_decimal(left) and (pa.types.is_int64(right) or pa.types.is_uint64(right)):
-                continue
-            if pa.types.is_decimal(right) and (pa.types.is_int64(left) or pa.types.is_uint64(left)):
-                continue
-
             yield (left, right)
 
 

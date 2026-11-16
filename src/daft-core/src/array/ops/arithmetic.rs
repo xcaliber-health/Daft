@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow::buffer::NullBuffer;
+use arrow::{array::NullBufferBuilder, buffer::NullBuffer};
 use common_error::{DaftError, DaftResult};
 
 use super::{as_arrow::AsArrow, full::FullNull};
@@ -17,6 +17,7 @@ use crate::{
     },
     prelude::{BinaryArray, Decimal128Array, FixedSizeBinaryArray},
     series::Series,
+    utils::decimal::{DecimalAnswer, DecimalProduct, DecimalQuotient},
 };
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -119,19 +120,6 @@ impl Sub for &Decimal128Array {
     fn sub(self, rhs: Self) -> Self::Output {
         assert_eq!(self.data_type(), rhs.data_type());
         arithmetic_helper(self, rhs, |l, r| l - r)
-    }
-}
-
-impl Mul for &Decimal128Array {
-    type Output = DaftResult<Decimal128Array>;
-    fn mul(self, rhs: Self) -> Self::Output {
-        assert_eq!(self.data_type(), rhs.data_type());
-
-        let DataType::Decimal128(_, s) = self.data_type() else {
-            unreachable!("This should always be a Decimal128")
-        };
-        let scale = 10i128.pow(*s as u32);
-        arithmetic_helper(self, rhs, |l, r| (l * r) / scale)
     }
 }
 
@@ -317,47 +305,140 @@ where
     }
 }
 
-impl Div for &Decimal128Array {
-    type Output = DaftResult<Decimal128Array>;
-    fn div(self, rhs: Self) -> Self::Output {
-        assert_eq!(self.data_type(), rhs.data_type());
-        let DataType::Decimal128(_, s) = self.data_type() else {
-            unreachable!("This should always be a Decimal128")
-        };
-        let scale = 10i128.pow(*s as u32);
+impl Decimal128Array {
+    /// Divides this decimal column by `rhs`, answering `result`'s decimal type exactly.
+    ///
+    /// Each side keeps its own scale. A quotient is rounded half away from zero at
+    /// the result scale. A row answers null where either side is null, the divisor
+    /// is zero, or the quotient does not fit the result type. Either side may be a
+    /// single value, which is broadcast. The result takes this column's name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaftError::ValueError`] for lengths that cannot broadcast, and
+    /// [`DaftError::TypeError`] when `result` is not a decimal type.
+    pub fn divide_exactly(&self, rhs: &Self, result: &DataType) -> DaftResult<Self> {
+        let quotient = DecimalQuotient::new(
+            decimal_scale(self.data_type())?,
+            decimal_scale(rhs.data_type())?,
+            DecimalAnswer::of(result)?,
+        )?;
+        exact_decimal_rows(self, rhs, result, |l, r| quotient.of(l, r))
+    }
 
-        if rhs.null_count() == 0 {
-            arithmetic_helper(self, rhs, |l, r| (l * scale) / r)
-        } else {
-            match (self.len(), rhs.len()) {
-                (a, b) if a == b => null_aware_binary(self, rhs, |l, r| (l * scale) / r),
-                // broadcast right path
-                (_, 1) => {
-                    let opt_rhs = rhs.get(0);
-                    match opt_rhs {
-                        None => Ok(DataArray::full_null(
-                            self.name(),
-                            self.data_type(),
-                            self.len(),
-                        )),
-                        Some(rhs) => self.apply(|lhs| (lhs * scale) / rhs),
-                    }
-                }
-                (1, _) => {
-                    let opt_lhs = self.get(0);
-                    Ok(match opt_lhs {
-                        None => DataArray::full_null(rhs.name(), rhs.data_type(), rhs.len()),
-                        Some(lhs_val) => {
-                            broadcast_left_null_aware(self, rhs, lhs_val, |l, r| (l * scale) / r)?
-                        }
-                    })
-                }
-                (a, b) => Err(DaftError::ValueError(format!(
-                    "Cannot apply operation on arrays of different lengths: {a} vs {b}"
-                ))),
+    /// Multiplies this decimal column by `rhs`, answering `result`'s decimal type exactly.
+    ///
+    /// Each side keeps its own scale. A product with more places than the result
+    /// keeps is rounded half away from zero. A row answers null where either side
+    /// is null or the product does not fit the result type. Either side may be a
+    /// single value, which is broadcast. The result takes this column's name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaftError::ValueError`] for lengths that cannot broadcast, and
+    /// [`DaftError::TypeError`] when `result` is not a decimal type.
+    pub fn multiply_exactly(&self, rhs: &Self, result: &DataType) -> DaftResult<Self> {
+        let product = DecimalProduct::new(
+            decimal_scale(self.data_type())?,
+            decimal_scale(rhs.data_type())?,
+            DecimalAnswer::of(result)?,
+        )?;
+        exact_decimal_rows(self, rhs, result, |l, r| product.of(l, r))
+    }
+}
+
+fn decimal_scale(dtype: &DataType) -> DaftResult<usize> {
+    match dtype {
+        DataType::Decimal128(_, scale) => Ok(*scale),
+        other => Err(DaftError::TypeError(format!(
+            "Expected a decimal operand, not {other}"
+        ))),
+    }
+}
+
+/// Applies `row` to each pair of valid values, broadcasting a single value on either
+/// side. A row is null where an input is null or `row` answers `None`.
+#[inline(never)]
+fn exact_decimal_rows<F>(
+    lhs: &Decimal128Array,
+    rhs: &Decimal128Array,
+    result: &DataType,
+    row: F,
+) -> DaftResult<Decimal128Array>
+where
+    F: Fn(i128, i128) -> Option<i128>,
+{
+    let field = Arc::new(Field::new(lhs.name(), result.clone()));
+    let lhs_values = lhs.values();
+    let rhs_values = rhs.values();
+    match (lhs.len(), rhs.len()) {
+        (a, b) if a == b => {
+            let valid = NullBuffer::union(lhs.nulls(), rhs.nulls());
+            let rows = zip(lhs_values.iter(), rhs_values.iter())
+                .enumerate()
+                .map(|(i, (l, r))| {
+                    valid
+                        .as_ref()
+                        .is_none_or(|valid| valid.is_valid(i))
+                        .then(|| row(*l, *r))
+                        .flatten()
+                });
+            collect_decimal_rows(field, a, rows)
+        }
+        (len, 1) => match rhs.get(0) {
+            None => Ok(Decimal128Array::full_null(lhs.name(), result, len)),
+            Some(r) => {
+                let valid = lhs.nulls();
+                let rows = lhs_values.iter().enumerate().map(|(i, l)| {
+                    valid
+                        .is_none_or(|valid| valid.is_valid(i))
+                        .then(|| row(*l, r))
+                        .flatten()
+                });
+                collect_decimal_rows(field, len, rows)
+            }
+        },
+        (1, len) => match lhs.get(0) {
+            None => Ok(Decimal128Array::full_null(lhs.name(), result, len)),
+            Some(l) => {
+                let valid = rhs.nulls();
+                let rows = rhs_values.iter().enumerate().map(|(i, r)| {
+                    valid
+                        .is_none_or(|valid| valid.is_valid(i))
+                        .then(|| row(l, *r))
+                        .flatten()
+                });
+                collect_decimal_rows(field, len, rows)
+            }
+        },
+        (a, b) => Err(DaftError::ValueError(format!(
+            "Cannot apply operation on arrays of different lengths: {a} vs {b}"
+        ))),
+    }
+}
+
+/// Gathers `len` optional rows into one decimal array; validity is allocated only
+/// once a null appears.
+fn collect_decimal_rows(
+    field: Arc<Field>,
+    len: usize,
+    rows: impl Iterator<Item = Option<i128>>,
+) -> DaftResult<Decimal128Array> {
+    let mut values = Vec::with_capacity(len);
+    let mut nulls = NullBufferBuilder::new(len);
+    for value in rows {
+        match value {
+            Some(value) => {
+                values.push(value);
+                nulls.append_non_null();
+            }
+            None => {
+                values.push(0);
+                nulls.append_null();
             }
         }
     }
+    Decimal128Array::from_field_and_values(field, values).with_nulls(nulls.finish())
 }
 
 #[inline(never)]

@@ -46,6 +46,12 @@ pub trait Division: NumericNative {
     #[must_use]
     fn floor_rem(self, divisor: Self) -> Self;
 
+    /// [`Self::floor_rem`] by a divisor every row shares, whose sign `divisor_negative` is
+    /// decided once: the remainder then moves into the divisor's sign with one shift and
+    /// add, instead of a comparison of both signs per row.
+    #[must_use]
+    fn floor_rem_by(self, divisor: Self, divisor_negative: bool) -> Self;
+
     /// The quotient rounded toward zero.
     #[must_use]
     fn trunc_div(self, divisor: Self) -> Self;
@@ -88,6 +94,20 @@ macro_rules! impl_signed_division {
             }
 
             #[inline]
+            fn floor_rem_by(self, divisor: Self, divisor_negative: bool) -> Self {
+                let remainder = self.wrapping_rem(divisor);
+                // All ones where the remainder's sign is the opposite of the divisor's: a
+                // negative remainder under a positive divisor, or a positive one under a
+                // negative divisor. The branch is on a value fixed across rows.
+                let opposite = if divisor_negative {
+                    Self::from(remainder > 0).wrapping_neg()
+                } else {
+                    remainder >> (Self::BITS - 1)
+                };
+                remainder.wrapping_add(divisor & opposite)
+            }
+
+            #[inline]
             fn trunc_div(self, divisor: Self) -> Self {
                 self.wrapping_div(divisor)
             }
@@ -123,6 +143,11 @@ macro_rules! impl_unsigned_division {
 
             #[inline]
             fn floor_rem(self, divisor: Self) -> Self {
+                self % divisor
+            }
+
+            #[inline]
+            fn floor_rem_by(self, divisor: Self, _divisor_negative: bool) -> Self {
                 self % divisor
             }
 
@@ -178,6 +203,11 @@ macro_rules! impl_float_division {
             }
 
             #[inline]
+            fn floor_rem_by(self, divisor: Self, _divisor_negative: bool) -> Self {
+                self.floor_rem(divisor)
+            }
+
+            #[inline]
             fn trunc_div(self, divisor: Self) -> Self {
                 (self / divisor).trunc()
             }
@@ -222,16 +252,31 @@ where
     (values, any_without_quotient)
 }
 
+/// `op` for any divisor sign: an operation that needs no sign decided ahead of the rows.
+fn for_any_sign<N, F>(op: F) -> impl Fn(N, N, bool) -> N + Copy
+where
+    F: Fn(N, N) -> N + Copy,
+{
+    move |dividend, divisor, _| op(dividend, divisor)
+}
+
 /// Applies a division `op` to every row, broadcasting a single value on either side.
 ///
-/// A row is null where an input is null or its divisor has no quotient. The result
-/// takes the dividend's name and type.
+/// A divisor every row shares goes through `by_shared`, with its sign decided once. A
+/// row is null where an input is null or its divisor has no quotient. The result takes
+/// the dividend's name and type.
 #[inline(never)]
-fn divide_rows<T, F>(lhs: &DataArray<T>, rhs: &DataArray<T>, op: F) -> DaftResult<DataArray<T>>
+fn divide_rows<T, F, G>(
+    lhs: &DataArray<T>,
+    rhs: &DataArray<T>,
+    op: F,
+    by_shared: G,
+) -> DaftResult<DataArray<T>>
 where
     T: DaftNumericType,
     T::Native: Division,
     F: Fn(T::Native, T::Native) -> T::Native + Copy,
+    G: Fn(T::Native, T::Native, bool) -> T::Native + Copy,
 {
     let (lhs_values, rhs_values) = (lhs.values(), rhs.values());
     match (lhs.len(), rhs.len()) {
@@ -250,11 +295,16 @@ where
             DataArray::from_field_and_values(lhs.field.clone(), values).with_nulls(nulls)
         }
         (len, 1) => match rhs.get(0) {
-            Some(divisor) if !divisor.has_no_quotient() => DataArray::from_field_and_values(
-                lhs.field.clone(),
-                lhs_values.iter().map(|dividend| op(*dividend, divisor)),
-            )
-            .with_nulls(lhs.nulls().cloned()),
+            Some(divisor) if !divisor.has_no_quotient() => {
+                let negative = divisor < T::Native::zero();
+                DataArray::from_field_and_values(
+                    lhs.field.clone(),
+                    lhs_values
+                        .iter()
+                        .map(|dividend| by_shared(*dividend, divisor, negative)),
+                )
+                .with_nulls(lhs.nulls().cloned())
+            }
             _ => Ok(DataArray::full_null(lhs.name(), lhs.data_type(), len)),
         },
         (1, len) => match lhs.get(0) {
@@ -290,7 +340,12 @@ where
     ///
     /// Returns [`DaftError::ValueError`] for lengths that cannot broadcast.
     pub fn floor_divide(&self, rhs: &Self) -> DaftResult<Self> {
-        divide_rows(self, rhs, Division::floor_div)
+        divide_rows(
+            self,
+            rhs,
+            Division::floor_div,
+            for_any_sign(Division::floor_div),
+        )
     }
 
     /// `self % rhs` with the divisor's sign, so that `a == b * (a // b) + a % b`.
@@ -302,7 +357,7 @@ where
     ///
     /// Returns [`DaftError::ValueError`] for lengths that cannot broadcast.
     pub fn floored_remainder(&self, rhs: &Self) -> DaftResult<Self> {
-        divide_rows(self, rhs, Division::floor_rem)
+        divide_rows(self, rhs, Division::floor_rem, Division::floor_rem_by)
     }
 
     /// `self / rhs` rounded toward zero, as SQL's integer division does.
@@ -314,7 +369,12 @@ where
     ///
     /// Returns [`DaftError::ValueError`] for lengths that cannot broadcast.
     pub fn truncated_divide(&self, rhs: &Self) -> DaftResult<Self> {
-        divide_rows(self, rhs, Division::trunc_div)
+        divide_rows(
+            self,
+            rhs,
+            Division::trunc_div,
+            for_any_sign(Division::trunc_div),
+        )
     }
 
     /// `self % rhs` with the dividend's sign, as SQL's `%` and `MOD` do.
@@ -326,7 +386,12 @@ where
     ///
     /// Returns [`DaftError::ValueError`] for lengths that cannot broadcast.
     pub fn truncated_remainder(&self, rhs: &Self) -> DaftResult<Self> {
-        divide_rows(self, rhs, Division::trunc_rem)
+        divide_rows(
+            self,
+            rhs,
+            Division::trunc_rem,
+            for_any_sign(Division::trunc_rem),
+        )
     }
 }
 
@@ -360,6 +425,30 @@ mod tests {
         // Each pair keeps the identity a == b·q + r.
         assert_eq!(b * floor_q + floor_r, a);
         assert_eq!(b * trunc_q + trunc_r, a);
+    }
+
+    #[test]
+    fn the_remainder_by_a_shared_divisor_is_the_floored_remainder() {
+        for dividend in i8::MIN..=i8::MAX {
+            for divisor in (i8::MIN..=i8::MAX).filter(|d| *d != 0) {
+                assert_eq!(
+                    dividend.floor_rem_by(divisor, divisor < 0),
+                    dividend.floor_rem(divisor),
+                    "{dividend} % {divisor}"
+                );
+            }
+        }
+        for (dividend, divisor) in [
+            (i64::MIN, -1),
+            (i64::MIN, 7),
+            (i64::MAX, -7),
+            (-1, i64::MIN),
+        ] {
+            assert_eq!(
+                dividend.floor_rem_by(divisor, divisor < 0),
+                dividend.floor_rem(divisor)
+            );
+        }
     }
 
     #[test]

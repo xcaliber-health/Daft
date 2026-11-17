@@ -196,6 +196,10 @@ impl JoinOperator for HashJoinOperator {
         ))
     }
 
+    fn build_repeats_keys(&self, state: &Self::FinalizedBuildState) -> Option<bool> {
+        Some(state.repeats_keys())
+    }
+
     fn make_build_state(&self) -> DaftResult<Self::BuildState> {
         HashJoinBuildState::new(
             &self.params.key_schema,

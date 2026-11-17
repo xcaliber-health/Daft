@@ -4,5 +4,6 @@ mod optimizer;
 mod rules;
 #[cfg(test)]
 mod test;
+pub(crate) mod uniqueness;
 
 pub use optimizer::{Optimizer, OptimizerBuilder, OptimizerConfig};

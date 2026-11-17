@@ -3904,6 +3904,40 @@ class DataFrame:
         return DataFrame(builder)
 
     @DataframePublicAPI
+    def assume_unique(self, *columns: str) -> "DataFrame":
+        """States that no two rows of this DataFrame share values in ``columns``.
+
+        The statement is not checked. It only helps plan queries over this DataFrame, such
+        as deciding whether an aggregation should run before a join: a wrong statement may
+        make a query slower, and never changes a result. Each call adds a key.
+
+        Note:
+            Only a DataFrame read directly from a source, before any other operation, can
+            take this statement.
+
+        Args:
+            *columns (str): The columns whose values together identify each row.
+
+        Returns:
+            DataFrame: This DataFrame, with the statement attached.
+
+        Raises:
+            ValueError: If no column is given, a column does not exist, or the DataFrame is
+                not read directly from a source.
+
+        Examples:
+            >>> import daft
+            >>> df = daft.from_pydict({"id": [1, 2, 3], "name": ["a", "b", "c"]})
+            >>> df = df.assume_unique("id")
+            >>> df.count_rows()
+            3
+        """
+        if not columns:
+            raise ValueError("assume_unique needs at least one column")
+        builder = self._builder.with_assumed_key(list(columns))
+        return DataFrame(builder)
+
+    @DataframePublicAPI
     def join(
         self,
         other: "DataFrame",

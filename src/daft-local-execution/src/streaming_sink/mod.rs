@@ -4,5 +4,6 @@ pub mod base;
 pub mod distributed_limit;
 pub mod limit;
 pub mod monotonically_increasing_id;
+pub mod partial_aggregate;
 pub mod sample;
 pub mod vllm;

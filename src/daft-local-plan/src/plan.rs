@@ -97,6 +97,7 @@ pub enum LocalPhysicalPlan {
     // ReduceMerge(ReduceMerge),
     UnGroupedAggregate(UnGroupedAggregate),
     HashAggregate(HashAggregate),
+    PartialHashAggregate(PartialHashAggregate),
     Dedup(Dedup),
     Pivot(Pivot),
     Concat(Concat),
@@ -175,6 +176,7 @@ impl LocalPhysicalPlan {
             | Self::StageCheckpointKeys(StageCheckpointKeys { stats_state, .. })
             | Self::UnGroupedAggregate(UnGroupedAggregate { stats_state, .. })
             | Self::HashAggregate(HashAggregate { stats_state, .. })
+            | Self::PartialHashAggregate(PartialHashAggregate { stats_state, .. })
             | Self::Dedup(Dedup { stats_state, .. })
             | Self::Pivot(Pivot { stats_state, .. })
             | Self::Concat(Concat { stats_state, .. })
@@ -228,6 +230,7 @@ impl LocalPhysicalPlan {
             | Self::StageCheckpointKeys(StageCheckpointKeys { context, .. })
             | Self::UnGroupedAggregate(UnGroupedAggregate { context, .. })
             | Self::HashAggregate(HashAggregate { context, .. })
+            | Self::PartialHashAggregate(PartialHashAggregate { context, .. })
             | Self::Dedup(Dedup { context, .. })
             | Self::Pivot(Pivot { context, .. })
             | Self::Concat(Concat { context, .. })
@@ -278,6 +281,7 @@ impl LocalPhysicalPlan {
             | Self::StageCheckpointKeys(StageCheckpointKeys { context, .. })
             | Self::UnGroupedAggregate(UnGroupedAggregate { context, .. })
             | Self::HashAggregate(HashAggregate { context, .. })
+            | Self::PartialHashAggregate(PartialHashAggregate { context, .. })
             | Self::Dedup(Dedup { context, .. })
             | Self::Pivot(Pivot { context, .. })
             | Self::Concat(Concat { context, .. })
@@ -596,6 +600,28 @@ impl LocalPhysicalPlan {
         context: LocalNodeContext,
     ) -> LocalPhysicalPlanRef {
         Self::HashAggregate(HashAggregate {
+            input,
+            aggregations,
+            group_by,
+            schema,
+            stats_state,
+            context,
+        })
+        .arced()
+    }
+
+    /// A grouped partial aggregation: rows whose per-group merge, by each aggregation's
+    /// merge function, equals the whole aggregation of `input`. It may answer any number of
+    /// rows per group.
+    pub fn partial_hash_aggregate(
+        input: LocalPhysicalPlanRef,
+        aggregations: Vec<BoundAggExpr>,
+        group_by: Vec<BoundExpr>,
+        schema: SchemaRef,
+        stats_state: StatsState,
+        context: LocalNodeContext,
+    ) -> LocalPhysicalPlanRef {
+        Self::PartialHashAggregate(PartialHashAggregate {
             input,
             aggregations,
             group_by,
@@ -1187,6 +1213,7 @@ impl LocalPhysicalPlan {
             | Self::UDFProject(UDFProject { schema, .. })
             | Self::UnGroupedAggregate(UnGroupedAggregate { schema, .. })
             | Self::HashAggregate(HashAggregate { schema, .. })
+            | Self::PartialHashAggregate(PartialHashAggregate { schema, .. })
             | Self::Dedup(Dedup { schema, .. })
             | Self::Pivot(Pivot { schema, .. })
             | Self::Sort(Sort { schema, .. })
@@ -1272,6 +1299,7 @@ impl LocalPhysicalPlan {
             | Self::UDFProject(UDFProject { input, .. })
             | Self::UnGroupedAggregate(UnGroupedAggregate { input, .. })
             | Self::HashAggregate(HashAggregate { input, .. })
+            | Self::PartialHashAggregate(PartialHashAggregate { input, .. })
             | Self::Dedup(Dedup { input, .. })
             | Self::Pivot(Pivot { input, .. })
             | Self::Sort(Sort { input, .. })
@@ -1407,6 +1435,20 @@ impl LocalPhysicalPlan {
                     context,
                     ..
                 }) => Self::hash_aggregate(
+                    new_child.clone(),
+                    aggregations.clone(),
+                    group_by.clone(),
+                    schema.clone(),
+                    StatsState::NotMaterialized,
+                    context.clone(),
+                ),
+                Self::PartialHashAggregate(PartialHashAggregate {
+                    aggregations,
+                    group_by,
+                    schema,
+                    context,
+                    ..
+                }) => Self::partial_hash_aggregate(
                     new_child.clone(),
                     aggregations.clone(),
                     group_by.clone(),
@@ -2184,6 +2226,19 @@ pub struct UnGroupedAggregate {
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub struct HashAggregate {
     pub input: LocalPhysicalPlanRef,
+    pub aggregations: Vec<BoundAggExpr>,
+    pub group_by: Vec<BoundExpr>,
+    pub schema: SchemaRef,
+    pub stats_state: StatsState,
+    pub context: LocalNodeContext,
+}
+
+/// A grouped partial aggregation; see [`LocalPhysicalPlan::partial_hash_aggregate`].
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub struct PartialHashAggregate {
+    pub input: LocalPhysicalPlanRef,
+    /// Aggregations whose partials each combine with an aggregation of the same kind.
     pub aggregations: Vec<BoundAggExpr>,
     pub group_by: Vec<BoundExpr>,
     pub schema: SchemaRef,

@@ -830,7 +830,7 @@ mod tests {
             binary_op(Operator::Plus, resolved_col("b"), two).alias("y"),
         ];
 
-        let projection = Project::try_new(source.clone(), expressions.clone())?;
+        let projection = Project::try_new(source, expressions.clone())?;
 
         assert_eq!(projection.projection, expressions);
         assert!(matches!(projection.input.as_ref(), LogicalPlan::Source(_)));

@@ -122,6 +122,9 @@ pub trait Probeable: Send + Sync {
         &'a self,
         table: RecordBatch,
     ) -> DaftResult<Box<dyn Iterator<Item = bool> + 'a>>;
+
+    /// Whether some key matches more than one row added, so a probe row can match many.
+    fn repeats_keys(&self) -> bool;
 }
 
 #[derive(Clone)]
@@ -161,5 +164,82 @@ impl ProbeState {
 
     pub fn get_record_batches(&self) -> &[RecordBatch] {
         &self.record_batches
+    }
+
+    /// Whether some key matches more than one row, so a probe row can match many.
+    pub fn repeats_keys(&self) -> bool {
+        self.probeable.repeats_keys()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use daft_core::prelude::*;
+    use rstest::rstest;
+
+    use super::{ProbeState, make_probeable_builder};
+    use crate::RecordBatch;
+
+    fn ints(name: &str, values: &[Option<i64>]) -> Series {
+        Int64Array::from_iter(Field::new(name, DataType::Int64), values.iter().copied())
+            .into_series()
+    }
+
+    fn texts(name: &str, values: &[Option<&str>]) -> Series {
+        Utf8Array::from_iter(name, values.iter().copied()).into_series()
+    }
+
+    /// Whether a table built from `columns`, added in two halves, repeats a key.
+    fn repeats(columns: Vec<Series>, nulls_equal: Option<Vec<bool>>) -> bool {
+        let batch = RecordBatch::from_nonempty_columns(columns).unwrap();
+        let mut builder =
+            make_probeable_builder(batch.schema.clone(), nulls_equal.as_ref(), true).unwrap();
+        let half = batch.len() / 2;
+        builder.add_table(&batch.slice(0, half).unwrap()).unwrap();
+        builder
+            .add_table(&batch.slice(half, batch.len()).unwrap())
+            .unwrap();
+        builder.build().repeats_keys()
+    }
+
+    #[rstest]
+    #[case::unique_ints(vec![ints("k", &[Some(1), Some(2), Some(3), Some(4)])], false)]
+    #[case::an_int_repeated_across_adds(vec![ints("k", &[Some(1), Some(2), Some(3), Some(1)])], true)]
+    #[case::null_int_keys_match_nothing(vec![ints("k", &[None, Some(2), None, Some(4)])], false)]
+    #[case::unique_texts(vec![texts("k", &[Some("a"), Some("b"), Some("c"), Some("d")])], false)]
+    #[case::a_text_repeated(vec![texts("k", &[Some("a"), Some("b"), Some("a"), Some("d")])], true)]
+    #[case::null_text_keys_match_nothing(vec![texts("k", &[None, Some("b"), None, Some("d")])], false)]
+    #[case::unique_pairs_of_repeated_columns(
+        vec![ints("a", &[Some(1), Some(1), Some(2), Some(2)]), ints("b", &[Some(1), Some(2), Some(1), Some(2)])],
+        false
+    )]
+    #[case::a_repeated_pair(
+        vec![ints("a", &[Some(1), Some(1), Some(2), Some(1)]), ints("b", &[Some(1), Some(2), Some(1), Some(1)])],
+        true
+    )]
+    fn a_built_table_says_whether_some_key_matches_two_rows(
+        #[case] columns: Vec<Series>,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(repeats(columns, None), expected);
+    }
+
+    #[test]
+    fn null_keys_that_compare_equal_repeat() {
+        let keys = ints("k", &[None, Some(2), None, Some(4)]);
+
+        assert!(repeats(vec![keys], Some(vec![true])));
+    }
+
+    #[test]
+    fn a_probe_state_reports_its_table() {
+        let batch =
+            RecordBatch::from_nonempty_columns(vec![ints("k", &[Some(1), Some(1)])]).unwrap();
+        let mut builder = make_probeable_builder(batch.schema.clone(), None, true).unwrap();
+        builder.add_table(&batch).unwrap();
+
+        let state = ProbeState::new(builder.build(), vec![batch]);
+
+        assert!(state.repeats_keys());
     }
 }

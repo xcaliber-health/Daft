@@ -213,6 +213,7 @@ impl PushDownLimit {
                     | LogicalPlan::Unpivot(..)
                     | LogicalPlan::Pivot(..)
                     | LogicalPlan::Aggregate(..)
+                    | LogicalPlan::PartialAggregate(..)
                     | LogicalPlan::Intersect(..)
                     | LogicalPlan::Union(..)
                     | LogicalPlan::Sink(..)

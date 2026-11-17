@@ -49,6 +49,7 @@ pub enum LogicalPlan {
     IntoPartitions(IntoPartitions),
     Distinct(Distinct),
     Aggregate(Aggregate),
+    PartialAggregate(PartialAggregate),
     Pivot(Pivot),
     Concat(Concat),
     Intersect(Intersect),
@@ -191,6 +192,7 @@ impl LogicalPlan {
             Self::IntoPartitions(IntoPartitions { input, .. }) => Self::schema_of_input(input),
             Self::Distinct(Distinct { input, .. }) => Self::schema_of_input(input),
             Self::Aggregate(Aggregate { output_schema, .. }) => output_schema.clone(),
+            Self::PartialAggregate(PartialAggregate { output_schema, .. }) => output_schema.clone(),
             Self::Pivot(Pivot { output_schema, .. }) => output_schema.clone(),
             Self::Concat(Concat { input, .. }) => Self::schema_of_input(input),
             Self::Intersect(Intersect { lhs, .. }) => Self::schema_of_input(lhs),
@@ -306,6 +308,16 @@ impl LogicalPlan {
                 }
             }
             Self::Aggregate(aggregate) => {
+                let res = aggregate
+                    .aggregations
+                    .iter()
+                    .flat_map(|agg| agg.children())
+                    .flat_map(|e| get_required_columns(&e))
+                    .chain(aggregate.groupby.iter().flat_map(get_required_columns))
+                    .collect();
+                RequiredCols::new(res, None)
+            }
+            Self::PartialAggregate(aggregate) => {
                 let res = aggregate
                     .aggregations
                     .iter()
@@ -444,6 +456,7 @@ impl LogicalPlan {
             Self::IntoPartitions(..) => "IntoPartitions",
             Self::Distinct(..) => "Distinct",
             Self::Aggregate(..) => "Aggregate",
+            Self::PartialAggregate(..) => "PartialAggregate",
             Self::Pivot(..) => "Pivot",
             Self::Concat(..) => "Concat",
             Self::Join(..) => "Join",
@@ -479,6 +492,7 @@ impl LogicalPlan {
             | Self::IntoPartitions(IntoPartitions { stats_state, .. })
             | Self::Distinct(Distinct { stats_state, .. })
             | Self::Aggregate(Aggregate { stats_state, .. })
+            | Self::PartialAggregate(PartialAggregate { stats_state, .. })
             | Self::Pivot(Pivot { stats_state, .. })
             | Self::Concat(Concat { stats_state, .. })
             | Self::Join(Join { stats_state, .. })
@@ -523,6 +537,7 @@ impl LogicalPlan {
             Self::IntoPartitions(plan) => Self::IntoPartitions(plan.with_materialized_stats()),
             Self::Distinct(plan) => Self::Distinct(plan.with_materialized_stats()),
             Self::Aggregate(plan) => Self::Aggregate(plan.with_materialized_stats()),
+            Self::PartialAggregate(plan) => Self::PartialAggregate(plan.with_materialized_stats()),
             Self::Pivot(plan) => Self::Pivot(plan.with_materialized_stats()),
             Self::Concat(plan) => Self::Concat(plan.with_materialized_stats()),
             Self::Join(plan) => Self::Join(plan.with_materialized_stats()),
@@ -565,6 +580,7 @@ impl LogicalPlan {
             Self::IntoPartitions(into_partitions) => into_partitions.multiline_display(),
             Self::Distinct(distinct) => distinct.multiline_display(),
             Self::Aggregate(aggregate) => aggregate.multiline_display(),
+            Self::PartialAggregate(aggregate) => aggregate.multiline_display(),
             Self::Pivot(pivot) => pivot.multiline_display(),
             Self::Concat(concat) => concat.multiline_display(),
             Self::Intersect(inner) => inner.multiline_display(),
@@ -602,6 +618,7 @@ impl LogicalPlan {
             Self::IntoPartitions(IntoPartitions { input, .. }) => vec![input],
             Self::Distinct(Distinct { input, .. }) => vec![input],
             Self::Aggregate(Aggregate { input, .. }) => vec![input],
+            Self::PartialAggregate(PartialAggregate { input, .. }) => vec![input],
             Self::Pivot(Pivot { input, .. }) => vec![input],
             Self::Concat(Concat { input, other, .. }) => vec![input, other],
             Self::Join(Join { left, right, .. }) => vec![left, right],
@@ -701,6 +718,14 @@ impl LogicalPlan {
                     ..
                 }) => Self::Aggregate(
                     Aggregate::try_new(input.clone(), aggregations.clone(), groupby.clone())
+                        .unwrap(),
+                ),
+                Self::PartialAggregate(PartialAggregate {
+                    aggregations,
+                    groupby,
+                    ..
+                }) => Self::PartialAggregate(
+                    PartialAggregate::try_new(input.clone(), aggregations.clone(), groupby.clone())
                         .unwrap(),
                 ),
                 Self::Pivot(Pivot {
@@ -1080,6 +1105,7 @@ impl LogicalPlan {
             | Self::IntoPartitions(IntoPartitions { plan_id, .. })
             | Self::Distinct(Distinct { plan_id, .. })
             | Self::Aggregate(Aggregate { plan_id, .. })
+            | Self::PartialAggregate(PartialAggregate { plan_id, .. })
             | Self::Pivot(Pivot { plan_id, .. })
             | Self::Concat(Concat { plan_id, .. })
             | Self::Intersect(Intersect { plan_id, .. })
@@ -1115,6 +1141,7 @@ impl LogicalPlan {
             | Self::IntoPartitions(IntoPartitions { node_id, .. })
             | Self::Distinct(Distinct { node_id, .. })
             | Self::Aggregate(Aggregate { node_id, .. })
+            | Self::PartialAggregate(PartialAggregate { node_id, .. })
             | Self::Pivot(Pivot { node_id, .. })
             | Self::Concat(Concat { node_id, .. })
             | Self::Intersect(Intersect { node_id, .. })
@@ -1155,6 +1182,9 @@ impl LogicalPlan {
             }
             Self::Distinct(distinct) => Self::Distinct(distinct.with_plan_id(plan_id)),
             Self::Aggregate(aggregate) => Self::Aggregate(aggregate.with_plan_id(plan_id)),
+            Self::PartialAggregate(aggregate) => {
+                Self::PartialAggregate(aggregate.with_plan_id(plan_id))
+            }
             Self::Pivot(pivot) => Self::Pivot(pivot.with_plan_id(plan_id)),
             Self::Concat(concat) => Self::Concat(concat.with_plan_id(plan_id)),
             Self::Intersect(intersect) => Self::Intersect(intersect.with_plan_id(plan_id)),
@@ -1201,6 +1231,9 @@ impl LogicalPlan {
             }
             Self::Distinct(distinct) => Self::Distinct(distinct.with_node_id(node_id)),
             Self::Aggregate(aggregate) => Self::Aggregate(aggregate.with_node_id(node_id)),
+            Self::PartialAggregate(aggregate) => {
+                Self::PartialAggregate(aggregate.with_node_id(node_id))
+            }
             Self::Pivot(pivot) => Self::Pivot(pivot.with_node_id(node_id)),
             Self::Concat(concat) => Self::Concat(concat.with_node_id(node_id)),
             Self::Intersect(intersect) => Self::Intersect(intersect.with_node_id(node_id)),
@@ -1321,6 +1354,7 @@ impl_from_data_struct_for_logical_plan!(Repartition);
 impl_from_data_struct_for_logical_plan!(IntoPartitions);
 impl_from_data_struct_for_logical_plan!(Distinct);
 impl_from_data_struct_for_logical_plan!(Aggregate);
+impl_from_data_struct_for_logical_plan!(PartialAggregate);
 impl_from_data_struct_for_logical_plan!(Pivot);
 impl_from_data_struct_for_logical_plan!(Concat);
 impl_from_data_struct_for_logical_plan!(Intersect);

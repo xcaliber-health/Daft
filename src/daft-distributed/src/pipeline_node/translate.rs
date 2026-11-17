@@ -26,11 +26,11 @@ use crate::{
         explode::ExplodeNode, filter::FilterNode, glob_scan_source::GlobScanSourceNode,
         in_memory_source::InMemorySourceNode, into_batches::IntoBatchesNode,
         into_partitions::IntoPartitionsNode, limit::LimitNode,
-        monotonically_increasing_id::MonotonicallyIncreasingIdNode, pivot::PivotNode,
-        project::ProjectNode, random_shuffle::RandomShuffleNode, sample::SampleNode,
-        scan_source::ScanSourceNode, sink::SinkNode, sort::SortNode,
-        stage_checkpoint_keys::StageCheckpointKeysNode, top_n::TopNNode, udf::UDFNode,
-        unpivot::UnpivotNode, vllm::VLLMNode, window::WindowNode,
+        monotonically_increasing_id::MonotonicallyIncreasingIdNode,
+        partial_aggregate::PartialAggregateNode, pivot::PivotNode, project::ProjectNode,
+        random_shuffle::RandomShuffleNode, sample::SampleNode, scan_source::ScanSourceNode,
+        sink::SinkNode, sort::SortNode, stage_checkpoint_keys::StageCheckpointKeysNode,
+        top_n::TopNNode, udf::UDFNode, unpivot::UnpivotNode, vllm::VLLMNode, window::WindowNode,
     },
     plan::PlanConfig,
 };
@@ -420,6 +420,26 @@ impl TreeNodeVisitor for LogicalPlanToPipelineNodeTranslator {
                     group_by,
                     input_size_bytes,
                 )?
+            }
+            LogicalPlan::PartialAggregate(aggregate) => {
+                let input_schema = aggregate.input.schema();
+                let group_by = BoundExpr::bind_all(&aggregate.groupby, &input_schema)?;
+                let aggregations = aggregate
+                    .aggregations
+                    .iter()
+                    .map(|expr| BoundAggExpr::try_new(extract_agg_expr(expr)?, &input_schema))
+                    .collect::<DaftResult<Vec<_>>>()?;
+                DistributedPipelineNode::new(
+                    Arc::new(PartialAggregateNode::new(
+                        self.get_next_pipeline_node_id(),
+                        &self.plan_config,
+                        group_by,
+                        aggregations,
+                        aggregate.output_schema.clone(),
+                        self.curr_node.pop().unwrap(),
+                    )),
+                    &self.meter,
+                )
             }
             LogicalPlan::Distinct(distinct) => {
                 let columns = distinct.columns.clone().unwrap_or_else(|| {

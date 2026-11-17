@@ -278,6 +278,7 @@ impl OptimizerRule for PushDownAntiSemiJoin {
                     | LogicalPlan::Unpivot(..)
                     | LogicalPlan::Pivot(..)
                     | LogicalPlan::Aggregate(..)
+                    | LogicalPlan::PartialAggregate(..)
                     | LogicalPlan::Intersect(..)
                     | LogicalPlan::Union(..)
                     | LogicalPlan::Sink(..)

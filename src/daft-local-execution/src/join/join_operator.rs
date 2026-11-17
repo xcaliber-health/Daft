@@ -122,6 +122,12 @@ pub(crate) trait JoinOperator: Send + Sync {
         None
     }
 
+    /// Whether a finished build side matches some key to more than one row, so the join
+    /// may repeat a probe row; `None` when the operator does not know.
+    fn build_repeats_keys(&self, _state: &Self::FinalizedBuildState) -> Option<bool> {
+        None
+    }
+
     /// Releases the raw input batches retained by an in-progress build
     /// state so the build side can be re-partitioned to disk. Returns the
     /// state unchanged in `Err` when raw input cannot be recovered; the

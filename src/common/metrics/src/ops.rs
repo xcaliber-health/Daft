@@ -62,6 +62,9 @@ pub enum NodeType {
     // Specific to distributed only
     BroadcastJoin,
     KeyFilteringJoin,
+
+    // A streaming sink, listed last so earlier variants keep their encoding.
+    PartialGroupByAgg,
 }
 
 impl Display for NodeType {

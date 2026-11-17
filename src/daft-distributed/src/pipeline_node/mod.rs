@@ -55,6 +55,7 @@ mod limit;
 pub(crate) mod materialize;
 pub(crate) mod metrics;
 mod monotonically_increasing_id;
+mod partial_aggregate;
 mod pivot;
 mod project;
 mod random_shuffle;

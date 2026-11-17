@@ -87,6 +87,8 @@ fn optimizer_config(cfg: Option<&DaftPlanningConfig>) -> OptimizerConfig {
     OptimizerConfig {
         strict_pushdown: cfg.is_some_and(|conf| conf.enable_strict_filter_pushdown),
         join_key_inference: !cfg.is_some_and(|conf| conf.disable_join_key_inference),
+        partial_aggregate_pushdown: !cfg
+            .is_some_and(|conf| conf.disable_partial_aggregate_pushdown),
         ..Default::default()
     }
 }
@@ -185,6 +187,28 @@ impl LogicalPlanBuilder {
             }
             other => Err(DaftError::ValueError(format!(
                 "with_checkpoint can only be called on a Source node, got: {}",
+                other.name()
+            ))),
+        }
+    }
+
+    /// States that the current plan's Source rows are unique by `columns`.
+    ///
+    /// The statement is not checked. It informs cost decisions only, never a rewrite
+    /// that could change an answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the plan root is not a Source, or when `columns` is empty
+    /// or names a column the Source does not output.
+    pub fn with_assumed_key(&self, columns: Vec<String>) -> DaftResult<Self> {
+        match self.plan.as_ref() {
+            LogicalPlan::Source(source) => {
+                let source = source.clone().with_assumed_key(columns)?;
+                Ok(self.with_new_plan(LogicalPlan::Source(source)))
+            }
+            other => Err(DaftError::ValueError(format!(
+                "Rows can be assumed unique only on a frame read directly from a source, got: {}",
                 other.name()
             ))),
         }
@@ -1087,6 +1111,7 @@ impl LogicalPlanBuilder {
                         builder.reorder_joins(Some(execution_config.clone()), use_dp_ccp)
                     },
                 )
+                .push_partial_aggregates()
                 .simplify_expressions()
                 .split_granular_projections()
                 .enrich_with_stats(Some(execution_config))
@@ -1152,6 +1177,7 @@ impl LogicalPlanBuilder {
                     builder.reorder_joins(Some(execution_config.clone()), use_dp_ccp)
                 },
             )
+            .push_partial_aggregates()
             .simplify_expressions()
             .split_granular_projections()
             .enrich_with_stats(Some(execution_config))
@@ -1317,6 +1343,10 @@ impl PyLogicalPlanBuilder {
         config: common_checkpoint_config::python::PyCheckpointConfig,
     ) -> PyResult<Self> {
         Ok(self.builder.with_checkpoint(config.config)?.into())
+    }
+
+    pub fn with_assumed_key(&self, columns: Vec<String>) -> PyResult<Self> {
+        Ok(self.builder.with_assumed_key(columns)?.into())
     }
 
     pub fn with_planning_config(

@@ -48,6 +48,7 @@ impl PushDownShard {
                     | LogicalPlan::IntoBatches(_)
                     | LogicalPlan::Distinct(_)
                     | LogicalPlan::Aggregate(_)
+                    | LogicalPlan::PartialAggregate(_)
                     | LogicalPlan::Pivot(_)
                     | LogicalPlan::Sink(_)
                     | LogicalPlan::Sample(_)

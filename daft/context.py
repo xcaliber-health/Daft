@@ -183,6 +183,7 @@ def set_planning_config(
     default_io_config: IOConfig | None = None,
     enable_strict_filter_pushdown: bool | None = None,
     disable_join_key_inference: bool | None = None,
+    disable_partial_aggregate_pushdown: bool | None = None,
 ) -> DaftContext:
     """Globally sets various configuration parameters which control Daft plan construction behavior.
 
@@ -196,6 +197,10 @@ def set_planning_config(
         disable_join_key_inference: Whether to stop deriving a restriction on one side of an equi-join from a
             restriction on the other side's key, such as reading the joined table only for the keys a filtered
             table keeps. Derivation never changes an answer. Defaults to False, which derives.
+        disable_partial_aggregate_pushdown: Whether to stop pushing a partial aggregation below an equi-join
+            whose aggregations read one side, such as counting each key's rows before a join that repeats them.
+            The push never changes an answer. It is made only where the other side's known keys, such as those
+            stated with DataFrame.assume_unique, say the join repeats rows. Defaults to False, which pushes there.
     """
     # Replace values in the DaftPlanningConfig with user-specified overrides
     ctx = get_context()
@@ -205,6 +210,7 @@ def set_planning_config(
             default_io_config=default_io_config,
             enable_strict_filter_pushdown=enable_strict_filter_pushdown,
             disable_join_key_inference=disable_join_key_inference,
+            disable_partial_aggregate_pushdown=disable_partial_aggregate_pushdown,
         )
 
         ctx._ctx._daft_planning_config = new_daft_planning_config
@@ -253,6 +259,9 @@ def set_execution_config(
     shuffle_aggregation_default_partitions: int | None = None,
     partial_aggregation_threshold: int | None = None,
     high_cardinality_aggregation_threshold: float | None = None,
+    partial_aggregate_pushdown_probe_rows: int | None = None,
+    partial_aggregate_pushdown_skip_ratio: float | None = None,
+    partial_aggregate_pushdown_max_buffer_bytes: int | None = None,
     read_sql_partition_size_bytes: int | None = None,
     default_morsel_size: int | None = None,
     shuffle_algorithm: str | None = None,
@@ -330,6 +339,12 @@ def set_execution_config(
         shuffle_aggregation_default_partitions: Maximum number of partitions to create when performing aggregations on the Ray Runner. Defaults to 200, unless the number of input partitions is less than 200.
         partial_aggregation_threshold: Threshold for performing partial aggregations on the Native Runner. Defaults to 10000 rows.
         high_cardinality_aggregation_threshold: Threshold selectivity for performing high cardinality aggregations on the Native Runner. Defaults to 0.8.
+        partial_aggregate_pushdown_probe_rows: Rows of its first batch a partial aggregation pushed below a join
+            samples to judge how much aggregating reduces them. Defaults to 100,000.
+        partial_aggregate_pushdown_skip_ratio: The ratio of distinct groups to sampled rows above which a partial
+            aggregation pushed below a join passes each row on instead of aggregating. Defaults to 0.5.
+        partial_aggregate_pushdown_max_buffer_bytes: Bytes of partial results a partial aggregation pushed below a join
+            holds before emitting them early. Defaults to 256MB.
         read_sql_partition_size_bytes: Target size of partition when reading from SQL databases. Defaults to 512MB
         default_morsel_size: Default size of morsels used for the new local executor. Defaults to 131072 rows.
         shuffle_algorithm: The shuffle algorithm to use. Defaults to "auto", which will let Daft determine the algorithm. Options are "map_reduce", "pre_shuffle_merge", and "flight_shuffle".
@@ -390,6 +405,9 @@ def set_execution_config(
             shuffle_aggregation_default_partitions=shuffle_aggregation_default_partitions,
             partial_aggregation_threshold=partial_aggregation_threshold,
             high_cardinality_aggregation_threshold=high_cardinality_aggregation_threshold,
+            partial_aggregate_pushdown_probe_rows=partial_aggregate_pushdown_probe_rows,
+            partial_aggregate_pushdown_skip_ratio=partial_aggregate_pushdown_skip_ratio,
+            partial_aggregate_pushdown_max_buffer_bytes=partial_aggregate_pushdown_max_buffer_bytes,
             read_sql_partition_size_bytes=read_sql_partition_size_bytes,
             default_morsel_size=default_morsel_size,
             shuffle_algorithm=shuffle_algorithm,

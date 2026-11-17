@@ -20,6 +20,8 @@ pub struct ProbeTable<T: ProbeContent> {
     tables: Vec<ArrowTableEntry>,
     nulls_equal: Vec<bool>,
     nans_equal: Vec<bool>,
+    /// Rows added; more than the keys held when a key repeats.
+    num_rows: usize,
 }
 
 impl<T: ProbeContent> ProbeTable<T> {
@@ -49,6 +51,7 @@ impl<T: ProbeContent> ProbeTable<T> {
             tables: vec![],
             nulls_equal,
             nans_equal,
+            num_rows: 0,
         })
     }
 
@@ -151,6 +154,7 @@ impl<T: ProbeContent> ProbeTable<T> {
 
         self.tables.push(ArrowTableEntry(current_arrays));
 
+        self.num_rows += hashes.len();
         for (i, h) in hashes.values().iter().enumerate() {
             let idx = table_offset | i;
             let entry = self.hash_table.raw_entry_mut().from_hash(*h, |other| {
@@ -199,6 +203,10 @@ impl<T: ProbeContent> Probeable for ProbeTable<T> {
     ) -> DaftResult<Box<dyn Iterator<Item = bool> + 'a>> {
         let iter = self.probe(table)?;
         Ok(Box::new(iter.map(|output| output.is_some())))
+    }
+
+    fn repeats_keys(&self) -> bool {
+        self.num_rows > self.hash_table.len()
     }
 }
 

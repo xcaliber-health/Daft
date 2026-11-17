@@ -470,6 +470,7 @@ impl<Op: JoinOperator + 'static> BuildExecutionContext<Op> {
             publisher.publish(
                 input_id,
                 finalized.and_then(|state| self.op.build_key_columns(state)),
+                finalized.and_then(|state| self.op.build_repeats_keys(state)),
             );
         }
     }

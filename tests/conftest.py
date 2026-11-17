@@ -30,6 +30,10 @@ def pytest_configure(config):
         "markers",
         "integration: mark test as an integration test that runs with external dependencies",
     )
+    config.addinivalue_line(
+        "markers",
+        "default_config: run without the configuration a module's autouse fixture sets",
+    )
 
 
 def get_tests_daft_runner_name() -> Literal["ray"] | Literal["native"]:

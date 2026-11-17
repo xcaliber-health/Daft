@@ -30,7 +30,7 @@ pub struct OptimizerConfig {
     /// carries ([`InferJoinKeyFilters`]).
     pub join_key_inference: bool,
     /// Whether to push a partial aggregation below an equi-join that its aggregations read
-    /// one side of ([`PushPartialAggregateThroughJoin`]).
+    /// one side of ([`PushPartialAggregateThroughJoin`]); off unless enabled.
     pub partial_aggregate_pushdown: bool,
 }
 
@@ -40,7 +40,7 @@ impl OptimizerConfig {
             default_max_optimizer_passes: max_optimizer_passes,
             strict_pushdown,
             join_key_inference,
-            partial_aggregate_pushdown: true,
+            partial_aggregate_pushdown: false,
         }
     }
 }

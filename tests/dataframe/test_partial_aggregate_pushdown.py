@@ -50,6 +50,16 @@ MODES = {
 }
 
 
+@pytest.fixture(autouse=True)
+def pushdown(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Turns the pushdown on, as a caller whose joins repeat rows would; it is off by default."""
+    if request.node.get_closest_marker("default_config"):
+        yield
+        return
+    with planning_config_ctx(enable_partial_aggregate_pushdown=True):
+        yield
+
+
 @pytest.fixture(params=sorted(MODES))
 def mode(request: pytest.FixtureRequest) -> Iterator[str]:
     with execution_config_ctx(**MODES[request.param]):
@@ -71,7 +81,7 @@ def in_order(columns: dict[str, list[object]], keys: list[str]) -> dict[str, lis
 
 
 def answer(build: Callable[[], DataFrame], keys: list[str], pushdown: bool) -> dict[str, list[object]]:
-    with planning_config_ctx(disable_partial_aggregate_pushdown=not pushdown):
+    with planning_config_ctx(enable_partial_aggregate_pushdown=pushdown):
         return in_order(build().to_pydict(), keys)
 
 
@@ -200,13 +210,17 @@ def test_a_distinct_count_is_not_aggregated_below_the_join() -> None:
     assert "PartialAggregation" not in plan(build)
 
 
-def test_turning_pushdown_off_leaves_the_plan_unchanged() -> None:
+@pytest.mark.default_config
+def test_pushdown_is_off_unless_enabled() -> None:
     def build() -> DataFrame:
         return (
             daft.from_pydict(LINK).join(daft.from_pydict(PEERS), on="owner").groupby("subject").agg(col("peer").sum())
         )
 
-    with planning_config_ctx(disable_partial_aggregate_pushdown=True):
+    assert "PartialAggregation" not in plan(build)
+    with planning_config_ctx(enable_partial_aggregate_pushdown=True):
+        assert "PartialAggregation" in plan(build)
+    with planning_config_ctx(enable_partial_aggregate_pushdown=False):
         assert "PartialAggregation" not in plan(build)
 
 
@@ -357,7 +371,7 @@ def test_rows_a_filtering_join_drops_are_dropped_before_they_are_aggregated(tmp_
     def build() -> DataFrame:
         return facts.join(dims, on="k").groupby("g").agg(col("v").sum().alias("s"), col("v").count().alias("n"))
 
-    with planning_config_ctx(disable_partial_aggregate_pushdown=False):
+    with planning_config_ctx(enable_partial_aggregate_pushdown=True):
         df = build().collect()
 
     assert "PartialAggregation" in plan(build)
@@ -399,7 +413,7 @@ def test_a_build_side_estimated_large_still_filters_the_partial_aggregation() ->
     # The build side is estimated past the size a scan waits for, as Q18's is, while its 20
     # keys still fit the budget for hashing them.
     with (
-        planning_config_ctx(disable_partial_aggregate_pushdown=False),
+        planning_config_ctx(enable_partial_aggregate_pushdown=True),
         execution_config_ctx(broadcast_join_size_bytes_threshold=1024),
     ):
         df = build().collect()
@@ -450,7 +464,7 @@ def test_events_are_aggregated_below_a_join_only_when_it_repeats_them(
             .agg(col("event_id").count().alias("n"))
         )
 
-    with planning_config_ctx(disable_partial_aggregate_pushdown=False):
+    with planning_config_ctx(enable_partial_aggregate_pushdown=True):
         df = build().collect()
 
     assert "PartialAggregation" in plan(build)

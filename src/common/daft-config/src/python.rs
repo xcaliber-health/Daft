@@ -29,13 +29,13 @@ impl PyDaftPlanningConfig {
         }
     }
 
-    #[pyo3(signature = (default_io_config=None, enable_strict_filter_pushdown=None, disable_join_key_inference=None, disable_partial_aggregate_pushdown=None))]
+    #[pyo3(signature = (default_io_config=None, enable_strict_filter_pushdown=None, disable_join_key_inference=None, enable_partial_aggregate_pushdown=None))]
     fn with_config_values(
         &mut self,
         default_io_config: Option<PyIOConfig>,
         enable_strict_filter_pushdown: Option<bool>,
         disable_join_key_inference: Option<bool>,
-        disable_partial_aggregate_pushdown: Option<bool>,
+        enable_partial_aggregate_pushdown: Option<bool>,
     ) -> PyResult<Self> {
         let mut config = self.config.as_ref().clone();
 
@@ -51,8 +51,8 @@ impl PyDaftPlanningConfig {
             config.disable_join_key_inference = disable_join_key_inference;
         }
 
-        if let Some(disable_partial_aggregate_pushdown) = disable_partial_aggregate_pushdown {
-            config.disable_partial_aggregate_pushdown = disable_partial_aggregate_pushdown;
+        if let Some(enable_partial_aggregate_pushdown) = enable_partial_aggregate_pushdown {
+            config.enable_partial_aggregate_pushdown = enable_partial_aggregate_pushdown;
         }
 
         Ok(Self {
@@ -77,9 +77,9 @@ impl PyDaftPlanningConfig {
         Ok(self.config.disable_join_key_inference)
     }
 
-    #[getter(disable_partial_aggregate_pushdown)]
-    fn disable_partial_aggregate_pushdown(&self) -> PyResult<bool> {
-        Ok(self.config.disable_partial_aggregate_pushdown)
+    #[getter(enable_partial_aggregate_pushdown)]
+    fn enable_partial_aggregate_pushdown(&self) -> PyResult<bool> {
+        Ok(self.config.enable_partial_aggregate_pushdown)
     }
 }
 

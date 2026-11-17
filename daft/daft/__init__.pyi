@@ -2794,7 +2794,7 @@ class PyDaftPlanningConfig:
         default_io_config: IOConfig | None = None,
         enable_strict_filter_pushdown: bool | None = None,
         disable_join_key_inference: bool | None = None,
-        disable_partial_aggregate_pushdown: bool | None = None,
+        enable_partial_aggregate_pushdown: bool | None = None,
     ) -> PyDaftPlanningConfig: ...
     @property
     def default_io_config(self) -> IOConfig: ...
@@ -2803,7 +2803,7 @@ class PyDaftPlanningConfig:
     @property
     def disable_join_key_inference(self) -> bool: ...
     @property
-    def disable_partial_aggregate_pushdown(self) -> bool: ...
+    def enable_partial_aggregate_pushdown(self) -> bool: ...
 
 class PyDaftEventLogConfig:
     @staticmethod

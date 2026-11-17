@@ -62,8 +62,9 @@ where
 
             let idx = (self.num_tables << TABLE_IDX_SHIFT) | i;
             self.hash_table.entry(h).or_default().add_row(idx as u64);
-            self.num_rows += 1;
         }
+        // Null keys are skipped above: they match nothing.
+        self.num_rows += input.len() - input.null_count();
 
         self.num_tables += 1;
         Ok(())

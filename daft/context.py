@@ -183,7 +183,7 @@ def set_planning_config(
     default_io_config: IOConfig | None = None,
     enable_strict_filter_pushdown: bool | None = None,
     disable_join_key_inference: bool | None = None,
-    disable_partial_aggregate_pushdown: bool | None = None,
+    enable_partial_aggregate_pushdown: bool | None = None,
 ) -> DaftContext:
     """Globally sets various configuration parameters which control Daft plan construction behavior.
 
@@ -197,9 +197,11 @@ def set_planning_config(
         disable_join_key_inference: Whether to stop deriving a restriction on one side of an equi-join from a
             restriction on the other side's key, such as reading the joined table only for the keys a filtered
             table keeps. Derivation never changes an answer. Defaults to False, which derives.
-        disable_partial_aggregate_pushdown: Whether to stop pushing a partial aggregation below an equi-join
-            whose aggregations read one side, such as counting each key's rows before a join that repeats
-            them. The pushdown never changes an answer. Defaults to False, which pushes.
+        enable_partial_aggregate_pushdown: Whether to push a partial aggregation below an equi-join whose
+            aggregations read one side, such as counting each key's rows before a join that repeats them. It
+            never changes an answer. It pays when the join repeats that side's rows, and costs when it repeats
+            none, as a lookup of the one row each key names does; planning cannot tell which. Defaults to
+            False; enable it for queries whose joins repeat rows.
     """
     # Replace values in the DaftPlanningConfig with user-specified overrides
     ctx = get_context()
@@ -209,7 +211,7 @@ def set_planning_config(
             default_io_config=default_io_config,
             enable_strict_filter_pushdown=enable_strict_filter_pushdown,
             disable_join_key_inference=disable_join_key_inference,
-            disable_partial_aggregate_pushdown=disable_partial_aggregate_pushdown,
+            enable_partial_aggregate_pushdown=enable_partial_aggregate_pushdown,
         )
 
         ctx._ctx._daft_planning_config = new_daft_planning_config

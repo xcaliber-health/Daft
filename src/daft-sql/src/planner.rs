@@ -16,7 +16,11 @@ use daft_dsl::{
 };
 use daft_functions::{
     invalid_argument_err,
-    numeric::{ceil::ceil, floor::floor},
+    numeric::{
+        ceil::ceil,
+        floor::floor,
+        sql_division::{Mod, SqlIntegerDivide},
+    },
 };
 use daft_functions_utf8::{ilike, like, to_date, to_datetime};
 use daft_logical_plan::{
@@ -1672,6 +1676,16 @@ impl SQLPlanner<'_> {
             SQLExpr::BinaryOp { left, op, right } => {
                 let left = self.plan_expr(left)?;
                 let right = self.plan_expr(right)?;
+                // SQL's `%` and `//` truncate toward zero; the expression operators floor.
+                match op {
+                    BinaryOperator::Modulo => {
+                        return Ok(ScalarFn::builtin(Mod, vec![left, right]).into());
+                    }
+                    BinaryOperator::DuckIntegerDivide => {
+                        return Ok(ScalarFn::builtin(SqlIntegerDivide, vec![left, right]).into());
+                    }
+                    _ => {}
+                }
                 let op = self.sql_operator_to_operator(op)?;
                 Ok(Expr::BinaryOp { left, op, right }.arced())
             }
@@ -2221,7 +2235,6 @@ impl SQLPlanner<'_> {
             BinaryOperator::Divide => Ok(Operator::TrueDivide),
             BinaryOperator::Eq => Ok(Operator::Eq),
             BinaryOperator::Spaceship => Ok(Operator::EqNullSafe),
-            BinaryOperator::Modulo => Ok(Operator::Modulus),
             BinaryOperator::Gt => Ok(Operator::Gt),
             BinaryOperator::Lt => Ok(Operator::Lt),
             BinaryOperator::GtEq => Ok(Operator::GtEq),
@@ -2229,7 +2242,6 @@ impl SQLPlanner<'_> {
             BinaryOperator::NotEq => Ok(Operator::NotEq),
             BinaryOperator::And => Ok(Operator::And),
             BinaryOperator::Or => Ok(Operator::Or),
-            BinaryOperator::DuckIntegerDivide => Ok(Operator::FloorDivide),
             other => unsupported_sql_err!("Unsupported operator: '{other}'"),
         }
     }

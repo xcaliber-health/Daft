@@ -509,6 +509,7 @@ class Series:
         return Series._from_pyseries(self._series / other._series)
 
     def __mod__(self, other: object) -> Series:
+        """Takes the floored modulo, with the divisor's sign; an integer divisor of zero gives null."""
         if not isinstance(other, Series):
             raise TypeError(f"expected another Series but got {type(other)}")
         assert self._series is not None and other._series is not None
@@ -585,6 +586,7 @@ class Series:
         return Series._from_pyseries(self._series ^ other._series)
 
     def __floordiv__(self, other: object) -> Series:
+        """Floor divides, rounding toward negative infinity; an integer divisor of zero gives null."""
         if not isinstance(other, Series):
             raise TypeError(f"expected another Series but got {type(other)}")
         assert self._series is not None and other._series is not None

@@ -16,6 +16,7 @@ pub mod pow;
 pub mod power;
 pub mod round;
 pub mod sign;
+pub mod sql_division;
 pub mod sqrt;
 pub mod trigonometry;
 
@@ -43,6 +44,7 @@ use pow::Pow;
 use power::Power;
 use round::Round;
 use sign::{Negate, Sign};
+use sql_division::Mod;
 use sqrt::Sqrt;
 
 fn to_field_numeric(f: &dyn ScalarUDF, input: &Expr, schema: &Schema) -> DaftResult<Field> {
@@ -91,6 +93,7 @@ impl FunctionModule for NumericFunctions {
         parent.add_fn(Sign);
         parent.add_fn(Negate);
         parent.add_fn(Sqrt);
+        parent.add_fn(Mod);
 
         // trig functions
         use trigonometry::*;

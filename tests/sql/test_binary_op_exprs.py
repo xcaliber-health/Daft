@@ -57,6 +57,16 @@ def test_div_floor():
     assert actual1 == actual2 == expected
 
 
+def test_div_floor_of_negative_integers_truncates_in_sql_and_floors_in_expressions():
+    df = daft.from_pydict({"A": [-7, 7], "B": [2, -2]})
+
+    sql = daft.sql("SELECT (A // B) AS q, (A % B) AS r FROM df").collect().to_pydict()
+    expressions = df.select((daft.col("A") // daft.col("B")).alias("q"), (daft.col("A") % daft.col("B")).alias("r"))
+
+    assert sql == {"q": [-3, -3], "r": [-1, 1]}
+    assert expressions.to_pydict() == {"q": [-4, -4], "r": [1, -1]}
+
+
 def test_unsupported_div_floor():
     df = daft.from_pydict({"A": [1, 2, 3, 4], "B": [1.5, 2.5, 3.5, 4.5], "C": [True, False, True, True]})
 

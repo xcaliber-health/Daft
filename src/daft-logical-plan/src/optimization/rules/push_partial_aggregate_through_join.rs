@@ -30,10 +30,11 @@ use daft_dsl::{
 };
 use indexmap::{IndexMap, IndexSet};
 
-use super::OptimizerRule;
+use super::{OptimizerRule, passed_through_columns};
 use crate::{
     LogicalPlan,
-    ops::{Aggregate, Distinct, Filter, Join, Limit, PartialAggregate, Project, Sort},
+    ops::{Aggregate, Join, PartialAggregate, Project},
+    optimization::uniqueness::{assumed_keys, unique_by},
 };
 
 /// Pushes a [`PartialAggregate`] below an equi-join whose aggregations read one side;
@@ -132,50 +133,14 @@ fn join_below(
             LogicalPlan::Project(Project {
                 input, projection, ..
             }) => {
-                let renames: HashMap<String, String> = projection
-                    .iter()
-                    .filter_map(|expr| Some((expr.name().to_string(), expr.input_mapping()?)))
-                    .collect();
+                let renames = passed_through_columns(projection);
                 for name in names.values_mut() {
-                    *name = renames.get(name.as_str())?.clone();
+                    *name = renames.get(name.as_str())?.name().to_string();
                 }
                 plan = input;
             }
             _ => return None,
         }
-    }
-}
-
-/// Whether `plan` provably holds at most one row for each value of `columns`: it is an
-/// aggregation or a distinct keyed within them, seen through filters, sorts, limits and
-/// renaming projections.
-fn unique_by(plan: &LogicalPlan, columns: &IndexSet<String>) -> bool {
-    let within = |keys: &[ExprRef]| keys.iter().all(|key| columns.contains(key.name()));
-    match plan {
-        LogicalPlan::Aggregate(Aggregate { groupby, .. }) => within(groupby),
-        LogicalPlan::Distinct(Distinct {
-            columns: Some(keys),
-            ..
-        }) => within(keys),
-        LogicalPlan::Distinct(Distinct { columns: None, .. }) => plan
-            .schema()
-            .field_names()
-            .all(|name| columns.contains(name)),
-        LogicalPlan::Filter(Filter { input, .. })
-        | LogicalPlan::Sort(Sort { input, .. })
-        | LogicalPlan::Limit(Limit { input, .. }) => unique_by(input, columns),
-        // Unique on the columns it passes through is unique on all of `columns`.
-        LogicalPlan::Project(Project {
-            input, projection, ..
-        }) => {
-            let below = projection
-                .iter()
-                .filter(|expr| columns.contains(expr.name()))
-                .filter_map(|expr| expr.input_mapping())
-                .collect();
-            unique_by(input, &below)
-        }
-        _ => false,
     }
 }
 
@@ -281,14 +246,19 @@ fn push_below_join(aggregate: &Aggregate) -> DaftResult<Option<Arc<LogicalPlan>>
     if matches!(side_plan.as_ref(), LogicalPlan::PartialAggregate(_)) {
         return Ok(None);
     }
-    // When the other side holds at most one row per key, the join repeats no row of this
-    // side: aggregating it first saves no repeated work, only moves the aggregation below
-    // a join that may drop its rows.
+    // Aggregating first pays when the join repeats this side's rows, which it does when
+    // the other side holds more than one row per join key. That is known from the other
+    // side's keys, proven or stated (a cost decision: both outcomes answer alike):
+    // - unique by its join keys, it repeats no row: a lookup, a 1:1 join, or a filtering
+    //   join against a keyed side keeps today's plan;
+    // - with no key known, nothing says it repeats, and today's plan is kept;
+    // - with a key the join keys do not cover, it holds rows that share a join key.
+    let other_unique_keys = assumed_keys(other_plan);
     let other_key_columns: IndexSet<String> = other_keys
         .iter()
         .filter_map(|key| key.input_mapping())
         .collect();
-    if unique_by(other_plan, &other_key_columns) {
+    if other_unique_keys.is_empty() || unique_by(&other_unique_keys, &other_key_columns) {
         return Ok(None);
     }
 
@@ -323,7 +293,7 @@ fn push_below_join(aggregate: &Aggregate) -> DaftResult<Option<Arc<LogicalPlan>>
                 .filter(|c| side_names.contains(c)),
         )
         .collect();
-    if unique_by(side_plan, &partial_groupby) {
+    if unique_by(&assumed_keys(side_plan), &partial_groupby) {
         return Ok(None);
     }
 
@@ -472,14 +442,18 @@ mod tests {
     };
 
     /// A link of subjects to owners, and a second copy of it keyed by owner.
+    /// Subjects linked to owners, stated unique by the pair: an owner has many subjects.
     fn link() -> LogicalPlanBuilder {
         dummy_scan_node(dummy_scan_operator(vec![
             Field::new("subject", DataType::Int64),
             Field::new("owner", DataType::Int64),
             Field::new("weight", DataType::Int64),
         ]))
+        .with_assumed_key(vec!["subject".to_string(), "owner".to_string()])
+        .unwrap()
     }
 
+    /// Peers of owners, stated unique by the pair: an owner has many peers.
     fn peers() -> LogicalPlanBuilder {
         dummy_scan_node(dummy_scan_operator(vec![
             Field::new("owner", DataType::Int64),
@@ -487,6 +461,8 @@ mod tests {
             Field::new("score", DataType::Float64),
             Field::new("flag", DataType::Boolean),
         ]))
+        .with_assumed_key(vec!["owner".to_string(), "peer".to_string()])
+        .unwrap()
     }
 
     fn joined(join_type: JoinType) -> DaftResult<LogicalPlanBuilder> {
@@ -676,9 +652,20 @@ mod tests {
         let on = left_col(int("owner"))
             .eq(right_col(int("owner")))
             .and(left_col(int("weight")).lt(right_col(int("peer"))));
+        // Peers of a pair can differ in score, so grouping by owner and peer still reduces.
+        let peers = dummy_scan_node(dummy_scan_operator(vec![
+            Field::new("owner", DataType::Int64),
+            Field::new("peer", DataType::Int64),
+            Field::new("score", DataType::Float64),
+        ]))
+        .with_assumed_key(vec![
+            "owner".to_string(),
+            "peer".to_string(),
+            "score".to_string(),
+        ])?;
         let plan = aggregate(
             link().join(
-                peers(),
+                peers,
                 Some(on),
                 vec![],
                 JoinType::Inner,
@@ -749,6 +736,89 @@ mod tests {
         )?;
 
         assert!(partials(&optimized(plan)?).is_empty());
+        Ok(())
+    }
+
+    /// Events, each naming one subject, and subjects, each held once.
+    fn lookup(subjects_keyed: bool) -> DaftResult<LogicalPlanBuilder> {
+        let events = dummy_scan_node(dummy_scan_operator(vec![
+            Field::new("event_id", DataType::Int64),
+            Field::new("subject", DataType::Int64),
+        ]));
+        let subjects = dummy_scan_node(dummy_scan_operator(vec![
+            Field::new("subject", DataType::Int64),
+            Field::new("tier", DataType::Int64),
+        ]));
+        let subjects = if subjects_keyed {
+            subjects.with_assumed_key(vec!["subject".to_string()])?
+        } else {
+            subjects
+        };
+        events.join(
+            subjects,
+            None,
+            vec!["subject".to_string()],
+            JoinType::Inner,
+            None,
+            Default::default(),
+        )
+    }
+
+    #[rstest]
+    // The other side holds each subject once: the join repeats no event.
+    #[case::other_side_unique_by_the_join_key(true)]
+    // Nothing is known about the other side: nothing says the join repeats events.
+    #[case::other_side_without_a_known_key(false)]
+    fn a_join_not_known_to_repeat_rows_keeps_todays_plan(
+        #[case] subjects_keyed: bool,
+    ) -> DaftResult<()> {
+        let plan = aggregate(
+            lookup(subjects_keyed)?,
+            vec![
+                unresolved_col("event_id")
+                    .count(CountMode::Valid)
+                    .alias("n"),
+            ],
+            vec![unresolved_col("tier")],
+        )?;
+
+        let optimized = optimized(plan.clone())?;
+
+        assert!(partials(&optimized).is_empty());
+        assert_eq!(optimized, plan);
+        Ok(())
+    }
+
+    #[test]
+    fn a_key_dropped_by_a_projection_still_says_the_join_repeats_rows() -> DaftResult<()> {
+        // Links keyed by an id no one reads; the self-join on owner repeats each link.
+        let links = || -> DaftResult<LogicalPlanBuilder> {
+            dummy_scan_node(dummy_scan_operator(vec![
+                Field::new("link_id", DataType::Int64),
+                Field::new("subject", DataType::Int64),
+                Field::new("owner", DataType::Int64),
+            ]))
+            .with_assumed_key(vec!["link_id".to_string()])?
+            .select(vec![unresolved_col("subject"), unresolved_col("owner")])
+        };
+        let peers = links()?.select(vec![
+            unresolved_col("owner"),
+            unresolved_col("subject").alias("peer"),
+        ])?;
+        let plan = aggregate(
+            links()?.join(
+                peers,
+                None,
+                vec!["owner".to_string()],
+                JoinType::Inner,
+                None,
+                Default::default(),
+            )?,
+            vec![unresolved_col("peer").count(CountMode::Valid).alias("n")],
+            vec![unresolved_col("subject")],
+        )?;
+
+        assert_eq!(partials(&optimized(plan)?).len(), 1);
         Ok(())
     }
 

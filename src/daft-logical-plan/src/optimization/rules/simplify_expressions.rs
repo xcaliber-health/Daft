@@ -72,6 +72,7 @@ mod test {
                 })),
                 stats_state: StatsState::NotMaterialized,
                 checkpoint: None,
+                assumed_keys: Vec::new(),
             })
             .arced(),
         )

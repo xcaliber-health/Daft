@@ -47,6 +47,7 @@ pub use materialize_scans::MaterializeScans;
 pub use push_down_aggregation::PushDownAggregation;
 pub use push_down_anti_semi_join::PushDownAntiSemiJoin;
 pub use push_down_filter::PushDownFilter;
+pub(crate) use push_down_filter::passed_through_columns;
 pub use push_down_join_predicate::PushDownJoinPredicate;
 pub use push_down_limit::PushDownLimit;
 pub use push_down_projection::PushDownProjection;

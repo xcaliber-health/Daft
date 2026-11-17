@@ -9,6 +9,9 @@ use crate::{LogicalPlan, LogicalPlanRef};
 
 pub(crate) fn to_json_value(node: &LogicalPlan) -> serde_json::Value {
     match node {
+        LogicalPlan::Source(source) if !source.assumed_keys.is_empty() => json!({
+            "assumed_keys": source.assumed_keys,
+        }),
         LogicalPlan::Source(_) => json!({}),
         // TODO(desmond): is this correct?
         LogicalPlan::Shard(shard) => json!({

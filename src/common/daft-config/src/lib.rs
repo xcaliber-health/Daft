@@ -74,12 +74,10 @@ pub struct DaftPlanningConfig {
     /// other side's key. Derivation never changes an answer; disabling it only gives up the
     /// reads it saves.
     pub disable_join_key_inference: bool,
-    /// Push a partial aggregation below an equi-join that its aggregations read one side
-    /// of. It never changes an answer, and pays when the join repeats that side's rows; a
-    /// join that repeats none, such as a lookup of the one row each key names, pays for
-    /// it. Planning cannot tell which a join is, so it is off unless a caller that knows
-    /// turns it on.
-    pub enable_partial_aggregate_pushdown: bool,
+    /// Stop pushing a partial aggregation below an equi-join that its aggregations read one
+    /// side of. The push never changes an answer, and is made only where the other side's
+    /// known keys say the join repeats rows; disabling it keeps every plan as written.
+    pub disable_partial_aggregate_pushdown: bool,
 }
 
 #[cfg(not(debug_assertions))]
@@ -97,8 +95,8 @@ impl DaftPlanningConfig {
         "DAFT_DEV_ENABLE_DP_CCP_JOIN_ORDERING";
     const ENV_DAFT_DEV_DISABLE_JOIN_KEY_INFERENCE: &'static str =
         "DAFT_DEV_DISABLE_JOIN_KEY_INFERENCE";
-    const ENV_DAFT_DEV_ENABLE_PARTIAL_AGGREGATE_PUSHDOWN: &'static str =
-        "DAFT_DEV_ENABLE_PARTIAL_AGGREGATE_PUSHDOWN";
+    const ENV_DAFT_DEV_DISABLE_PARTIAL_AGGREGATE_PUSHDOWN: &'static str =
+        "DAFT_DEV_DISABLE_PARTIAL_AGGREGATE_PUSHDOWN";
 
     #[must_use]
     pub fn from_env() -> Self {
@@ -120,9 +118,10 @@ impl DaftPlanningConfig {
             cfg.disable_join_key_inference = val;
         }
 
-        if let Some(val) = parse_bool_from_env(Self::ENV_DAFT_DEV_ENABLE_PARTIAL_AGGREGATE_PUSHDOWN)
+        if let Some(val) =
+            parse_bool_from_env(Self::ENV_DAFT_DEV_DISABLE_PARTIAL_AGGREGATE_PUSHDOWN)
         {
-            cfg.enable_partial_aggregate_pushdown = val;
+            cfg.disable_partial_aggregate_pushdown = val;
         }
 
         cfg

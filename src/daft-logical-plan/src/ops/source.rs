@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use common_checkpoint_config::CheckpointConfig;
 use common_daft_config::DaftExecutionConfig;
-use common_error::DaftResult;
+use common_error::{DaftError, DaftResult};
 use daft_scan::{PhysicalScanInfo, Precision, ScanState};
 use daft_schema::schema::SchemaRef;
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,11 @@ pub struct Source {
 
     /// Checkpoint configuration for progress tracking.
     pub checkpoint: Option<CheckpointConfig>,
+
+    /// Column sets the caller states the source's rows are unique by. Not checked: they
+    /// inform cost decisions only, never a rewrite that could change an answer (see
+    /// `optimization::uniqueness`).
+    pub assumed_keys: Vec<Vec<String>>,
 }
 
 impl Source {
@@ -37,12 +42,39 @@ impl Source {
             source_info,
             stats_state: StatsState::NotMaterialized,
             checkpoint: None,
+            assumed_keys: Vec::new(),
         }
     }
 
     pub fn with_checkpoint(mut self, config: CheckpointConfig) -> Self {
         self.checkpoint = Some(config);
         self
+    }
+
+    /// Adds a column set the caller states the source's rows are unique by.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `columns` is empty or names a column the source does not
+    /// output.
+    pub fn with_assumed_key(mut self, columns: Vec<String>) -> DaftResult<Self> {
+        if columns.is_empty() {
+            return Err(DaftError::ValueError(
+                "A key must name at least one column".to_string(),
+            ));
+        }
+        if let Some(missing) = columns
+            .iter()
+            .find(|column| !self.output_schema.has_field(column))
+        {
+            return Err(DaftError::ValueError(format!(
+                "Cannot assume rows unique by {columns:?}: the source has no column {missing:?}"
+            )));
+        }
+        if !self.assumed_keys.contains(&columns) {
+            self.assumed_keys.push(columns);
+        }
+        Ok(self)
     }
 
     /// Return a copy of this `Source` with a replaced `source_info`, preserving
@@ -224,6 +256,16 @@ impl Source {
             "Output schema = {}",
             self.output_schema.short_string()
         ));
+        if !self.assumed_keys.is_empty() {
+            res.push(format!(
+                "Assumed unique by = {}",
+                self.assumed_keys
+                    .iter()
+                    .map(|key| format!("[{}]", key.join(", ")))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         if let StatsState::Materialized(stats) = &self.stats_state {
             res.push(format!("Stats = {}", stats));
         }

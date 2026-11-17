@@ -18,7 +18,8 @@ use super::OptimizerRule;
 use crate::{
     LogicalPlan, LogicalPlanRef,
     logical_plan::downcast_subquery,
-    ops::{Aggregate, Filter, Join, Limit, Project, Sort, join::JoinPredicate},
+    ops::{Aggregate, Filter, Join, Project, join::JoinPredicate},
+    optimization::uniqueness::{proven_keys, unique_by},
 };
 
 /// Rewriter rule to convert scalar subqueries into joins.
@@ -602,8 +603,8 @@ fn one_row_per_key(
     let already_one = if keys.is_empty() {
         yields_exactly_one_row(&subquery)
     } else {
-        let key_names = keys.iter().map(|key| key.name()).collect::<Vec<_>>();
-        yields_at_most_one_row_per(&subquery, &key_names)
+        let key_names = keys.iter().map(|key| key.name().to_string()).collect();
+        unique_by(&proven_keys(&subquery), &key_names)
     };
     if already_one {
         return Ok((subquery, None));
@@ -666,48 +667,6 @@ fn yields_exactly_one_row(plan: &LogicalPlan) -> bool {
         LogicalPlan::Project(Project { input, .. }) => yields_exactly_one_row(input),
         LogicalPlan::Aggregate(Aggregate { groupby, .. }) => groupby.is_empty(),
         _ => false,
-    }
-}
-
-/// Whether `plan` yields at most one row for each value of the columns named `keys`.
-///
-/// Proven only for an aggregation grouped by nothing but keys, seen through projections
-/// that pass the keys through and through operators that only drop or reorder rows.
-/// Anything else answers `false`, which costs an aggregation but never a wrong answer.
-#[recursive::recursive]
-fn yields_at_most_one_row_per(plan: &LogicalPlan, keys: &[&str]) -> bool {
-    match plan {
-        LogicalPlan::Project(Project {
-            input, projection, ..
-        }) => {
-            let input_keys = keys
-                .iter()
-                .map(|key| {
-                    projection
-                        .iter()
-                        .find(|expr| expr.name() == *key)
-                        .and_then(|expr| passed_through_column(expr))
-                })
-                .collect::<Option<Vec<_>>>();
-            input_keys.is_some_and(|input_keys| yields_at_most_one_row_per(input, &input_keys))
-        }
-        LogicalPlan::Filter(Filter { input, .. })
-        | LogicalPlan::Sort(Sort { input, .. })
-        | LogicalPlan::Limit(Limit { input, .. }) => yields_at_most_one_row_per(input, keys),
-        LogicalPlan::Aggregate(Aggregate { groupby, .. }) => {
-            groupby.iter().all(|group| keys.contains(&group.name()))
-        }
-        _ => false,
-    }
-}
-
-/// The name of the input column `expr` passes through unchanged, if it does.
-#[recursive::recursive]
-fn passed_through_column(expr: &Expr) -> Option<&str> {
-    match expr {
-        Expr::Alias(inner, _) => passed_through_column(inner),
-        Expr::Column(Column::Resolved(ResolvedColumn::Basic(name))) => Some(name),
-        _ => None,
     }
 }
 

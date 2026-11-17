@@ -191,6 +191,7 @@ impl LogicalPlan {
                 source_info,
                 stats_state,
                 checkpoint,
+                assumed_keys,
             }) => match source_info.as_ref() {
                 SourceInfo::Physical(
                     physical_scan_info @ PhysicalScanInfo {
@@ -221,6 +222,7 @@ impl LogicalPlan {
                             )),
                             stats_state: stats_state.clone(),
                             checkpoint: checkpoint.clone(),
+                            assumed_keys: assumed_keys.clone(),
                         })
                         .into()
                     })

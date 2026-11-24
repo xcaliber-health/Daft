@@ -131,6 +131,7 @@ pub enum LocalPhysicalPlan {
     #[cfg(feature = "python")]
     DistributedLimit(DistributedLimit),
     VLLMProject(VLLMProject),
+    Shared(Shared),
 }
 #[cfg(not(debug_assertions))]
 impl std::fmt::Debug for LocalPhysicalPlan {
@@ -197,7 +198,8 @@ impl LocalPhysicalPlan {
                 ..
             })
             | Self::WindowOrderByOnly(WindowOrderByOnly { stats_state, .. })
-            | Self::VLLMProject(VLLMProject { stats_state, .. }) => stats_state,
+            | Self::VLLMProject(VLLMProject { stats_state, .. })
+            | Self::Shared(Shared { stats_state, .. }) => stats_state,
             #[cfg(feature = "python")]
             Self::CatalogWrite(CatalogWrite { stats_state, .. })
             | Self::LanceWrite(LanceWrite { stats_state, .. })
@@ -250,7 +252,8 @@ impl LocalPhysicalPlan {
                 context,
                 ..
             })
-            | Self::VLLMProject(VLLMProject { context, .. }) => context,
+            | Self::VLLMProject(VLLMProject { context, .. })
+            | Self::Shared(Shared { context, .. }) => context,
             Self::WindowOrderByOnly(WindowOrderByOnly { context, .. }) => context,
             #[cfg(feature = "python")]
             Self::CatalogWrite(CatalogWrite { context, .. })
@@ -301,7 +304,8 @@ impl LocalPhysicalPlan {
                 context,
                 ..
             })
-            | Self::VLLMProject(VLLMProject { context, .. }) => context,
+            | Self::VLLMProject(VLLMProject { context, .. })
+            | Self::Shared(Shared { context, .. }) => context,
             Self::WindowOrderByOnly(WindowOrderByOnly { context, .. }) => context,
             #[cfg(feature = "python")]
             Self::CatalogWrite(CatalogWrite { context, .. })
@@ -1145,6 +1149,29 @@ impl LocalPhysicalPlan {
         .arced()
     }
 
+    /// The part of a plan that `readers` readers read, computed once for all of them.
+    ///
+    /// Every reader holds the same node (`Arc`), so a walk of the plan reaches the part once
+    /// per reader; the executor builds it once.
+    pub fn shared(
+        input: LocalPhysicalPlanRef,
+        id: usize,
+        readers: usize,
+        stats_state: StatsState,
+        context: LocalNodeContext,
+    ) -> LocalPhysicalPlanRef {
+        let schema = input.schema().clone();
+        Self::Shared(Shared {
+            input,
+            id,
+            readers,
+            schema,
+            stats_state,
+            context,
+        })
+        .arced()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn repartition_write(
         input: LocalPhysicalPlanRef,
@@ -1254,6 +1281,7 @@ impl LocalPhysicalPlan {
             Self::WindowPartitionOnly(WindowPartitionOnly { schema, .. }) => schema,
             Self::WindowPartitionAndOrderBy(WindowPartitionAndOrderBy { schema, .. }) => schema,
             Self::VLLMProject(VLLMProject { schema, .. }) => schema,
+            Self::Shared(Shared { schema, .. }) => schema,
         }
     }
 
@@ -1342,6 +1370,7 @@ impl LocalPhysicalPlan {
             Self::TopN(TopN { input, .. }) => vec![input.clone()],
             Self::WindowOrderByOnly(WindowOrderByOnly { input, .. }) => vec![input.clone()],
             Self::VLLMProject(VLLMProject { input, .. }) => vec![input.clone()],
+            Self::Shared(Shared { input, .. }) => vec![input.clone()],
         }
     }
 
@@ -1831,6 +1860,19 @@ impl LocalPhysicalPlan {
                     llm_actors.clone(),
                     output_column_name.clone(),
                     schema.clone(),
+                    stats_state.clone(),
+                    context.clone(),
+                ),
+                Self::Shared(Shared {
+                    id,
+                    readers,
+                    stats_state,
+                    context,
+                    ..
+                }) => Self::shared(
+                    new_child.clone(),
+                    *id,
+                    *readers,
                     stats_state.clone(),
                     context.clone(),
                 ),
@@ -2490,6 +2532,20 @@ pub struct VLLMProject {
     pub expr: BoundVLLMExpr,
     pub llm_actors: Option<RuntimePyObject>,
     pub output_column_name: Arc<str>,
+    pub schema: SchemaRef,
+    pub stats_state: StatsState,
+    pub context: LocalNodeContext,
+}
+
+/// A part of the plan computed once and read by several readers.
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub struct Shared {
+    pub input: LocalPhysicalPlanRef,
+    /// Identifies the part; it matches the id of the logical plan's shared node.
+    pub id: usize,
+    /// How many readers read the part; each receives every row of it.
+    pub readers: usize,
     pub schema: SchemaRef,
     pub stats_state: StatsState,
     pub context: LocalNodeContext,

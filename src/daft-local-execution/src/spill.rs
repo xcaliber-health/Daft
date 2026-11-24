@@ -296,6 +296,15 @@ impl SpilledRun {
     /// Opens a streaming cursor over the run, yielding record batches in
     /// write order one file at a time, so a run never needs to be resident
     /// in memory all at once.
+    /// Opens a cursor over the run without consuming it, so several readers can
+    /// each replay it; the files stay until the scratch directory is dropped.
+    pub(crate) fn reader(&self) -> RunCursor {
+        RunCursor {
+            file_paths: self.file_paths.iter().cloned().collect(),
+            pending: std::collections::VecDeque::new(),
+        }
+    }
+
     pub(crate) fn cursor(self) -> RunCursor {
         RunCursor {
             file_paths: self.file_paths.into_iter().collect(),

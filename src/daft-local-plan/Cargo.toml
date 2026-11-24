@@ -25,6 +25,9 @@ indexmap = {workspace = true}
 daft-functions = {path = "../daft-functions", default-features = false}
 daft-functions-list = {path = "../daft-functions-list", default-features = false}
 
+[dev-dependencies]
+common-partitioning = {path = "../common/partitioning", default-features = false}
+
 [features]
 python = [
   "dep:pyo3",

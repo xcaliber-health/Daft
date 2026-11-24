@@ -45,7 +45,9 @@ use crate::{
         self, Limit, Offset, SetQuantifier, UnionStrategy, get_right_cols_to_drop,
         join::{JoinOptions, JoinPredicate},
     },
-    optimization::{OptimizerBuilder, OptimizerConfig},
+    optimization::{
+        Optimizer, OptimizerBuilder, OptimizerConfig, OptimizerRule, ShareRepeatedParts,
+    },
     partitioning::{HashRepartitionConfig, RandomShuffleConfig, RepartitionSpec},
     sink_info::{FormatSinkOption, OutputFileInfo, SinkInfo},
     source_info::{GlobScanInfo, InMemoryInfo, SourceInfo},
@@ -83,6 +85,63 @@ fn ensure_distinct_output_names(exprs: &[ExprRef], operation: &str) -> DaftResul
 }
 
 /// The optimizer settings a planning config asks for; the defaults when there is none.
+/// Whether the local executor computes a part written more than once, once: unless the config
+/// turns it off, or turns spilling off, since a shared part spills what lagging readers hold.
+fn shares_repeated_parts(execution_config: &DaftExecutionConfig) -> bool {
+    !execution_config.disable_subplan_sharing
+        && execution_config.enable_spilling
+        && !execution_config.spill_dirs.is_empty()
+}
+
+/// The optimizer every entry point runs, built from the planning config.
+fn build_optimizer(
+    cfg: Option<&DaftPlanningConfig>,
+    execution_config: &Arc<DaftExecutionConfig>,
+    share_repeated_parts: bool,
+) -> Optimizer {
+    OptimizerBuilder::default()
+        .with_optimizer_config(OptimizerConfig {
+            share_repeated_parts,
+            ..optimizer_config(cfg)
+        })
+        .with_default_optimizations()
+        .enrich_with_stats(Some(execution_config.clone()))
+        .when(
+            !cfg.is_some_and(|conf| conf.disable_join_reordering),
+            |builder| {
+                let use_dp_ccp = cfg.is_some_and(|conf| conf.enable_dp_ccp_join_ordering);
+                builder.reorder_joins(Some(execution_config.clone()), use_dp_ccp)
+            },
+        )
+        .push_partial_aggregates()
+        .simplify_expressions()
+        .split_granular_projections()
+        .enrich_with_stats(Some(execution_config.clone()))
+        .build()
+}
+
+/// Runs `optimizer` over `plan`, logging each rule batch's effect.
+fn run_optimizer(optimizer: &Optimizer, plan: Arc<LogicalPlan>) -> DaftResult<Arc<LogicalPlan>> {
+    optimizer.optimize(plan, |new_plan, rule_batch, pass, transformed, seen| {
+        if transformed {
+            log::debug!(
+                "Rule batch {:?} transformed plan on pass {}, and produced {} plan:\n{}",
+                rule_batch,
+                pass,
+                if seen { "an already seen" } else { "a new" },
+                new_plan.repr_ascii(true),
+            );
+        } else {
+            log::debug!(
+                "Rule batch {:?} did NOT transform plan on pass {} for plan:\n{}",
+                rule_batch,
+                pass,
+                new_plan.repr_ascii(true),
+            );
+        }
+    })
+}
+
 fn optimizer_config(cfg: Option<&DaftPlanningConfig>) -> OptimizerConfig {
     OptimizerConfig {
         strict_pushdown: cfg.is_some_and(|conf| conf.enable_strict_filter_pushdown),
@@ -1097,52 +1156,13 @@ impl LogicalPlanBuilder {
         let unoptimized_plan = self.build();
         let (tx, rx) = tokio::sync::oneshot::channel();
 
+        let planning_config = cfg.clone();
         std::thread::spawn(move || {
-            let optimizer = OptimizerBuilder::default()
-                .with_optimizer_config(optimizer_config(cfg.as_deref()))
-                .with_default_optimizations()
-                .when(
-                    !cfg.as_ref()
-                        .is_some_and(|conf| conf.disable_join_reordering),
-                    |builder| {
-                        let use_dp_ccp = cfg
-                            .as_ref()
-                            .is_some_and(|conf| conf.enable_dp_ccp_join_ordering);
-                        builder.reorder_joins(Some(execution_config.clone()), use_dp_ccp)
-                    },
-                )
-                .push_partial_aggregates()
-                .simplify_expressions()
-                .split_granular_projections()
-                .enrich_with_stats(Some(execution_config))
-                .build();
-
-            let optimized_plan = optimizer.optimize(
-                unoptimized_plan,
-                |new_plan, rule_batch, pass, transformed, seen| {
-                    if transformed {
-
-                        log::debug!(
-                            "Rule batch {:?} transformed plan on pass {}, and produced {} plan:\n{}",
-                            rule_batch,
-                            pass,
-                            if seen { "an already seen" } else { "a new" },
-                            new_plan.repr_ascii(true),
-                        );
-                    } else {
-                        log::debug!(
-                            "Rule batch {:?} did NOT transform plan on pass {} for plan:\n{}",
-                            rule_batch,
-                            pass,
-                            new_plan.repr_ascii(true),
-                        );
-                    }
-                },
-            );
-            tx.send(optimized_plan).unwrap();
+            let optimizer = build_optimizer(planning_config.as_deref(), &execution_config, false);
+            tx.send(run_optimizer(&optimizer, unoptimized_plan))
+                .unwrap();
         });
 
-        let cfg = self.config.clone();
         async move {
             rx.await
                 .map_err(|e| {
@@ -1157,53 +1177,47 @@ impl LogicalPlanBuilder {
     /// **Important**: Do not call this method from the main thread as there is a `block_on` call deep within this method
     /// Calling will result in a runtime panic
     pub fn optimize(&self, execution_config: Arc<DaftExecutionConfig>) -> DaftResult<Self> {
+        self.optimize_with(&execution_config, false)
+    }
+
+    /// Optimizes the plan for the local executor, which also computes a part of the plan
+    /// written more than once, once for all of its readers.
+    ///
+    /// Sharing stays off when the execution config turns it off, or when spilling is off: a
+    /// shared part holds rows for readers that lag, and spills them past its budget.
+    pub fn optimize_for_local_execution(
+        &self,
+        execution_config: Arc<DaftExecutionConfig>,
+    ) -> DaftResult<Self> {
+        let share = shares_repeated_parts(&execution_config);
+        self.optimize_with(&execution_config, share)
+    }
+
+    /// Marks the parts of the plan written more than once to be computed once, without
+    /// optimizing it otherwise, for a plan that is serialized before it is optimized.
+    ///
+    /// Two occurrences match only while they hold the same source objects, which a plan
+    /// loses when it is serialized: each occurrence comes back with its own.
+    pub fn with_repeated_parts_marked(
+        &self,
+        execution_config: &DaftExecutionConfig,
+    ) -> DaftResult<Self> {
+        if !shares_repeated_parts(execution_config) {
+            return Ok(self.clone());
+        }
+        let marked = ShareRepeatedParts::new().try_optimize(self.build())?;
+        Ok(self.with_new_plan(marked.data))
+    }
+
+    fn optimize_with(
+        &self,
+        execution_config: &Arc<DaftExecutionConfig>,
+        share_repeated_parts: bool,
+    ) -> DaftResult<Self> {
         // TODO: remove the `block_on` to make this method safe to call from the main thread
-
         let cfg = self.config.clone();
-
-        let unoptimized_plan = self.build();
-
-        let optimizer = OptimizerBuilder::default()
-            .with_optimizer_config(optimizer_config(cfg.as_deref()))
-            .with_default_optimizations()
-            .enrich_with_stats(Some(execution_config.clone()))
-            .when(
-                !cfg.as_ref()
-                    .is_some_and(|conf| conf.disable_join_reordering),
-                |builder| {
-                    let use_dp_ccp = cfg
-                        .as_ref()
-                        .is_some_and(|conf| conf.enable_dp_ccp_join_ordering);
-                    builder.reorder_joins(Some(execution_config.clone()), use_dp_ccp)
-                },
-            )
-            .push_partial_aggregates()
-            .simplify_expressions()
-            .split_granular_projections()
-            .enrich_with_stats(Some(execution_config))
-            .build();
-
-        let optimized_plan = optimizer.optimize(
-            unoptimized_plan,
-            |new_plan, rule_batch, pass, transformed, seen| {
-                if transformed {
-                    log::debug!(
-                        "Rule batch {:?} transformed plan on pass {}, and produced {} plan:\n{}",
-                        rule_batch,
-                        pass,
-                        if seen { "an already seen" } else { "a new" },
-                        new_plan.repr_ascii(true),
-                    );
-                } else {
-                    log::debug!(
-                        "Rule batch {:?} did NOT transform plan on pass {} for plan:\n{}",
-                        rule_batch,
-                        pass,
-                        new_plan.repr_ascii(true),
-                    );
-                }
-            },
-        )?;
+        let optimizer = build_optimizer(cfg.as_deref(), execution_config, share_repeated_parts);
+        let optimized_plan = run_optimizer(&optimizer, self.build())?;
 
         // Assign node IDs to the optimized plan
         let builder = if std::env::var("DAFT_INSTRUMENT_LOGICAL_PLAN").is_ok() {
@@ -1878,8 +1892,24 @@ impl PyLogicalPlanBuilder {
     }
 
     /// Optimize the underlying logical plan, returning a new plan builder containing the optimized plan.
-    pub fn optimize(&self, py: Python, execution_config: PyDaftExecutionConfig) -> PyResult<Self> {
-        py.detach(|| Ok(self.builder.optimize(execution_config.config)?.into()))
+    /// Optimizes the plan; with `local`, for the local executor, which also computes a part
+    /// of the plan written more than once, once.
+    #[pyo3(signature = (execution_config, local=false))]
+    pub fn optimize(
+        &self,
+        py: Python,
+        execution_config: PyDaftExecutionConfig,
+        local: bool,
+    ) -> PyResult<Self> {
+        py.detach(|| {
+            let optimized = if local {
+                self.builder
+                    .optimize_for_local_execution(execution_config.config)?
+            } else {
+                self.builder.optimize(execution_config.config)?
+            };
+            Ok(optimized.into())
+        })
     }
 
     pub fn repr_ascii(&self, simple: bool) -> PyResult<String> {

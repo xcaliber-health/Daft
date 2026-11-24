@@ -65,6 +65,9 @@ pub enum NodeType {
 
     // A streaming sink, listed last so earlier variants keep their encoding.
     PartialGroupByAgg,
+    // One reader of a part computed once for several readers; listed last so earlier
+    // variants keep their encoding.
+    Shared,
 }
 
 impl Display for NodeType {

@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use common_error::{DaftError, DaftResult};
-use daft_core::join::JoinStrategy;
+use common_treenode::{TreeNode, TreeNodeRecursion};
+use daft_core::{join::JoinStrategy, prelude::SchemaRef};
 use daft_dsl::{
     expr::{
         agg::extract_agg_expr,
@@ -22,14 +23,67 @@ pub fn translate(
     plan: &LogicalPlanRef,
     psets: &HashMap<String, Vec<MicroPartitionRef>>,
 ) -> DaftResult<(LocalPhysicalPlanRef, HashMap<SourceId, Input>)> {
-    let mut source_counter = SourceIdCounter::default();
-    translate_helper(plan, &mut source_counter, psets)
+    let mut state = TranslationState {
+        sources: SourceIdCounter::default(),
+        shared: SharedParts::of(plan)?,
+    };
+    translate_helper(plan, &mut state, psets)
+}
+
+/// What translation carries from one node to the next.
+struct TranslationState {
+    sources: SourceIdCounter,
+    shared: SharedParts,
+}
+
+/// The parts of a plan computed once for several readers, and their translations.
+///
+/// Every occurrence of a shared id computes the same rows, so the first one translated
+/// stands for all of them: its sources take their inputs once, and every reader holds the
+/// same local node. An occurrence whose schema differs from the first occurrence's is not a
+/// reader of the part; it translates its own body.
+#[derive(Default)]
+struct SharedParts {
+    /// For each id, the schema its readers share and how many occurrences have it.
+    readers: HashMap<usize, (SchemaRef, usize)>,
+    /// For each id, the part once translated.
+    translated: HashMap<usize, LocalPhysicalPlanRef>,
+}
+
+impl SharedParts {
+    /// Counts each id's readers: its occurrences with the schema of the first one met.
+    fn of(plan: &LogicalPlanRef) -> DaftResult<Self> {
+        let mut parts = Self::default();
+        plan.apply(|node| {
+            if let LogicalPlan::Shared(shared) = node.as_ref() {
+                let schema = shared.input.schema();
+                let (expected, count) = parts
+                    .readers
+                    .entry(shared.id)
+                    .or_insert_with(|| (schema.clone(), 0));
+                if *expected == schema {
+                    *count += 1;
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        Ok(parts)
+    }
+
+    /// How many readers share the part `id` if an occurrence with `schema` reads it, or
+    /// `None` if that occurrence is not one of them.
+    fn readers_of(&self, id: usize, schema: &SchemaRef) -> Option<usize> {
+        self.readers
+            .get(&id)
+            .filter(|(expected, _)| expected == schema)
+            .map(|(_, count)| *count)
+    }
 }
 
 #[recursive::recursive]
 fn translate_helper(
     plan: &LogicalPlanRef,
-    source_counter: &mut SourceIdCounter,
+    state: &mut TranslationState,
     psets: &HashMap<String, Vec<MicroPartitionRef>>,
 ) -> DaftResult<(LocalPhysicalPlanRef, HashMap<SourceId, Input>)> {
     match plan.as_ref() {
@@ -37,7 +91,7 @@ fn translate_helper(
             let mut inputs = HashMap::new();
             let physical_plan = match source.source_info.as_ref() {
                 SourceInfo::InMemory(info) => {
-                    let source_id = source_counter.next();
+                    let source_id = state.sources.next();
                     if let Some(partitions) = psets.get(&info.cache_key).cloned() {
                         inputs.insert(source_id, Input::InMemory(partitions));
                     }
@@ -61,7 +115,7 @@ fn translate_helper(
                     let source_config = scan_tasks
                         .first()
                         .map(|scan_task| scan_task.source_config.clone());
-                    let source_id = source_counter.next();
+                    let source_id = state.sources.next();
                     inputs.insert(source_id, Input::ScanTasks(scan_tasks));
 
                     LocalPhysicalPlan::physical_scan(
@@ -74,7 +128,7 @@ fn translate_helper(
                     )
                 }
                 SourceInfo::GlobScan(info) => {
-                    let source_id = source_counter.next();
+                    let source_id = state.sources.next();
                     inputs.insert(source_id, Input::GlobPaths((*info.glob_paths).clone()));
 
                     LocalPhysicalPlan::glob_scan(
@@ -101,7 +155,7 @@ fn translate_helper(
             "Sharding should have been folded into a source".to_string(),
         )),
         LogicalPlan::Filter(filter) => {
-            let (input_plan, inputs) = translate_helper(&filter.input, source_counter, psets)?;
+            let (input_plan, inputs) = translate_helper(&filter.input, state, psets)?;
             let predicate = BoundExpr::try_new(filter.predicate.clone(), input_plan.schema())?;
             Ok((
                 LocalPhysicalPlan::filter(
@@ -114,7 +168,7 @@ fn translate_helper(
             ))
         }
         LogicalPlan::StageCheckpointKeys(stage) => {
-            let (input_plan, inputs) = translate_helper(&stage.input, source_counter, psets)?;
+            let (input_plan, inputs) = translate_helper(&stage.input, state, psets)?;
             Ok((
                 LocalPhysicalPlan::stage_checkpoint_keys(
                     input_plan,
@@ -126,8 +180,7 @@ fn translate_helper(
             ))
         }
         LogicalPlan::IntoBatches(into_batches) => {
-            let (input_plan, inputs) =
-                translate_helper(&into_batches.input, source_counter, psets)?;
+            let (input_plan, inputs) = translate_helper(&into_batches.input, state, psets)?;
             Ok((
                 LocalPhysicalPlan::into_batches(
                     input_plan,
@@ -140,7 +193,7 @@ fn translate_helper(
             ))
         }
         LogicalPlan::Limit(limit) => {
-            let (input_plan, inputs) = translate_helper(&limit.input, source_counter, psets)?;
+            let (input_plan, inputs) = translate_helper(&limit.input, state, psets)?;
             Ok((
                 LocalPhysicalPlan::limit(
                     input_plan,
@@ -153,7 +206,7 @@ fn translate_helper(
             ))
         }
         LogicalPlan::Project(project) => {
-            let (input_plan, inputs) = translate_helper(&project.input, source_counter, psets)?;
+            let (input_plan, inputs) = translate_helper(&project.input, state, psets)?;
 
             let projection = BoundExpr::bind_all(&project.projection, input_plan.schema())?;
 
@@ -169,7 +222,7 @@ fn translate_helper(
             ))
         }
         LogicalPlan::UDFProject(udf_project) => {
-            let (input_plan, inputs) = translate_helper(&udf_project.input, source_counter, psets)?;
+            let (input_plan, inputs) = translate_helper(&udf_project.input, state, psets)?;
 
             let passthrough_columns =
                 BoundExpr::bind_all(&udf_project.passthrough_columns, input_plan.schema())?;
@@ -189,7 +242,7 @@ fn translate_helper(
             ))
         }
         LogicalPlan::Sample(sample) => {
-            let (input_plan, inputs) = translate_helper(&sample.input, source_counter, psets)?;
+            let (input_plan, inputs) = translate_helper(&sample.input, state, psets)?;
             let sampling_method = if let Some(fraction) = sample.fraction {
                 SamplingMethod::Fraction(fraction)
             } else if let Some(size) = sample.size {
@@ -212,7 +265,7 @@ fn translate_helper(
             ))
         }
         LogicalPlan::Aggregate(aggregate) => {
-            let (input_plan, inputs) = translate_helper(&aggregate.input, source_counter, psets)?;
+            let (input_plan, inputs) = translate_helper(&aggregate.input, state, psets)?;
 
             let aggregations = aggregate
                 .aggregations
@@ -251,7 +304,7 @@ fn translate_helper(
             }
         }
         LogicalPlan::PartialAggregate(aggregate) => {
-            let (input_plan, inputs) = translate_helper(&aggregate.input, source_counter, psets)?;
+            let (input_plan, inputs) = translate_helper(&aggregate.input, state, psets)?;
             let aggregations = aggregate
                 .aggregations
                 .iter()
@@ -271,7 +324,7 @@ fn translate_helper(
             ))
         }
         LogicalPlan::Window(window) => {
-            let (input_plan, inputs) = translate_helper(&window.input, source_counter, psets)?;
+            let (input_plan, inputs) = translate_helper(&window.input, state, psets)?;
 
             let window_functions =
                 BoundWindowExpr::bind_all(&window.window_functions, input_plan.schema())?;
@@ -349,7 +402,7 @@ fn translate_helper(
             Ok((plan, inputs))
         }
         LogicalPlan::Unpivot(unpivot) => {
-            let (input_plan, inputs) = translate_helper(&unpivot.input, source_counter, psets)?;
+            let (input_plan, inputs) = translate_helper(&unpivot.input, state, psets)?;
 
             let ids = BoundExpr::bind_all(&unpivot.ids, input_plan.schema())?;
             let values = BoundExpr::bind_all(&unpivot.values, input_plan.schema())?;
@@ -369,7 +422,7 @@ fn translate_helper(
             ))
         }
         LogicalPlan::Pivot(pivot) => {
-            let (input_plan, inputs) = translate_helper(&pivot.input, source_counter, psets)?;
+            let (input_plan, inputs) = translate_helper(&pivot.input, state, psets)?;
 
             let group_by = BoundExpr::bind_all(&pivot.group_by, input_plan.schema())?;
             let pivot_column = BoundExpr::try_new(pivot.pivot_column.clone(), input_plan.schema())?;
@@ -394,7 +447,7 @@ fn translate_helper(
             ))
         }
         LogicalPlan::Sort(sort) => {
-            let (input_plan, inputs) = translate_helper(&sort.input, source_counter, psets)?;
+            let (input_plan, inputs) = translate_helper(&sort.input, state, psets)?;
 
             let sort_by = BoundExpr::bind_all(&sort.sort_by, input_plan.schema())?;
 
@@ -411,7 +464,7 @@ fn translate_helper(
             ))
         }
         LogicalPlan::Shuffle(shuffle) => {
-            let (input_plan, inputs) = translate_helper(&shuffle.input, source_counter, psets)?;
+            let (input_plan, inputs) = translate_helper(&shuffle.input, state, psets)?;
             let sort_by = BoundExpr::bind_all(
                 &[random_int_expr(i64::MIN, i64::MAX, shuffle.seed)],
                 input_plan.schema(),
@@ -429,7 +482,7 @@ fn translate_helper(
             ))
         }
         LogicalPlan::TopN(top_n) => {
-            let (input_plan, inputs) = translate_helper(&top_n.input, source_counter, psets)?;
+            let (input_plan, inputs) = translate_helper(&top_n.input, state, psets)?;
 
             let sort_by = BoundExpr::bind_all(&top_n.sort_by, input_plan.schema())?;
 
@@ -468,8 +521,8 @@ fn translate_helper(
                     _ => {}
                 }
             }
-            let (left_plan, mut left_inputs) = translate_helper(&join.left, source_counter, psets)?;
-            let (right_plan, right_inputs) = translate_helper(&join.right, source_counter, psets)?;
+            let (left_plan, mut left_inputs) = translate_helper(&join.left, state, psets)?;
+            let (right_plan, right_inputs) = translate_helper(&join.right, state, psets)?;
 
             // Merge inputs from both sides
             left_inputs.extend(right_inputs);
@@ -516,10 +569,8 @@ fn translate_helper(
             }
         }
         LogicalPlan::AsofJoin(asof_join) => {
-            let (left_plan, mut left_inputs) =
-                translate_helper(&asof_join.left, source_counter, psets)?;
-            let (right_plan, right_inputs) =
-                translate_helper(&asof_join.right, source_counter, psets)?;
+            let (left_plan, mut left_inputs) = translate_helper(&asof_join.left, state, psets)?;
+            let (right_plan, right_inputs) = translate_helper(&asof_join.right, state, psets)?;
 
             left_inputs.extend(right_inputs);
 
@@ -564,7 +615,7 @@ fn translate_helper(
         }
         LogicalPlan::Distinct(distinct) => {
             let schema = distinct.input.schema();
-            let (input_plan, inputs) = translate_helper(&distinct.input, source_counter, psets)?;
+            let (input_plan, inputs) = translate_helper(&distinct.input, state, psets)?;
 
             let columns = distinct
                 .columns
@@ -584,9 +635,8 @@ fn translate_helper(
             ))
         }
         LogicalPlan::Concat(concat) => {
-            let (input_plan, mut inputs) = translate_helper(&concat.input, source_counter, psets)?;
-            let (other_plan, other_inputs) =
-                translate_helper(&concat.other, source_counter, psets)?;
+            let (input_plan, mut inputs) = translate_helper(&concat.input, state, psets)?;
+            let (other_plan, other_inputs) = translate_helper(&concat.other, state, psets)?;
 
             // Merge inputs from both sides
             inputs.extend(other_inputs);
@@ -605,17 +655,17 @@ fn translate_helper(
             log::warn!(
                 "Repartition not supported on the NativeRunner. This will be a no-op. Please use the Ray Runner instead if you need to repartition"
             );
-            translate_helper(&repartition.input, source_counter, psets)
+            translate_helper(&repartition.input, state, psets)
         }
         LogicalPlan::IntoPartitions(into_partitions) => {
             log::warn!(
                 "IntoPartitions not supported on the NativeRunner. This will be a no-op. Please use the Ray Runner instead if you need to repartition"
             );
-            translate_helper(&into_partitions.input, source_counter, psets)
+            translate_helper(&into_partitions.input, state, psets)
         }
         LogicalPlan::MonotonicallyIncreasingId(monotonically_increasing_id) => {
             let (input_plan, inputs) =
-                translate_helper(&monotonically_increasing_id.input, source_counter, psets)?;
+                translate_helper(&monotonically_increasing_id.input, state, psets)?;
             Ok((
                 LocalPhysicalPlan::monotonically_increasing_id(
                     input_plan,
@@ -630,7 +680,7 @@ fn translate_helper(
         }
         LogicalPlan::Sink(sink) => {
             use daft_logical_plan::SinkInfo;
-            let (input_plan, inputs) = translate_helper(&sink.input, source_counter, psets)?;
+            let (input_plan, inputs) = translate_helper(&sink.input, state, psets)?;
             let data_schema = input_plan.schema().clone();
             let plan = match sink.sink_info.as_ref() {
                 SinkInfo::OutputFileInfo(info) => {
@@ -687,7 +737,7 @@ fn translate_helper(
             Ok((plan, inputs))
         }
         LogicalPlan::Explode(explode) => {
-            let (input_plan, inputs) = translate_helper(&explode.input, source_counter, psets)?;
+            let (input_plan, inputs) = translate_helper(&explode.input, state, psets)?;
 
             let to_explode = BoundExpr::bind_all(&explode.to_explode, input_plan.schema())?;
 
@@ -705,8 +755,7 @@ fn translate_helper(
             ))
         }
         LogicalPlan::VLLMProject(vllm_project) => {
-            let (input_plan, inputs) =
-                translate_helper(&vllm_project.input, source_counter, psets)?;
+            let (input_plan, inputs) = translate_helper(&vllm_project.input, state, psets)?;
             let expr = BoundVLLMExpr::try_new(vllm_project.expr.clone(), input_plan.schema())?;
             Ok((
                 LocalPhysicalPlan::vllm_project(
@@ -721,6 +770,31 @@ fn translate_helper(
                 inputs,
             ))
         }
+        LogicalPlan::Shared(shared) => {
+            let readers = state.shared.readers_of(shared.id, &shared.input.schema());
+            if readers.is_some()
+                && let Some(part) = state.shared.translated.get(&shared.id)
+            {
+                // Its sources already take their inputs through the first reader.
+                return Ok((part.clone(), HashMap::new()));
+            }
+            let (input_plan, inputs) = translate_helper(&shared.input, state, psets)?;
+            match readers {
+                Some(readers) if readers > 1 => {
+                    let part = LocalPhysicalPlan::shared(
+                        input_plan,
+                        shared.id,
+                        readers,
+                        shared.stats_state.clone(),
+                        LocalNodeContext::default(),
+                    );
+                    state.shared.translated.insert(shared.id, part.clone());
+                    Ok((part, inputs))
+                }
+                // Read once, or not one of the part's readers: it computes its own rows.
+                _ => Ok((input_plan, inputs)),
+            }
+        }
         LogicalPlan::Intersect(_)
         | LogicalPlan::Union(_)
         | LogicalPlan::SubqueryAlias(_)
@@ -728,5 +802,96 @@ fn translate_helper(
             "Logical plan operator {} should already be optimized away",
             plan.name()
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, sync::Arc};
+
+    use common_error::DaftResult;
+    use common_partitioning::PartitionCacheEntry;
+    use common_treenode::{TreeNode, TreeNodeRecursion};
+    use daft_core::{join::JoinType, prelude::*};
+    use daft_dsl::unresolved_col;
+    use daft_logical_plan::{LogicalPlan, LogicalPlanBuilder, LogicalPlanRef, ops::Shared};
+
+    use super::translate;
+    use crate::{LocalPhysicalPlan, LocalPhysicalPlanRef};
+
+    fn rows() -> LogicalPlanBuilder {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64),
+            Field::new("v", DataType::Int64),
+        ]));
+        let entry = PartitionCacheEntry::Rust {
+            key: "rows".to_string(),
+            value: None,
+        };
+        LogicalPlanBuilder::in_memory_scan("rows", entry, schema, 1, 16, 2).unwrap()
+    }
+
+    /// The aggregation of `rows` by `k`, wrapped as occurrence of shared part 0.
+    fn occurrence(rows: &LogicalPlanBuilder, renamed: bool) -> LogicalPlanBuilder {
+        let sum = unresolved_col("v")
+            .sum()
+            .alias(if renamed { "t" } else { "s" });
+        let part = rows
+            .aggregate(vec![sum], vec![unresolved_col("k")])
+            .unwrap();
+        LogicalPlanBuilder::from(Arc::new(LogicalPlan::Shared(Shared::new(part.build(), 0))))
+    }
+
+    fn joined(left: &LogicalPlanBuilder, right: &LogicalPlanBuilder) -> LogicalPlanRef {
+        left.join(
+            right.clone(),
+            None,
+            vec!["k".to_string()],
+            JoinType::Inner,
+            None,
+            daft_logical_plan::JoinOptions::default().suffix("_r"),
+        )
+        .unwrap()
+        .build()
+    }
+
+    fn shared_nodes(plan: &LocalPhysicalPlanRef) -> Vec<(LocalPhysicalPlanRef, usize)> {
+        let mut found = vec![];
+        plan.apply(|node| {
+            if let LocalPhysicalPlan::Shared(shared) = node.as_ref() {
+                found.push((node.clone(), shared.readers));
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        found
+    }
+
+    fn psets() -> HashMap<String, Vec<daft_micropartition::MicroPartitionRef>> {
+        HashMap::from([("rows".to_string(), vec![])])
+    }
+
+    #[test]
+    fn readers_of_a_part_hold_one_translation_and_its_inputs_once() -> DaftResult<()> {
+        let rows = rows();
+        let plan = joined(&occurrence(&rows, false), &occurrence(&rows, false));
+        let (local, inputs) = translate(&plan, &psets())?;
+        let shared = shared_nodes(&local);
+        assert_eq!(shared.len(), 2);
+        assert!(Arc::ptr_eq(&shared[0].0, &shared[1].0));
+        assert_eq!(shared[0].1, 2);
+        assert_eq!(inputs.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn an_occurrence_with_another_schema_computes_its_own_rows() -> DaftResult<()> {
+        let rows = rows();
+        let plan = joined(&occurrence(&rows, false), &occurrence(&rows, true));
+        let (local, inputs) = translate(&plan, &psets())?;
+        // Each has one reader, so neither is shared.
+        assert!(shared_nodes(&local).is_empty());
+        assert_eq!(inputs.len(), 2);
+        Ok(())
     }
 }

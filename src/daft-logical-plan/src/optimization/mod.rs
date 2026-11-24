@@ -7,3 +7,4 @@ mod test;
 pub(crate) mod uniqueness;
 
 pub use optimizer::{Optimizer, OptimizerBuilder, OptimizerConfig};
+pub(crate) use rules::{OptimizerRule, ShareRepeatedParts};

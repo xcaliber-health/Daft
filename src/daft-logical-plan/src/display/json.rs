@@ -113,6 +113,9 @@ pub(crate) fn to_json_value(node: &LogicalPlan) -> serde_json::Value {
         LogicalPlan::StageCheckpointKeys(stage) => json!({
             "key_column": stage.checkpoint_config.key_column,
         }),
+        LogicalPlan::Shared(shared) => json!({
+            "id": shared.id,
+        }),
         LogicalPlan::SubqueryAlias(subquery_alias) => json!({
             "name": subquery_alias.name,
         }),

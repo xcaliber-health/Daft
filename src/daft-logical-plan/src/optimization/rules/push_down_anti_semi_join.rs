@@ -292,7 +292,9 @@ impl OptimizerRule for PushDownAntiSemiJoin {
                     | LogicalPlan::Concat(_)
                     | LogicalPlan::AsofJoin(..)
                     | LogicalPlan::VLLMProject(..)
-                    | LogicalPlan::StageCheckpointKeys(..) => {}
+                    | LogicalPlan::StageCheckpointKeys(..)
+                    // A semi or anti join filters one reader's rows, not the part's.
+                    | LogicalPlan::Shared(..) => {}
                 }
             }
 

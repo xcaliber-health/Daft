@@ -20,7 +20,7 @@ use daft_local_plan::{
     AsofJoin, CommitWrite, Concat, CrossJoin, Dedup, Explode, Filter, FlightShuffleReadInput,
     GatherWrite, GlobScan, HashAggregate, HashJoin, InMemoryScan, IntoBatches, Limit,
     LocalNodeContext, LocalPhysicalPlan, MonotonicallyIncreasingId, PartialHashAggregate,
-    PhysicalScan, PhysicalWrite, Pivot, Project, RepartitionWrite, Sample, ShuffleBackend,
+    PhysicalScan, PhysicalWrite, Pivot, Project, RepartitionWrite, Sample, Shared, ShuffleBackend,
     ShuffleReadBackend, Sort, SortMergeJoin, SourceId, TopN, UDFProject, UnGroupedAggregate,
     Unpivot, VLLMProject, WindowOrderByOnly, WindowPartitionAndDynamicFrame,
     WindowPartitionAndOrderBy, WindowPartitionOnly,
@@ -50,6 +50,7 @@ use crate::{
         AsofJoinOperator, CrossJoinOperator, HashJoinOperator, JoinNode, SortMergeJoinOperator,
         key_filter::{FilterSite, ScanKeyFilter, plan_key_filter},
     },
+    shared::{SharedHub, SharedReaderNode},
     sinks::{
         aggregate::AggregateSink,
         blocking_sink::BlockingSinkNode,
@@ -303,6 +304,8 @@ pub struct BuilderContext {
     /// aggregations on its probe side, held by site until that site becomes a
     /// pipeline node.
     key_filters: std::cell::RefCell<HashMap<FilterSite, Vec<ScanKeyFilter>>>,
+    /// The parts computed once for several readers, by id, once their first reader is built.
+    shared_parts: std::cell::RefCell<HashMap<usize, Arc<SharedHub>>>,
 }
 
 impl BuilderContext {
@@ -325,6 +328,7 @@ impl BuilderContext {
             checkpoint: std::cell::RefCell::new(None),
             skipped_corrupt_files: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             key_filters: std::cell::RefCell::new(HashMap::new()),
+            shared_parts: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
@@ -947,6 +951,27 @@ fn physical_plan_to_pipeline(
                 context,
             )
             .boxed()
+        }
+        LocalPhysicalPlan::Shared(Shared {
+            id,
+            input,
+            stats_state,
+            context,
+            ..
+        }) => {
+            // Every reader holds the same part; it is built, and run, once.
+            let existing = ctx.shared_parts.borrow().get(id).cloned();
+            match existing {
+                Some(hub) => {
+                    SharedReaderNode::another(hub, stats_state.clone(), ctx, context).boxed()
+                }
+                None => {
+                    let hub = SharedHub::new(*id, cfg.clone());
+                    ctx.shared_parts.borrow_mut().insert(*id, hub.clone());
+                    let body = physical_plan_to_pipeline(input, cfg, ctx, input_senders)?;
+                    SharedReaderNode::first(hub, body, stats_state.clone(), ctx, context).boxed()
+                }
+            }
         }
         LocalPhysicalPlan::Concat(Concat {
             input,

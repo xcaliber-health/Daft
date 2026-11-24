@@ -76,14 +76,17 @@ pub fn prepare_plan_for_shipping(
         Ok(TreeNodeRecursion::Continue)
     })?;
 
+    let builder = daft_logical_plan::LogicalPlanBuilder::new(plan, None);
     if all_ship {
-        return Ok((plan, false));
+        // Parts written more than once are matched here, by their shared source objects,
+        // which the plan no longer holds once it is decoded on the server.
+        let marked = builder.with_repeated_parts_marked(exec_config)?;
+        return Ok((marked.build(), false));
     }
     // Materializing scans without running the optimizer would bake in empty
     // pushdowns and force the server to scan full-width tables; optimize
     // here instead so tasks carry their projections and predicates.
-    let optimized =
-        daft_logical_plan::LogicalPlanBuilder::new(plan, None).optimize(exec_config.clone())?;
+    let optimized = builder.optimize_for_local_execution(exec_config.clone())?;
     Ok((optimized.build(), true))
 }
 

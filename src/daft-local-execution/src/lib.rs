@@ -13,6 +13,7 @@ mod pipeline;
 mod resource_manager;
 mod run;
 mod runtime_stats;
+mod shared;
 mod sinks;
 mod sorted_merge;
 mod sources;

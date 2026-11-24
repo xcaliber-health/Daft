@@ -65,6 +65,7 @@ pub enum LogicalPlan {
     Window(Window),
     TopN(TopN),
     VLLMProject(VLLMProject),
+    Shared(Shared),
 }
 
 // A plan nests one level per operation, and a derived (de)serializer recurses
@@ -212,6 +213,7 @@ impl LogicalPlan {
             Self::Window(Window { schema, .. }) => schema.clone(),
             Self::TopN(TopN { input, .. }) => Self::schema_of_input(input),
             Self::VLLMProject(VLLMProject { output_schema, .. }) => output_schema.clone(),
+            Self::Shared(Shared { input, .. }) => Self::schema_of_input(input),
         }
     }
 
@@ -233,6 +235,7 @@ impl LogicalPlan {
             | Self::Offset(..)
             | Self::Sample(..)
             | Self::StageCheckpointKeys(..)
+            | Self::Shared(..)
             | Self::MonotonicallyIncreasingId(..) => RequiredCols::new(IndexSet::new(), None),
             Self::Concat(..) => RequiredCols::new(IndexSet::new(), Some(IndexSet::new())),
             Self::Project(projection) => {
@@ -472,6 +475,7 @@ impl LogicalPlan {
             Self::Window(..) => "Window",
             Self::TopN(..) => "TopN",
             Self::VLLMProject(..) => "VLLMProject",
+            Self::Shared(..) => "Shared",
         }
     }
 
@@ -504,7 +508,8 @@ impl LogicalPlan {
             | Self::StageCheckpointKeys(StageCheckpointKeys { stats_state, .. })
             | Self::Window(Window { stats_state, .. })
             | Self::TopN(TopN { stats_state, .. })
-            | Self::VLLMProject(VLLMProject { stats_state, .. }) => stats_state,
+            | Self::VLLMProject(VLLMProject { stats_state, .. })
+            | Self::Shared(Shared { stats_state, .. }) => stats_state,
             Self::Intersect(_) | Self::Union(_) | Self::SubqueryAlias(_) => {
                 panic!(
                     "{} nodes should be optimized away before stats are materialized",
@@ -554,6 +559,7 @@ impl LogicalPlan {
             Self::Window(plan) => Self::Window(plan.with_materialized_stats()),
             Self::TopN(plan) => Self::TopN(plan.with_materialized_stats()),
             Self::VLLMProject(plan) => Self::VLLMProject(plan.with_materialized_stats()),
+            Self::Shared(plan) => Self::Shared(plan.with_materialized_stats()),
             Self::Intersect(_) | Self::Union(_) | Self::SubqueryAlias(_) => {
                 panic!(
                     "{} should be optimized away before stats are derived",
@@ -598,6 +604,7 @@ impl LogicalPlan {
             Self::Window(window) => window.multiline_display(),
             Self::TopN(top_n) => top_n.multiline_display(),
             Self::VLLMProject(vllm_project) => vllm_project.multiline_display(),
+            Self::Shared(shared) => shared.multiline_display(),
         }
     }
 
@@ -636,6 +643,7 @@ impl LogicalPlan {
             Self::Window(Window { input, .. }) => vec![input],
             Self::TopN(TopN { input, .. }) => vec![input],
             Self::VLLMProject(VLLMProject { input, .. }) => vec![input],
+            Self::Shared(Shared { input, .. }) => vec![input],
         }
     }
 
@@ -843,6 +851,7 @@ impl LogicalPlan {
                     input.clone(),
                     checkpoint_config.clone(),
                 )),
+                Self::Shared(Shared { id, .. }) => Self::Shared(Shared::new(input.clone(), *id)),
                 Self::Concat(_)
                 | Self::Intersect(_)
                 | Self::Union(_)
@@ -1120,7 +1129,8 @@ impl LogicalPlan {
             | Self::SubqueryAlias(SubqueryAlias { plan_id, .. })
             | Self::Window(Window { plan_id, .. })
             | Self::TopN(TopN { plan_id, .. })
-            | Self::VLLMProject(VLLMProject { plan_id, .. }) => plan_id,
+            | Self::VLLMProject(VLLMProject { plan_id, .. })
+            | Self::Shared(Shared { plan_id, .. }) => plan_id,
         }
     }
 
@@ -1156,7 +1166,8 @@ impl LogicalPlan {
             | Self::SubqueryAlias(SubqueryAlias { node_id, .. })
             | Self::Window(Window { node_id, .. })
             | Self::TopN(TopN { node_id, .. })
-            | Self::VLLMProject(VLLMProject { node_id, .. }) => node_id,
+            | Self::VLLMProject(VLLMProject { node_id, .. })
+            | Self::Shared(Shared { node_id, .. }) => node_id,
         }
     }
 
@@ -1206,6 +1217,7 @@ impl LogicalPlan {
             Self::VLLMProject(vllm_project) => {
                 Self::VLLMProject(vllm_project.with_plan_id(plan_id))
             }
+            Self::Shared(shared) => Self::Shared(shared.with_plan_id(plan_id)),
         }
     }
 
@@ -1255,6 +1267,7 @@ impl LogicalPlan {
             Self::VLLMProject(vllm_project) => {
                 Self::VLLMProject(vllm_project.with_node_id(node_id))
             }
+            Self::Shared(shared) => Self::Shared(shared.with_node_id(node_id)),
         }
     }
 }
@@ -1367,3 +1380,4 @@ impl_from_data_struct_for_logical_plan!(Shuffle);
 impl_from_data_struct_for_logical_plan!(MonotonicallyIncreasingId);
 impl_from_data_struct_for_logical_plan!(Window);
 impl_from_data_struct_for_logical_plan!(TopN);
+impl_from_data_struct_for_logical_plan!(Shared);

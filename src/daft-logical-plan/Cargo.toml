@@ -27,6 +27,7 @@ log = {workspace = true}
 num-format = {workspace = true}
 pyo3 = {workspace = true, optional = true}
 recursive = {workspace = true}
+stacker = {workspace = true}
 serde = {workspace = true, features = ["rc"]}
 snafu = {workspace = true}
 tokio = {workspace = true}

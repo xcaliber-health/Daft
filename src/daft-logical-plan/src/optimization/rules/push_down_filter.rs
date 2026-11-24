@@ -485,6 +485,9 @@ impl PushDownFilter {
             | LogicalPlan::AsofJoin(..)
             | LogicalPlan::VLLMProject(..)
             | LogicalPlan::StageCheckpointKeys(..)
+            // Every reader of a shared part reads the same rows: one reader's filter enters
+            // it only through `PushDownIntoSharedParts`, alike for every reader.
+            | LogicalPlan::Shared(..)
             // Placed after every pushdown, below a join; nothing is pushed through it.
             | LogicalPlan::PartialAggregate(..) => {
                 return Ok(Transformed::no(plan));

@@ -594,6 +594,9 @@ impl PushDownProjection {
             }
             LogicalPlan::VLLMProject(..) => Ok(Transformed::no(plan)),
             LogicalPlan::StageCheckpointKeys(_) => Ok(Transformed::no(plan)),
+            // Every reader of a shared part reads the same columns: the union of what the
+            // readers need enters it only through `PushDownIntoSharedParts`.
+            LogicalPlan::Shared(_) => Ok(Transformed::no(plan)),
             // Placed after every pushdown with exactly the columns it needs.
             LogicalPlan::PartialAggregate(_) => Ok(Transformed::no(plan)),
             LogicalPlan::SubqueryAlias(_) => unreachable!("Alias should have been optimized away"),

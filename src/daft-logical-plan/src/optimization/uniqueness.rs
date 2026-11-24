@@ -28,7 +28,7 @@ use crate::{
     logical_plan::SubqueryAlias,
     ops::{
         Aggregate, Distinct, Filter, IntoBatches, IntoPartitions, Join, Limit, Offset, Project,
-        Repartition, Sample, Shard, Sort, TopN, Window,
+        Repartition, Sample, Shard, Shared, Sort, TopN, Window,
     },
 };
 
@@ -152,7 +152,9 @@ fn keys(plan: &LogicalPlan, trust: Trust) -> Vec<Key> {
         | LogicalPlan::IntoPartitions(IntoPartitions { input, .. })
         | LogicalPlan::IntoBatches(IntoBatches { input, .. })
         | LogicalPlan::Window(Window { input, .. })
-        | LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. }) => keys(input, trust),
+        | LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. })
+        // A shared part hands each reader its rows unchanged.
+        | LogicalPlan::Shared(Shared { input, .. }) => keys(input, trust),
         // Sampling with replacement may draw a row twice.
         LogicalPlan::Sample(Sample {
             input,

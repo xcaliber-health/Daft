@@ -10,12 +10,13 @@ use super::{
         DetectMonotonicId, DropIntoBatches, DropRepartition, EliminateCrossJoin, EliminateOffsets,
         EliminateSubqueryAliasRule, EnrichWithStats, ExtractWindowFunction, FilterNullJoinKey,
         InferJoinKeyFilters, LiftProjectFromAgg, MaterializeScans, OptimizerRule,
-        PushDownAggregation, PushDownAntiSemiJoin, PushDownFilter, PushDownJoinPredicate,
-        PushDownLimit, PushDownProjection, PushDownShard, PushPartialAggregateThroughJoin,
-        ReorderJoins, RewriteCheckpointSource, RewriteCountDistinct, RewriteOffset, ShardScans,
-        SimplifyExpressionsRule, SimplifyNullFilteredJoin, SplitExplodeFromProject,
-        SplitGranularProjection, SplitUDFs, SplitUDFsFromFilters, UnnestPredicateSubquery,
-        UnnestScalarSubquery,
+        PushDownAggregation, PushDownAntiSemiJoin, PushDownFilter, PushDownIntoSharedParts,
+        PushDownJoinPredicate, PushDownLimit, PushDownProjection, PushDownShard,
+        PushLimitsIntoSharedParts, PushPartialAggregateThroughJoin, ReorderJoins,
+        RewriteCheckpointSource, RewriteCountDistinct, RewriteOffset, ShardScans,
+        ShareRepeatedParts, SimplifyExpressionsRule, SimplifyNullFilteredJoin,
+        SplitExplodeFromProject, SplitGranularProjection, SplitUDFs, SplitUDFsFromFilters,
+        UnnestPredicateSubquery, UnnestScalarSubquery, WithSharedParts,
     },
 };
 use crate::{LogicalPlan, optimization::rules::SplitVLLM};
@@ -32,6 +33,10 @@ pub struct OptimizerConfig {
     /// Whether to push a partial aggregation below an equi-join that its aggregations read
     /// one side of ([`PushPartialAggregateThroughJoin`]).
     pub partial_aggregate_pushdown: bool,
+    /// Whether to compute a part of the plan written more than once, once for all of its
+    /// readers ([`ShareRepeatedParts`]). Only the local executor runs shared parts, so it is
+    /// off unless the caller plans for it.
+    pub share_repeated_parts: bool,
 }
 
 impl OptimizerConfig {
@@ -41,6 +46,7 @@ impl OptimizerConfig {
             strict_pushdown,
             join_key_inference,
             partial_aggregate_pushdown: true,
+            share_repeated_parts: false,
         }
     }
 }
@@ -63,6 +69,19 @@ impl<T: OptimizerRule + std::fmt::Debug> OptimizerRuleInBatch for T {}
 
 #[cfg(not(debug_assertions))]
 impl<T: OptimizerRule> OptimizerRuleInBatch for T {}
+
+/// `rule` as a rule of a batch; with `only_with_shared_parts`, acting only on a plan that
+/// holds a shared part.
+fn gated<R: OptimizerRuleInBatch + 'static>(
+    rule: R,
+    only_with_shared_parts: bool,
+) -> Box<dyn OptimizerRuleInBatch> {
+    if only_with_shared_parts {
+        Box::new(WithSharedParts(rule))
+    } else {
+        Box::new(rule)
+    }
+}
 
 /// A batch of logical optimization rules.
 #[cfg_attr(debug_assertions, derive(Debug))]
@@ -150,6 +169,16 @@ impl OptimizerBuilder {
                 vec![Box::new(SimplifyExpressionsRule::new())],
                 RuleExecutionStrategy::FixedPoint(None),
             ),
+        ]);
+        // --- Parts written more than once ---
+        // Found before any pushdown, while their occurrences are still alike.
+        if self.config.share_repeated_parts {
+            self.rule_batches.push(RuleBatch::new(
+                vec![Box::new(ShareRepeatedParts::new())],
+                RuleExecutionStrategy::Once,
+            ));
+        }
+        self.rule_batches.extend(vec![
             // --- Filter out null join keys ---
             // This rule should be run once, before any filter pushdown rules.
             RuleBatch::new(
@@ -165,49 +194,45 @@ impl OptimizerBuilder {
                 RuleExecutionStrategy::FixedPoint(None),
             ),
             // --- Bulk of our rules ---
-            RuleBatch::new(
-                vec![
-                    Box::new(DropRepartition::new()),
-                    Box::new(DropIntoBatches::new()),
-                    Box::new(PushDownFilter::new(self.config.strict_pushdown)),
-                    Box::new(PushDownProjection::new()),
-                    Box::new(EliminateCrossJoin::new()),
-                    Box::new(SimplifyNullFilteredJoin::new()),
-                    Box::new(PushDownJoinPredicate::new()),
-                    Box::new(EliminateOffsets::new()),
-                ],
-                // Use a fixed-point policy for the pushdown rules: PushDownProjection can produce a Filter node
-                // at the current node, which would require another batch application in order to have a chance to push
-                // that Filter node through upstream nodes.
-                // TODO(Clark): Refine this fixed-point policy.
-                RuleExecutionStrategy::FixedPoint(None),
-            ),
+            self.pushdown_batch(false),
         ]);
         // --- Restrictions derived across join keys ---
         // After the bulk of our rules every filter sits as low as it goes, wherever it was written,
         // and scans still take filters. A fixed point carries a restriction derived on top of a
         // join's side through the joins inside that side.
-        if self.config.join_key_inference {
+        if let Some(batch) = self.join_key_inference_batch(false) {
+            self.rule_batches.push(batch);
+        }
+        // --- What every reader of a shared part needs ---
+        // Pushdown stops at a shared part, so the readers' filters and projections now sit right
+        // above it. What all of them need enters the part, and the pushdown rules run again so it
+        // reaches as far into the part as it goes.
+        if self.config.share_repeated_parts {
             self.rule_batches.push(RuleBatch::new(
-                vec![
-                    Box::new(InferJoinKeyFilters::new()),
-                    Box::new(PushDownFilter::new(self.config.strict_pushdown)),
-                ],
-                RuleExecutionStrategy::FixedPoint(None),
+                vec![gated(
+                    PushDownIntoSharedParts::new(self.config.strict_pushdown),
+                    true,
+                )],
+                RuleExecutionStrategy::Once,
             ));
+            self.rule_batches.push(self.pushdown_batch(true));
+            if let Some(batch) = self.join_key_inference_batch(true) {
+                self.rule_batches.push(batch);
+            }
+        }
+        let mut limit_rules: Vec<Box<dyn OptimizerRuleInBatch>> = vec![
+            Box::new(RewriteOffset::new()),
+            Box::new(PushDownLimit::new()),
+        ];
+        if self.config.share_repeated_parts {
+            limit_rules.insert(0, gated(PushLimitsIntoSharedParts::new(), true));
         }
         self.rule_batches.extend(vec![
             // --- Rewrite Offset and Pushdown Limit ---
             // This needs to be separate from PushDownProjection because otherwise the limit and
             // projection just keep swapping places, preventing optimization
             // (see https://github.com/Eventual-Inc/Daft/issues/2616)
-            RuleBatch::new(
-                vec![
-                    Box::new(RewriteOffset::new()),
-                    Box::new(PushDownLimit::new()),
-                ],
-                RuleExecutionStrategy::FixedPoint(Some(3)),
-            ),
+            RuleBatch::new(limit_rules, RuleExecutionStrategy::FixedPoint(Some(3))),
             // --- Rewrite projections ---
             // Once optimization rules have been applied, split UDFs and detect monotonic IDs.
             // By delaying these rewrite rules, we avoid having to special case optimization rules for
@@ -261,6 +286,48 @@ impl OptimizerBuilder {
             ),
         ]);
         self
+    }
+
+    /// The bulk of the pushdown rules; with `only_with_shared_parts`, each acts only on a plan
+    /// that holds a shared part, as when they run again after what its readers need entered it.
+    fn pushdown_batch(&self, only_with_shared_parts: bool) -> RuleBatch {
+        RuleBatch::new(
+            vec![
+                gated(DropRepartition::new(), only_with_shared_parts),
+                gated(DropIntoBatches::new(), only_with_shared_parts),
+                gated(
+                    PushDownFilter::new(self.config.strict_pushdown),
+                    only_with_shared_parts,
+                ),
+                gated(PushDownProjection::new(), only_with_shared_parts),
+                gated(EliminateCrossJoin::new(), only_with_shared_parts),
+                gated(SimplifyNullFilteredJoin::new(), only_with_shared_parts),
+                gated(PushDownJoinPredicate::new(), only_with_shared_parts),
+                gated(EliminateOffsets::new(), only_with_shared_parts),
+            ],
+            // Use a fixed-point policy for the pushdown rules: PushDownProjection can produce a Filter node
+            // at the current node, which would require another batch application in order to have a chance to push
+            // that Filter node through upstream nodes.
+            // TODO(Clark): Refine this fixed-point policy.
+            RuleExecutionStrategy::FixedPoint(None),
+        )
+    }
+
+    /// Restrictions derived across join keys, unless the config turns them off; with
+    /// `only_with_shared_parts`, only on a plan that holds a shared part.
+    fn join_key_inference_batch(&self, only_with_shared_parts: bool) -> Option<RuleBatch> {
+        self.config.join_key_inference.then(|| {
+            RuleBatch::new(
+                vec![
+                    gated(InferJoinKeyFilters::new(), only_with_shared_parts),
+                    gated(
+                        PushDownFilter::new(self.config.strict_pushdown),
+                        only_with_shared_parts,
+                    ),
+                ],
+                RuleExecutionStrategy::FixedPoint(None),
+            )
+        })
     }
 
     pub fn reorder_joins(

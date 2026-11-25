@@ -190,6 +190,12 @@ pub struct DaftExecutionConfig {
     /// Bytes of partial results a partial aggregation pushed below a join holds before it
     /// emits them early, which is always correct.
     pub partial_aggregate_pushdown_max_buffer_bytes: usize,
+    /// Whether the local runner computes a part of a plan written more than once, once.
+    /// Off restores planning each occurrence on its own.
+    pub disable_subplan_sharing: bool,
+    /// Bytes of a shared part's rows held in memory for readers that have not taken them
+    /// yet; past it, or past the query's memory budget, they spill to disk.
+    pub shared_part_buffer_bytes: usize,
     pub read_sql_partition_size_bytes: usize,
     pub default_morsel_size: NonZeroUsize,
     pub shuffle_algorithm: String,
@@ -249,7 +255,9 @@ impl Default for DaftExecutionConfig {
             partial_aggregate_pushdown_probe_rows: 100_000,
             partial_aggregate_pushdown_skip_ratio: 0.5,
             partial_aggregate_pushdown_max_buffer_bytes: 256 * 1024 * 1024, // 256MB
-            read_sql_partition_size_bytes: 512 * 1024 * 1024,               // 512MB
+            disable_subplan_sharing: false,
+            shared_part_buffer_bytes: 64 * 1024 * 1024, // 64MB
+            read_sql_partition_size_bytes: 512 * 1024 * 1024, // 512MB
             default_morsel_size: NonZeroUsize::new(128 * 1024).unwrap(),
             shuffle_algorithm: "auto".to_string(),
             pre_shuffle_merge_threshold: 1024 * 1024 * 1024, // 1GB
@@ -281,6 +289,7 @@ impl DaftExecutionConfig {
     const ENV_JSON_INFLATION_FACTOR: &'static str = "DAFT_JSON_INFLATION_FACTOR";
     const ENV_TEXT_INFLATION_FACTOR: &'static str = "DAFT_TEXT_INFLATION_FACTOR";
     const ENV_DAFT_MAINTAIN_ORDER: &'static str = "DAFT_MAINTAIN_ORDER";
+    const ENV_DAFT_DEV_DISABLE_SUBPLAN_SHARING: &'static str = "DAFT_DEV_DISABLE_SUBPLAN_SHARING";
 
     #[must_use]
     pub fn from_env() -> Self {
@@ -323,6 +332,10 @@ impl DaftExecutionConfig {
 
         if let Some(val) = parse_bool_from_env(Self::ENV_DAFT_MAINTAIN_ORDER) {
             cfg.maintain_order = val;
+        }
+
+        if let Some(val) = parse_bool_from_env(Self::ENV_DAFT_DEV_DISABLE_SUBPLAN_SHARING) {
+            cfg.disable_subplan_sharing = val;
         }
 
         if let Some(val) = parse_number_from_env(

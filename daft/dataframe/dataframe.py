@@ -404,10 +404,11 @@ class DataFrame:
         if show_all:
             print_to_file("\n== Optimized Logical Plan ==\n")
             execution_config = get_context().daft_execution_config
-            builder = builder.optimize(execution_config)
+            local = get_or_create_runner().name == "native"
+            builder = builder.optimize(execution_config, local=local)
             print_to_file(builder.pretty_print(simple))
             print_to_file("\n== Physical Plan ==\n")
-            if get_or_create_runner().name != "native":
+            if not local:
                 from daft.daft import DistributedPhysicalPlan
 
                 distributed_plan = DistributedPhysicalPlan.from_logical_plan_builder(

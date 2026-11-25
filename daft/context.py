@@ -262,6 +262,8 @@ def set_execution_config(
     partial_aggregate_pushdown_probe_rows: int | None = None,
     partial_aggregate_pushdown_skip_ratio: float | None = None,
     partial_aggregate_pushdown_max_buffer_bytes: int | None = None,
+    disable_subplan_sharing: bool | None = None,
+    shared_part_buffer_bytes: int | None = None,
     read_sql_partition_size_bytes: int | None = None,
     default_morsel_size: int | None = None,
     shuffle_algorithm: str | None = None,
@@ -345,6 +347,11 @@ def set_execution_config(
             aggregation pushed below a join passes each row on instead of aggregating. Defaults to 0.5.
         partial_aggregate_pushdown_max_buffer_bytes: Bytes of partial results a partial aggregation pushed below a join
             holds before emitting them early. Defaults to 256MB.
+        disable_subplan_sharing: Whether the native runner computes a part of a plan written more than once
+            (a join, aggregation, window or sort read by several readers) once for all of them. Set it to
+            turn that off. Defaults to False.
+        shared_part_buffer_bytes: Bytes of a shared part's rows held in memory for readers that have not
+            taken them yet; past it, or past the query's memory budget, they spill to disk. Defaults to 64MB.
         read_sql_partition_size_bytes: Target size of partition when reading from SQL databases. Defaults to 512MB
         default_morsel_size: Default size of morsels used for the new local executor. Defaults to 131072 rows.
         shuffle_algorithm: The shuffle algorithm to use. Defaults to "auto", which will let Daft determine the algorithm. Options are "map_reduce", "pre_shuffle_merge", and "flight_shuffle".
@@ -408,6 +415,8 @@ def set_execution_config(
             partial_aggregate_pushdown_probe_rows=partial_aggregate_pushdown_probe_rows,
             partial_aggregate_pushdown_skip_ratio=partial_aggregate_pushdown_skip_ratio,
             partial_aggregate_pushdown_max_buffer_bytes=partial_aggregate_pushdown_max_buffer_bytes,
+            disable_subplan_sharing=disable_subplan_sharing,
+            shared_part_buffer_bytes=shared_part_buffer_bytes,
             read_sql_partition_size_bytes=read_sql_partition_size_bytes,
             default_morsel_size=default_morsel_size,
             shuffle_algorithm=shuffle_algorithm,

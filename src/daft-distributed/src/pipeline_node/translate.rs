@@ -1,7 +1,7 @@
 use core::panic;
 use std::{collections::HashMap, sync::Arc};
 
-use common_error::DaftResult;
+use common_error::{DaftError, DaftResult};
 use common_metrics::Meter;
 use common_partitioning::PartitionRef;
 use common_treenode::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
@@ -700,6 +700,11 @@ impl TreeNodeVisitor for LogicalPlanToPipelineNodeTranslator {
                     &self.meter,
                 )
             }
+            // A part shared by several readers is computed by each of them here, as the
+            // distributed runner plans it unshared: the node passes its input through.
+            LogicalPlan::Shared(_) => self.curr_node.pop().ok_or_else(|| {
+                DaftError::InternalError("a shared part was translated without its input".into())
+            })?,
             LogicalPlan::SubqueryAlias(_)
             | LogicalPlan::Union(_)
             | LogicalPlan::Intersect(_)

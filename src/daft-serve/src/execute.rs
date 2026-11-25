@@ -362,7 +362,7 @@ async fn plan_off_runtime(
         if let Some(events) = &planning {
             events.started(&builder);
         }
-        let optimized = builder.optimize(exec_config)?;
+        let optimized = builder.optimize_for_local_execution(exec_config)?;
         if let Some(events) = &planning {
             events.optimized(&optimized);
         }

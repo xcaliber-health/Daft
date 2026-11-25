@@ -139,6 +139,8 @@ impl PyDaftExecutionConfig {
         partial_aggregate_pushdown_probe_rows=None,
         partial_aggregate_pushdown_skip_ratio=None,
         partial_aggregate_pushdown_max_buffer_bytes=None,
+        disable_subplan_sharing=None,
+        shared_part_buffer_bytes=None,
         read_sql_partition_size_bytes=None,
         default_morsel_size=None,
         shuffle_algorithm=None,
@@ -189,6 +191,8 @@ impl PyDaftExecutionConfig {
         partial_aggregate_pushdown_probe_rows: Option<usize>,
         partial_aggregate_pushdown_skip_ratio: Option<f64>,
         partial_aggregate_pushdown_max_buffer_bytes: Option<usize>,
+        disable_subplan_sharing: Option<bool>,
+        shared_part_buffer_bytes: Option<usize>,
         read_sql_partition_size_bytes: Option<usize>,
         default_morsel_size: Option<usize>,
         shuffle_algorithm: Option<&str>,
@@ -300,6 +304,12 @@ impl PyDaftExecutionConfig {
         }
         if let Some(max_buffer_bytes) = partial_aggregate_pushdown_max_buffer_bytes {
             config.partial_aggregate_pushdown_max_buffer_bytes = max_buffer_bytes;
+        }
+        if let Some(disable_subplan_sharing) = disable_subplan_sharing {
+            config.disable_subplan_sharing = disable_subplan_sharing;
+        }
+        if let Some(shared_part_buffer_bytes) = shared_part_buffer_bytes {
+            config.shared_part_buffer_bytes = shared_part_buffer_bytes;
         }
         if let Some(read_sql_partition_size_bytes) = read_sql_partition_size_bytes {
             config.read_sql_partition_size_bytes = read_sql_partition_size_bytes;
@@ -554,6 +564,16 @@ impl PyDaftExecutionConfig {
     #[getter]
     fn get_partial_aggregate_pushdown_max_buffer_bytes(&self) -> PyResult<usize> {
         Ok(self.config.partial_aggregate_pushdown_max_buffer_bytes)
+    }
+
+    #[getter]
+    fn get_disable_subplan_sharing(&self) -> PyResult<bool> {
+        Ok(self.config.disable_subplan_sharing)
+    }
+
+    #[getter]
+    fn get_shared_part_buffer_bytes(&self) -> PyResult<usize> {
+        Ok(self.config.shared_part_buffer_bytes)
     }
 
     #[getter]

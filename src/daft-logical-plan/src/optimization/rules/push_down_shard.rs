@@ -112,7 +112,9 @@ impl PushDownShard {
                     LogicalPlan::Intersect(_)
                     | LogicalPlan::Union(_)
                     | LogicalPlan::SubqueryAlias(_)
-                    | LogicalPlan::StageCheckpointKeys(_) => Ok(Transformed::no(plan)),
+                    | LogicalPlan::StageCheckpointKeys(_)
+                    // A shard would restrict every reader of the part, not only this one.
+                    | LogicalPlan::Shared(_) => Ok(Transformed::no(plan)),
                 }
             }
             _ => Ok(Transformed::no(plan)),

@@ -6,7 +6,7 @@ impl MaterializeScans {
         Self {}
     }
 }
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use common_error::DaftResult;
 use common_treenode::{Transformed, TreeNode};
@@ -16,37 +16,39 @@ use super::OptimizerRule;
 use crate::{LogicalPlan, SourceInfo};
 
 // Materialize scan tasks from scan operators for all physical scans.
+//
+// Scans of one operator with the same pushdowns are listed once: a part of a plan written
+// more than once reads its sources once per occurrence until it is shared, and listing a
+// source (a catalog's manifests, a directory) can cost as much as reading a small one. Each
+// occurrence still gets its own node; only the listed tasks are shared.
 impl OptimizerRule for MaterializeScans {
     fn try_optimize(&self, plan: Arc<LogicalPlan>) -> DaftResult<Transformed<Arc<LogicalPlan>>> {
-        plan.transform_up(|node| self.try_optimize_node(node))
+        let mut listed: HashMap<Arc<LogicalPlan>, LogicalPlan> = HashMap::new();
+        plan.transform_up(|node| Self::try_optimize_node(node, &mut listed))
     }
 }
 
 impl MaterializeScans {
-    #[allow(clippy::only_used_in_recursion)]
     fn try_optimize_node(
-        &self,
         plan: Arc<LogicalPlan>,
+        listed: &mut HashMap<Arc<LogicalPlan>, LogicalPlan>,
     ) -> DaftResult<Transformed<Arc<LogicalPlan>>> {
-        match &*plan {
-            LogicalPlan::Source(source) => match &*source.source_info {
-                SourceInfo::Physical(physical_scan_info) => match &physical_scan_info.scan_state {
-                    ScanState::Operator(_) => {
-                        let source_plan = Arc::unwrap_or_clone(plan);
-                        if let LogicalPlan::Source(source) = source_plan {
-                            Ok(Transformed::yes(
-                                source.build_materialized_scan_source()?.into(),
-                            ))
-                        } else {
-                            unreachable!("This logical plan was already matched as a Source node")
-                        }
-                    }
-                    ScanState::Tasks(_) => Ok(Transformed::no(plan)),
-                },
-                _ => Ok(Transformed::no(plan)),
-            },
-            _ => Ok(Transformed::no(plan)),
+        let LogicalPlan::Source(source) = plan.as_ref() else {
+            return Ok(Transformed::no(plan));
+        };
+        let SourceInfo::Physical(physical_scan_info) = source.source_info.as_ref() else {
+            return Ok(Transformed::no(plan));
+        };
+        if matches!(physical_scan_info.scan_state, ScanState::Tasks(_)) {
+            return Ok(Transformed::no(plan));
         }
+        if let Some(materialized) = listed.get(&plan) {
+            // A new node holding the same tasks: rules that key nodes by pointer see two scans.
+            return Ok(Transformed::yes(Arc::new(materialized.clone())));
+        }
+        let materialized: LogicalPlan = source.clone().build_materialized_scan_source()?.into();
+        listed.insert(plan, materialized.clone());
+        Ok(Transformed::yes(Arc::new(materialized)))
     }
 }
 

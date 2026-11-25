@@ -89,9 +89,18 @@ class LogicalPlanBuilder:
     def __repr__(self) -> str:
         return self._builder.repr_ascii(simple=False)
 
-    def optimize(self, execution_config: PyDaftExecutionConfig) -> LogicalPlanBuilder:
-        """Optimize the underlying logical plan."""
-        builder = self._builder.optimize(execution_config)
+    def optimize(self, execution_config: PyDaftExecutionConfig, *, local: bool = False) -> LogicalPlanBuilder:
+        """Optimize the underlying logical plan.
+
+        Args:
+            execution_config: The execution configuration the plan is optimized for.
+            local: Whether the plan runs on the local executor, which also computes a part of
+                the plan written more than once, once for all of its readers.
+
+        Returns:
+            LogicalPlanBuilder: The optimized plan.
+        """
+        builder = self._builder.optimize(execution_config, local=local)
         return LogicalPlanBuilder(builder)
 
     @classmethod

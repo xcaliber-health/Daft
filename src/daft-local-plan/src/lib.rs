@@ -12,10 +12,10 @@ pub use plan::{
     GatherWrite, GlobScan, HashAggregate, HashJoin, InMemoryScan, IntoBatches, IntoPartitions,
     Limit, LocalNodeContext, LocalPhysicalPlan, LocalPhysicalPlanRef, MonotonicallyIncreasingId,
     PartialHashAggregate, PhysicalScan, PhysicalWrite, Pivot, PlaceholderScan, Project,
-    RepartitionWrite, Sample, SamplingMethod, ShuffleBackend, ShuffleRead, ShuffleReadBackend,
-    Sort, SortMergeJoin, StageCheckpointKeys, TopN, UDFProject, UnGroupedAggregate, Unpivot,
-    VLLMProject, WindowOrderByOnly, WindowPartitionAndDynamicFrame, WindowPartitionAndOrderBy,
-    WindowPartitionOnly,
+    RepartitionWrite, Sample, SamplingMethod, Shared, ShuffleBackend, ShuffleRead,
+    ShuffleReadBackend, Sort, SortMergeJoin, StageCheckpointKeys, TopN, UDFProject,
+    UnGroupedAggregate, Unpivot, VLLMProject, WindowOrderByOnly, WindowPartitionAndDynamicFrame,
+    WindowPartitionAndOrderBy, WindowPartitionOnly,
 };
 #[cfg(feature = "python")]
 pub use plan::{CatalogWrite, DataSink, DistributedActorPoolProject, DistributedLimit, LanceWrite};

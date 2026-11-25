@@ -148,7 +148,7 @@ class NativeRunner(Runner[MicroPartition]):
             except Exception as e:
                 logger.warning("Failed to send optimization start notification: %s", e)
 
-        builder = builder.optimize(ctx.daft_execution_config)
+        builder = builder.optimize(ctx.daft_execution_config, local=True)
 
         if has_subscribers:
             try:

@@ -574,7 +574,8 @@ fn pull_up_correlated_cols(
         | LogicalPlan::Window(..)
         | LogicalPlan::VLLMProject(..)
         | LogicalPlan::PartialAggregate(..)
-        | LogicalPlan::StageCheckpointKeys(..) => {
+        | LogicalPlan::StageCheckpointKeys(..)
+        | LogicalPlan::Shared(..) => {
             if subquery_on.is_empty() {
                 Ok((plan.clone(), vec![], vec![]))
             } else {

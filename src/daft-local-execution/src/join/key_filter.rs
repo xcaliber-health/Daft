@@ -709,6 +709,9 @@ fn scans_reached(plan: &LocalPhysicalPlan, column: usize, spares_state: bool) ->
         }) => passed_through(plan, input, partition_by, column)
             .map(|column| scans_reached(input, column, true))
             .unwrap_or_default(),
+        // Every reader of a shared part reads the same rows: a filter made from one reader's
+        // join would drop rows another reader needs.
+        LocalPhysicalPlan::Shared(_) => Vec::new(),
         _ => Vec::new(),
     }
 }

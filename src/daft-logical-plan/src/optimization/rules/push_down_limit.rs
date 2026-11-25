@@ -222,7 +222,10 @@ impl PushDownLimit {
                     | LogicalPlan::Window(..)
                     | LogicalPlan::Concat(_)
                     | LogicalPlan::VLLMProject(..)
-                    | LogicalPlan::StageCheckpointKeys(..) => Ok(Transformed::no(plan)),
+                    | LogicalPlan::StageCheckpointKeys(..)
+                    // Readers' limits enter a shared part only through
+                    // `PushDownIntoSharedParts`, as the largest of them.
+                    | LogicalPlan::Shared(..) => Ok(Transformed::no(plan)),
                 }
             }
             _ => Ok(Transformed::no(plan)),

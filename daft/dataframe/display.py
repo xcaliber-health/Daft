@@ -69,12 +69,13 @@ class MermaidFormatter:
             output += "\n"
 
             execution_config = get_context().daft_execution_config
-            builder = builder.optimize(execution_config)
+            local = get_or_create_runner().name == "native"
+            builder = builder.optimize(execution_config, local=local)
             output += builder._builder.repr_mermaid(
                 display_opts.with_subgraph_options(name="Optimized LogicalPlan", subgraph_id="optimized")
             )
             output += "\n"
-            if get_or_create_runner().name != "native":
+            if not local:
                 daft_execution_config = execution_config
                 distributed_plan = DistributedPhysicalPlan.from_logical_plan_builder(
                     builder._builder, "<tmp>", daft_execution_config

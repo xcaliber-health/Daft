@@ -212,7 +212,10 @@ fn infer(plan: Arc<LogicalPlan>) -> DaftResult<(Transformed<Arc<LogicalPlan>>, F
         | LogicalPlan::Shuffle(_)
         | LogicalPlan::IntoBatches(_)
         | LogicalPlan::IntoPartitions(_)
-        | LogicalPlan::Shard(_) => Facts {
+        | LogicalPlan::Shard(_)
+        // A shared part hands each reader its rows unchanged; a restriction derived from it
+        // still enters it only through `PushDownIntoSharedParts`.
+        | LogicalPlan::Shared(_) => Facts {
             restrictions: child_restrictions(),
             exact,
         },

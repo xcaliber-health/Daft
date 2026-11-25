@@ -793,3 +793,61 @@ def test_window_on_hash_partitioned_df_with_different_partition_does_shuffle():
     assert captured.count("RayShuffle") == 2, (
         f"Expected two physical RayShuffles when the window requires an additional shuffle, got {captured.count('RayShuffle')}\n{captured}"
     )
+
+
+def _approx_distinct_data() -> tuple[dict[str, list[int | None]], dict[int, int]]:
+    """Builds partitions that hold only nulls, nulls among values, or no nulls.
+
+    There are more partitions than a machine has cores, so a window's hash split puts
+    several partitions together and counts them as groups.
+    """
+    category: list[int] = []
+    ts: list[int] = []
+    value: list[int | None] = []
+    expected: dict[int, int] = {}
+    for key in range(300):
+        if key % 3 == 0:
+            values, distinct = [None, None], 0
+        elif key % 3 == 1:
+            values, distinct = [key, None, key, key + 1, None], 2
+        else:
+            values, distinct = [key, key + 1, key + 2], 3
+        category.extend([key] * len(values))
+        ts.extend(range(len(values)))
+        value.extend(values)
+        expected[key] = distinct
+    return {"category": category, "ts": ts, "value": value}, expected
+
+
+@pytest.mark.parametrize(
+    "window",
+    [
+        pytest.param(Window().partition_by("category"), id="partition_only"),
+        pytest.param(
+            Window()
+            .partition_by("category")
+            .order_by("ts")
+            .rows_between(Window.unbounded_preceding, Window.unbounded_following),
+            id="whole_ordered_frame",
+        ),
+    ],
+)
+def test_approx_count_distinct_skips_nulls(make_df, window):
+    """A null is no value: each partition counts as a group-by and an exact count do."""
+    data, expected = _approx_distinct_data()
+    df = make_df(data)
+
+    windowed = (
+        df.select(
+            col("category"),
+            col("value").approx_count_distinct().over(window).alias("approx"),
+            col("value").count_distinct().over(window).alias("exact"),
+        )
+        .distinct()
+        .to_pydict()
+    )
+    grouped = df.groupby("category").agg(col("value").approx_count_distinct().alias("grouped")).to_pydict()
+
+    assert dict(zip(windowed["category"], windowed["approx"])) == expected
+    assert dict(zip(windowed["category"], windowed["exact"])) == expected
+    assert dict(zip(grouped["category"], grouped["grouped"])) == expected
